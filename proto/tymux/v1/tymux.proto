@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package tymux.v1;
+
+// TymuxService is the daemon's public API. It's the thing tmux never had:
+// a typed, cross-language RPC surface, so a web UI, an AI agent, or a CLI
+// can all drive the same multiplexer without scraping terminal escape codes.
+service TymuxService {
+  rpc CreateSession(CreateSessionRequest) returns (Session);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc KillSession(KillSessionRequest) returns (KillSessionResponse);
+
+  // One-shot structured read of a pane's current screen — the AI-friendly
+  // alternative to `tmux capture-pane` (which returns raw text you'd have
+  // to re-parse). Cells carry attributes directly.
+  rpc CapturePane(CapturePaneRequest) returns (PaneSnapshot);
+
+  // Bidirectional stream: client sends input/resize events, server streams
+  // output back. This is what an interactive attach (human or agent) uses.
+  rpc Attach(stream AttachRequest) returns (stream AttachEvent);
+}
+
+message Session {
+  string id = 1;
+  string name = 2;
+  repeated Window windows = 3;
+}
+
+message Window {
+  string id = 1;
+  string name = 2;
+  repeated Pane panes = 3;
+}
+
+message Pane {
+  string id = 1;
+  uint32 rows = 2;
+  uint32 cols = 3;
+}
+
+message CreateSessionRequest {
+  string name = 1;
+  string command = 2; // defaults to $SHELL if empty
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+message KillSessionRequest {
+  string session_id = 1;
+}
+
+message KillSessionResponse {}
+
+message CapturePaneRequest {
+  string pane_id = 1;
+}
+
+message PaneSnapshot {
+  string pane_id = 1;
+  uint32 rows = 2;
+  uint32 cols = 3;
+  repeated Row grid = 4;
+  uint32 cursor_row = 5;
+  uint32 cursor_col = 6;
+}
+
+message Row {
+  repeated Cell cells = 1;
+}
+
+message Cell {
+  string text = 1; // one grapheme cluster
+  uint32 fg = 2;
+  uint32 bg = 3;
+  uint32 attrs = 4; // bitflags: 1=bold, 2=underline, 4=reverse, 8=italic
+}
+
+message AttachRequest {
+  oneof payload {
+    string pane_id = 1; // first message on the stream: which pane to attach to
+    bytes input = 2;    // raw keystrokes to forward to the pty
+    Resize resize = 3;
+  }
+}
+
+message Resize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message AttachEvent {
+  oneof payload {
+    bytes output = 1; // raw pty output bytes, as they arrive
+    PaneSnapshot snapshot = 2;
+  }
+}

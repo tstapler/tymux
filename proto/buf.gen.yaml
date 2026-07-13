@@ -1,0 +1,12 @@
+version: v2
+# Rust codegen does NOT go through here — crates/tymux-proto/build.rs calls
+# tonic-build directly against this proto tree, which is the idiomatic path
+# for a Rust service. This file is for *other* language clients (TS, Python,
+# Go, ...) as they show up — add plugins here, e.g.:
+#
+# plugins:
+#   - remote: buf.build/protocolbuffers/es
+#     out: ../clients/ts/gen
+inputs:
+  - directory: .
+plugins: []

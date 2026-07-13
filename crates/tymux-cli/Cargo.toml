@@ -1,0 +1,18 @@
+[package]
+name = "tymux-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tymux"
+path = "src/main.rs"
+
+[dependencies]
+tymux-proto = { path = "../tymux-proto" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true }
+anyhow = { workspace = true }

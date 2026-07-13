@@ -1,0 +1,12 @@
+[package]
+name = "tymux-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }

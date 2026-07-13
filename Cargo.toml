@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tymux-core",
+    "crates/tymux-proto",
+    "crates/tymuxd",
+    "crates/tymux-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
+portable-pty = "0.8"
+vt100 = "0.15"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+futures = "0.3"
+tokio-stream = "0.1"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }

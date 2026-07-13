@@ -1,0 +1,19 @@
+[package]
+name = "tymuxd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tymuxd"
+path = "src/main.rs"
+
+[dependencies]
+tymux-core = { path = "../tymux-core" }
+tymux-proto = { path = "../tymux-proto" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
