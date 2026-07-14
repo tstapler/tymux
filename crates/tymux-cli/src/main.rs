@@ -198,14 +198,33 @@ async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Re
             }
             Some(attach_event::Payload::Exited(_)) => {
                 drop(_raw); // restore the terminal before printing
-                println!("\r\n[tymux: pane exited]");
+                println!(
+                    "{}",
+                    chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap()
+                );
                 break;
+            }
+            Some(ref payload @ attach_event::Payload::OutputGap(_)) => {
+                print!("{}", chrome_message_for_event(payload).unwrap());
+                stdout.flush()?;
             }
             _ => {}
         }
     }
 
     Ok(())
+}
+
+/// Maps an [`attach_event::Payload`] variant to the fixed status line (if
+/// any) the CLI prints for it — pulled out of the attach loop above so the
+/// exact wording (and that "pane exited" vs. "output dropped" render as
+/// textually distinct messages) is unit-testable without a live stream.
+fn chrome_message_for_event(payload: &attach_event::Payload) -> Option<&'static str> {
+    match payload {
+        attach_event::Payload::Exited(_) => Some("\r\n[tymux: pane exited]\n"),
+        attach_event::Payload::OutputGap(_) => Some("\r\n[tymux: output dropped]\r\n"),
+        _ => None,
+    }
 }
 
 async fn send_resize(tx: &tokio::sync::mpsc::Sender<AttachRequest>) -> Result<()> {
@@ -256,6 +275,22 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("tymux").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn attach_event_match_should_render_output_dropped_message_on_output_gap_variant() {
+        let exited_msg = chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap();
+        let gap_msg = chrome_message_for_event(&attach_event::Payload::OutputGap(true)).unwrap();
+        assert!(gap_msg.contains("output dropped"));
+        assert_ne!(
+            exited_msg, gap_msg,
+            "exited and output-gap messages must be textually distinct"
+        );
+    }
+
+    #[test]
+    fn chrome_message_for_event_is_none_for_output_bytes() {
+        assert!(chrome_message_for_event(&attach_event::Payload::Output(vec![1, 2, 3])).is_none());
     }
 
     #[test]
@@ -339,6 +374,7 @@ mod tests {
             id: "session-1".to_string(),
             name: "test".to_string(),
             windows,
+            liveness: tymux_proto::v1::Liveness::Live as i32,
         }
     }
 
@@ -355,6 +391,7 @@ mod tests {
             id: id.to_string(),
             rows: 24,
             cols: 80,
+            liveness: tymux_proto::v1::Liveness::Live as i32,
         }
     }
 

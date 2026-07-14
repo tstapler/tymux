@@ -130,6 +130,18 @@ impl Pane {
         self.exited.load(Ordering::SeqCst)
     }
 
+    /// Terminates the child process. Does not itself mark the pane exited
+    /// or notify `wait_exit` waiters — that happens naturally once the
+    /// reader thread observes EOF on the pty after the process dies, the
+    /// same path an ordinary process exit takes (e.g. the shell running
+    /// `exit`). Callers that need the exit to be observed (e.g.
+    /// `KillSession` signaling attached clients) should await
+    /// [`Self::wait_exit`] after calling this.
+    pub fn kill(&self) -> Result<()> {
+        self._child.lock().unwrap().kill()?;
+        Ok(())
+    }
+
     /// Resolves once the pane's child process has exited. Safe to call
     /// after the exit already happened — checks the flag before *and*
     /// after registering for the notification, so a caller can't miss it
@@ -270,6 +282,12 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn is_exited_should_return_false_when_process_still_running() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        assert!(!pane.is_exited());
+    }
 
     #[test]
     fn spawns_a_shell_and_captures_its_output() {

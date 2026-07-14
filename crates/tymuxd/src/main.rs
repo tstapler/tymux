@@ -6,13 +6,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use tymux_core::{Engine, SessionInfo};
+use tymux_core::{Engine, PaneLookup, SessionInfo};
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
     attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
     Cell as ProtoCell, CreateSessionRequest, KillSessionRequest, KillSessionResponse,
-    ListSessionsRequest, ListSessionsResponse, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
-    Row as ProtoRow, Session as ProtoSession, Window as ProtoWindow,
+    ListSessionsRequest, ListSessionsResponse, Liveness, Pane as ProtoPane,
+    PaneSnapshot as ProtoSnapshot, Row as ProtoRow, Session as ProtoSession, Window as ProtoWindow,
 };
 
 pub struct TymuxDaemon {
@@ -25,7 +25,16 @@ pub struct TymuxDaemon {
 /// so "0" here is that same convention, not an arbitrary placeholder.
 const SOLE_WINDOW_NAME: &str = "0";
 
+fn liveness_of(live: bool) -> Liveness {
+    if live {
+        Liveness::Live
+    } else {
+        Liveness::Dead
+    }
+}
+
 fn session_to_proto(info: SessionInfo) -> ProtoSession {
+    let liveness = liveness_of(info.live);
     ProtoSession {
         id: info.id.to_string(),
         name: info.name,
@@ -36,12 +45,14 @@ fn session_to_proto(info: SessionInfo) -> ProtoSession {
                 id: info.pane_id.to_string(),
                 rows: info.rows,
                 cols: info.cols,
+                liveness: liveness as i32,
             }],
         }],
+        liveness: liveness as i32,
     }
 }
 
-fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot) -> ProtoSnapshot {
+fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot, live: bool) -> ProtoSnapshot {
     ProtoSnapshot {
         pane_id: pane_id.to_string(),
         rows: snap.rows,
@@ -63,6 +74,7 @@ fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot) -> ProtoSnap
                     .collect(),
             })
             .collect(),
+        liveness: liveness_of(live) as i32,
     }
 }
 
@@ -79,6 +91,43 @@ fn parse_uuid(s: &str) -> Result<Uuid, Status> {
 async fn supervise(pane_id: Uuid, task: &'static str, handle: tokio::task::JoinHandle<()>) {
     if let Err(e) = handle.await {
         tracing::error!(pane_id = %pane_id, task, error = %e, "attach task panicked");
+    }
+}
+
+// tonic::Status is a fixed ~176 bytes we don't control; boxing it here
+// would just push the cost onto every call site.
+#[allow(clippy::result_large_err)]
+fn resolve_live_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::Pane>, Status> {
+    match engine.pane_lookup(pane_id) {
+        PaneLookup::Live(pane) => Ok(pane),
+        PaneLookup::Dead => Err(Status::failed_precondition(format!(
+            "pane exited — run 'tymux revive <session_id>' to respawn it (pane_id={pane_id})"
+        ))),
+        PaneLookup::Unknown => Err(Status::not_found("no such pane")),
+    }
+}
+
+/// Maps one `output_rx.recv()` result from the attach forwarding loop to
+/// the `AttachEvent` (if any) it produces — pulled out of the loop so the
+/// Lagged-becomes-`output_gap` transformation is unit-testable without a
+/// live pty/broadcast channel. `None` means the stream should end (the
+/// channel was permanently closed).
+fn attach_event_for_output_result(
+    result: Result<Vec<u8>, tokio::sync::broadcast::error::RecvError>,
+    pane_id: Uuid,
+) -> Option<AttachEvent> {
+    use tokio::sync::broadcast::error::RecvError;
+    match result {
+        Ok(bytes) => Some(AttachEvent {
+            payload: Some(attach_event::Payload::Output(bytes)),
+        }),
+        Err(RecvError::Lagged(n)) => {
+            tracing::warn!(pane_id = %pane_id, skipped = n, "attach consumer lagged, output_gap signaled");
+            Some(AttachEvent {
+                payload: Some(attach_event::Payload::OutputGap(true)),
+            })
+        }
+        Err(RecvError::Closed) => None,
     }
 }
 
@@ -140,13 +189,13 @@ impl TymuxService for TymuxDaemon {
     ) -> Result<Response<ProtoSnapshot>, Status> {
         let pane_id_str = request.into_inner().pane_id;
         let pane_id = parse_uuid(&pane_id_str)?;
-        let pane = self.engine.pane(pane_id).ok_or_else(|| {
-            tracing::warn!(pane_id = %pane_id, "capture_pane: no such pane");
-            Status::not_found("no such pane")
+        let pane = resolve_live_pane(&self.engine, pane_id).inspect_err(|status| {
+            tracing::warn!(pane_id = %pane_id, code = ?status.code(), "capture_pane: pane unavailable");
         })?;
         Ok(Response::new(snapshot_to_proto(
             &pane_id_str,
             pane.snapshot(),
+            true,
         )))
     }
 
@@ -171,9 +220,8 @@ impl TymuxService for TymuxDaemon {
             }
         };
         let pane_id = parse_uuid(&pane_id_str)?;
-        let pane = self.engine.pane(pane_id).ok_or_else(|| {
-            tracing::warn!(pane_id = %pane_id, "attach: no such pane");
-            Status::not_found("no such pane")
+        let pane = resolve_live_pane(&self.engine, pane_id).inspect_err(|status| {
+            tracing::warn!(pane_id = %pane_id, code = ?status.code(), "attach: pane unavailable");
         })?;
         tracing::info!(pane_id = %pane_id, "attach started");
 
@@ -191,16 +239,12 @@ impl TymuxService for TymuxDaemon {
                 tokio::select! {
                     biased;
                     result = output_rx.recv() => {
-                        match result {
-                            Ok(bytes) => {
-                                let event = AttachEvent {
-                                    payload: Some(attach_event::Payload::Output(bytes)),
-                                };
-                                if forward_tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
+                        if let Some(event) = attach_event_for_output_result(result, pane_for_exit.id) {
+                            if forward_tx.send(Ok(event)).await.is_err() {
+                                return;
                             }
-                            Err(_) => return,
+                        } else {
+                            return;
                         }
                     }
                     _ = pane_for_exit.wait_exit() => {
@@ -337,6 +381,32 @@ mod tests {
         }
     }
 
+    /// Spins up a real server on an ephemeral port and returns a connected
+    /// client — the shared setup every real-network (as opposed to
+    /// direct-method-call) integration test in this module needs.
+    async fn spawn_test_server(
+        daemon: TymuxDaemon,
+    ) -> TymuxServiceClient<tonic::transport::Channel> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TymuxServiceServer::new(daemon))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        TymuxServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client should connect to the just-bound listener")
+    }
+
+    async fn wait_for_pane_exit(pane: &Arc<tymux_core::Pane>) {
+        tokio::time::timeout(Duration::from_secs(5), pane.wait_exit())
+            .await
+            .expect("pane should exit within 5s");
+    }
+
     #[tokio::test]
     async fn create_session_appears_in_list() {
         let daemon = test_daemon();
@@ -418,6 +488,184 @@ mod tests {
         assert_eq!(snapshot.grid.len(), 24);
     }
 
+    #[tokio::test]
+    async fn create_session_should_report_liveness_live_when_pane_freshly_spawned() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(session.liveness, Liveness::Live as i32);
+        assert_eq!(session.windows[0].panes[0].liveness, Liveness::Live as i32);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_should_report_liveness_dead_when_pane_child_process_exited() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = parse_uuid(&session.windows[0].panes[0].id).unwrap();
+
+        let pane = match daemon.engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"exit\n").unwrap();
+        wait_for_pane_exit(&pane).await;
+
+        let list = daemon
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(list.sessions[0].liveness, Liveness::Dead as i32);
+        assert_eq!(
+            list.sessions[0].windows[0].panes[0].liveness,
+            Liveness::Dead as i32
+        );
+    }
+
+    /// Integration counterpart to the two liveness unit tests above: proves
+    /// the LIVENESS_DEAD signal survives a real wire round trip, not just a
+    /// direct in-process method call.
+    #[tokio::test]
+    async fn session_to_proto_should_map_exited_pane_to_liveness_dead_field() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = parse_uuid(&session.windows[0].panes[0].id).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"exit\n").unwrap();
+        wait_for_pane_exit(&pane).await;
+
+        let list = client
+            .list_sessions(ListSessionsRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            list.sessions[0].windows[0].panes[0].liveness,
+            Liveness::Dead as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_pane_should_return_failed_precondition_when_pane_lookup_is_dead_vs_not_found_when_unknown(
+    ) {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = session.windows[0].panes[0].id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+
+        let pane = match daemon.engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"exit\n").unwrap();
+        wait_for_pane_exit(&pane).await;
+
+        let dead_err = daemon
+            .capture_pane(Request::new(CapturePaneRequest {
+                pane_id: pane_id_str,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(dead_err.code(), tonic::Code::FailedPrecondition);
+
+        let unknown_err = daemon
+            .capture_pane(Request::new(CapturePaneRequest {
+                pane_id: Uuid::new_v4().to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(unknown_err.code(), tonic::Code::NotFound);
+        assert_ne!(dead_err.code(), unknown_err.code());
+    }
+
+    #[test]
+    fn attach_should_not_emit_output_gap_event_when_consumer_keeps_pace() {
+        let pane_id = Uuid::new_v4();
+        let event = attach_event_for_output_result(Ok(b"hello".to_vec()), pane_id).unwrap();
+        assert!(matches!(
+            event.payload,
+            Some(attach_event::Payload::Output(_))
+        ));
+    }
+
+    #[test]
+    fn attach_should_emit_output_gap_event_when_consumer_lags_behind_broadcast_channel() {
+        let pane_id = Uuid::new_v4();
+        let event = attach_event_for_output_result(
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(5)),
+            pane_id,
+        )
+        .unwrap();
+        assert!(matches!(
+            event.payload,
+            Some(attach_event::Payload::OutputGap(true))
+        ));
+    }
+
+    #[test]
+    fn attach_event_for_output_result_ends_stream_on_closed_channel() {
+        let pane_id = Uuid::new_v4();
+        assert!(attach_event_for_output_result(
+            Err(tokio::sync::broadcast::error::RecvError::Closed),
+            pane_id
+        )
+        .is_none());
+    }
+
+    /// Integration-style proof (real `tokio::sync::broadcast` channel, tiny
+    /// capacity, burst sender) that a lagged consumer observes an
+    /// `OutputGap` event before normal `Output` events resume — exercising
+    /// `attach_event_for_output_result` against tokio's actual `Lagged`
+    /// semantics rather than a hand-constructed `RecvError`.
+    #[tokio::test]
+    async fn attach_stream_should_observe_output_gap_before_output_resumes_when_consumer_lags() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<Vec<u8>>(2);
+        let pane_id = Uuid::new_v4();
+
+        // Burst past the channel's capacity before the consumer ever reads,
+        // guaranteeing the next recv() observes Lagged.
+        for i in 0..5u8 {
+            let _ = tx.send(vec![i]);
+        }
+
+        let first = attach_event_for_output_result(rx.recv().await, pane_id).unwrap();
+        assert!(
+            matches!(first.payload, Some(attach_event::Payload::OutputGap(true))),
+            "first observed event after a burst past capacity must be OutputGap"
+        );
+
+        // Normal output resumes immediately after: the channel still holds
+        // its last `capacity` (2) buffered items (3, 4) — the next recv()
+        // must yield one of them as an ordinary Output event, not another
+        // Lagged/OutputGap.
+        let second = attach_event_for_output_result(rx.recv().await, pane_id).unwrap();
+        assert!(matches!(
+            second.payload,
+            Some(attach_event::Payload::Output(_))
+        ));
+    }
+
     /// End-to-end regression test for the Ctrl-d hang bug fixed earlier:
     /// spins up a real server, attaches, tells the shell to exit, and
     /// asserts the stream reports Exited and closes — instead of hanging.
@@ -478,6 +726,68 @@ mod tests {
         assert!(
             saw_exit,
             "expected an Exited event before the stream closed"
+        );
+    }
+
+    /// Story 2.3 AC2/task 5: KillSession from a second simulated client must
+    /// signal the first client's attach stream with a clean terminal event
+    /// (reusing the existing pane-exit path) before the stream closes —
+    /// never a bare stream error or silent hang. This is the direct
+    /// counterpart to the already-fixed Ctrl-D hang regression test above.
+    #[tokio::test]
+    async fn kill_session_should_close_attached_stream_cleanly_when_second_client_kills_session() {
+        let daemon = test_daemon();
+        let mut client_a = spawn_test_server(daemon).await;
+        let mut client_b = client_a.clone();
+
+        let session = client_a
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let session_id = session.id.clone();
+        let pane_id = session.windows[0].panes[0].id.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+        })
+        .await
+        .unwrap();
+
+        let mut inbound = client_a
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        client_b
+            .kill_session(KillSessionRequest { session_id })
+            .await
+            .expect(
+                "kill_session should not produce a raw stream error while a client is attached",
+            );
+
+        let saw_clean_exit = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(msg) = inbound.message().await.transpose() {
+                match msg {
+                    Ok(event)
+                        if matches!(event.payload, Some(attach_event::Payload::Exited(_))) =>
+                    {
+                        return true;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => return false, // raw stream error — the exact failure class this guards against
+                }
+            }
+            false
+        })
+        .await
+        .expect("attach stream must close within 5s, not hang");
+
+        assert!(
+            saw_clean_exit,
+            "expected a clean Exited event before the stream closed, not a raw error or silent hang"
         );
     }
 }

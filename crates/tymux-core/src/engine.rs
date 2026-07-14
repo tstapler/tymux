@@ -33,6 +33,21 @@ pub struct SessionInfo {
     pub pane_id: Uuid,
     pub rows: u32,
     pub cols: u32,
+    pub live: bool,
+}
+
+/// The three-way outcome of looking up a pane by id, replacing the old
+/// `Option<Arc<Pane>>` (which collapsed "exited" and "never existed" into
+/// the same `None`). A caller (e.g. `capture_pane`/`attach`) needs to tell
+/// these apart to return `failed_precondition` (with a remediation) instead
+/// of a bare `not_found` for a pane that used to exist.
+pub enum PaneLookup {
+    Live(Arc<Pane>),
+    /// The pane is still tracked by the engine but its process has exited.
+    /// (Once persistence lands in Epic 4, this will carry the persisted
+    /// record instead — see `plan.md`'s `PaneLookup` glossary entry.)
+    Dead,
+    Unknown,
 }
 
 #[derive(Default)]
@@ -74,29 +89,51 @@ impl Engine {
                     pane_id: s.pane.id,
                     rows,
                     cols,
+                    live: !s.pane.is_exited(),
                 }
             })
             .collect()
     }
 
+    /// Kills the session's pane process (if still live) before removing the
+    /// session, so any client currently attached to it observes a normal
+    /// pane-exit event through the same path an ordinary process exit
+    /// takes — rather than a bare stream error or silent hang. See
+    /// `tymuxd`'s `attach` handler: its forwarding loop already reacts to
+    /// `Pane::wait_exit`, so no separate out-of-band signal is needed here.
     pub fn kill_session(&self, id: Uuid) -> Result<()> {
-        self.sessions
+        let session = self
+            .sessions
             .lock()
             .unwrap()
             .remove(&id)
-            .map(|_| ())
-            .ok_or_else(|| anyhow!("no such session: {id}"))
+            .ok_or_else(|| anyhow!("no such session: {id}"))?;
+        if !session.pane.is_exited() {
+            if let Err(e) = session.pane.kill() {
+                tracing::warn!(session_id = %id, pane_id = %session.pane.id, error = %e, "kill_session: failed to kill pane process");
+            }
+        }
+        Ok(())
     }
 
     /// Finds the pane backing any session's window by pane id — the pane
-    /// namespace is flat across sessions since each session has exactly one.
-    pub fn pane(&self, pane_id: Uuid) -> Option<Arc<Pane>> {
-        self.sessions
+    /// namespace is flat across sessions since each session currently has
+    /// exactly one window and one pane (see
+    /// docs/adr/0001-single-pane-per-session-for-now.md); a pane id is
+    /// therefore already globally unique without needing to know which
+    /// session it belongs to.
+    pub fn pane_lookup(&self, pane_id: Uuid) -> PaneLookup {
+        match self
+            .sessions
             .lock()
             .unwrap()
             .values()
             .find(|s| s.pane.id == pane_id)
-            .map(|s| s.pane.clone())
+        {
+            None => PaneLookup::Unknown,
+            Some(s) if s.pane.is_exited() => PaneLookup::Dead,
+            Some(s) => PaneLookup::Live(s.pane.clone()),
+        }
     }
 }
 
@@ -160,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_lookup_by_id() {
+    fn pane_lookup_should_return_live_when_pane_process_still_running() {
         let engine = Engine::new();
         let id = engine.create_session("test".to_string(), sh()).unwrap();
         let pane_id = engine
@@ -170,7 +207,41 @@ mod tests {
             .unwrap()
             .pane_id;
 
-        assert!(engine.pane(pane_id).is_some());
-        assert!(engine.pane(Uuid::new_v4()).is_none());
+        assert!(matches!(engine.pane_lookup(pane_id), PaneLookup::Live(_)));
+    }
+
+    #[test]
+    fn pane_lookup_should_return_unknown_when_pane_id_never_created() {
+        let engine = Engine::new();
+        assert!(matches!(
+            engine.pane_lookup(Uuid::new_v4()),
+            PaneLookup::Unknown
+        ));
+    }
+
+    #[test]
+    fn pane_lookup_should_return_dead_when_pane_process_exited_but_record_exists() {
+        let engine = Engine::new();
+        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let pane = match engine.pane_lookup(
+            engine
+                .list_sessions()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .pane_id,
+        ) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected a freshly created pane to be Live"),
+        };
+        pane.write_input(b"exit\n").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pane.is_exited() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(pane.is_exited(), "pane should have exited by now");
+
+        assert!(matches!(engine.pane_lookup(pane.id), PaneLookup::Dead));
     }
 }
