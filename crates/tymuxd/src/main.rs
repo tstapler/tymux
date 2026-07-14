@@ -92,15 +92,18 @@ impl TymuxService for TymuxDaemon {
             .engine
             .create_session(req.name, command)
             .map_err(|e| Status::internal(e.to_string()))?;
-        let (_, name, window_id, pane_id) = self
+        let info = self
             .engine
             .list_sessions()
             .into_iter()
-            .find(|(sid, ..)| *sid == id)
+            .find(|s| s.id == id)
             .ok_or_else(|| Status::internal("session vanished after create"))?;
-        tracing::info!(session_id = %id, name = %name, pane_id = %pane_id, "session created");
+        tracing::info!(session_id = %info.id, name = %info.name, pane_id = %info.pane_id, "session created");
         Ok(Response::new(session_to_proto(
-            id, name, window_id, pane_id,
+            info.id,
+            info.name,
+            info.window_id,
+            info.pane_id,
         )))
     }
 
@@ -112,7 +115,7 @@ impl TymuxService for TymuxDaemon {
             .engine
             .list_sessions()
             .into_iter()
-            .map(|(id, name, window_id, pane_id)| session_to_proto(id, name, window_id, pane_id))
+            .map(|s| session_to_proto(s.id, s.name, s.window_id, s.pane_id))
             .collect();
         Ok(Response::new(ListSessionsResponse { sessions }))
     }
