@@ -164,13 +164,35 @@ impl TymuxService for TymuxDaemon {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         let forward_tx = tx.clone();
+        let pane_for_exit = pane.clone();
         tokio::spawn(async move {
-            while let Ok(bytes) = output_rx.recv().await {
-                let event = AttachEvent {
-                    payload: Some(attach_event::Payload::Output(bytes)),
-                };
-                if forward_tx.send(Ok(event)).await.is_err() {
-                    break;
+            loop {
+                // `biased` checks output_rx first every iteration, so any
+                // output already sent before the child exited (the reader
+                // thread sends, then marks exited — see pane.rs) is always
+                // drained before we report the exit, rather than racing.
+                tokio::select! {
+                    biased;
+                    result = output_rx.recv() => {
+                        match result {
+                            Ok(bytes) => {
+                                let event = AttachEvent {
+                                    payload: Some(attach_event::Payload::Output(bytes)),
+                                };
+                                if forward_tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    _ = pane_for_exit.wait_exit() => {
+                        let event = AttachEvent {
+                            payload: Some(attach_event::Payload::Exited(true)),
+                        };
+                        let _ = forward_tx.send(Ok(event)).await;
+                        return;
+                    }
                 }
             }
         });

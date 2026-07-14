@@ -1,9 +1,10 @@
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
 
 /// A single pty-backed terminal. Owns the child process, the pty master
@@ -19,8 +20,14 @@ pub struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
     output_tx: broadcast::Sender<Vec<u8>>,
+    exited: AtomicBool,
+    exit_notify: Notify,
     // Held only to keep the child alive; not otherwise touched.
     _child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+    // Tracked so the reader thread's lifecycle is at least observable
+    // (e.g. joinable during a future shutdown path) rather than fully
+    // abandoned; the thread itself already signals exit via `exited` above.
+    _reader_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 pub struct PaneSnapshot {
@@ -64,25 +71,61 @@ impl Pane {
             master: Mutex::new(pair.master),
             parser: parser.clone(),
             output_tx: output_tx.clone(),
+            exited: AtomicBool::new(false),
+            exit_notify: Notify::new(),
             _child: Mutex::new(child),
+            _reader_handle: Mutex::new(None),
         });
 
         // portable_pty's reader is blocking std::io::Read, so it gets its
         // own OS thread rather than a tokio task.
-        std::thread::spawn(move || {
+        let pane_for_reader = pane.clone();
+        let handle = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         parser.lock().unwrap().process(&buf[..n]);
+                        // Fails only when nobody is currently attached (no
+                        // receivers) — expected and benign (e.g. shell
+                        // startup output before the first Attach), not an
+                        // error worth logging.
                         let _ = output_tx.send(buf[..n].to_vec());
                     }
                 }
             }
+            // Child exited (or the pty read failed, which for a live child
+            // is effectively the same signal). Mark it so any current or
+            // future `wait_exit()` caller — including one that started
+            // waiting after this point — observes it.
+            pane_for_reader.exited.store(true, Ordering::SeqCst);
+            pane_for_reader.exit_notify.notify_waiters();
         });
+        *pane._reader_handle.lock().unwrap() = Some(handle);
 
         Ok(pane)
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.exited.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the pane's child process has exited. Safe to call
+    /// after the exit already happened — checks the flag before *and*
+    /// after registering for the notification, so a caller can't miss it
+    /// by starting to wait in the gap between the check and the await.
+    pub async fn wait_exit(&self) {
+        loop {
+            if self.is_exited() {
+                return;
+            }
+            let notified = self.exit_notify.notified();
+            if self.is_exited() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
@@ -203,5 +246,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(found, "expected pane output to contain echoed text");
+    }
+
+    #[tokio::test]
+    async fn wait_exit_resolves_after_child_exits() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        assert!(!pane.is_exited());
+        pane.write_input(b"exit\n").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), pane.wait_exit())
+            .await
+            .expect("wait_exit should resolve once the child process exits");
+        assert!(pane.is_exited());
+
+        // Already-exited: must resolve immediately, not hang waiting for a
+        // notification that already fired before this call started.
+        tokio::time::timeout(Duration::from_secs(1), pane.wait_exit())
+            .await
+            .expect("wait_exit must resolve immediately for an already-exited pane");
     }
 }

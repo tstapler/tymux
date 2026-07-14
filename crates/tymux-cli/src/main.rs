@@ -132,9 +132,17 @@ async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Re
 
     let mut stdout = std::io::stdout();
     while let Some(event) = inbound.message().await? {
-        if let Some(attach_event::Payload::Output(bytes)) = event.payload {
-            stdout.write_all(&bytes)?;
-            stdout.flush()?;
+        match event.payload {
+            Some(attach_event::Payload::Output(bytes)) => {
+                stdout.write_all(&bytes)?;
+                stdout.flush()?;
+            }
+            Some(attach_event::Payload::Exited(_)) => {
+                drop(_raw); // restore the terminal before printing
+                println!("\r\n[tymux: pane exited]");
+                break;
+            }
+            _ => {}
         }
     }
 

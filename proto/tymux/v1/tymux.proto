@@ -96,5 +96,6 @@ message AttachEvent {
   oneof payload {
     bytes output = 1; // raw pty output bytes, as they arrive
     PaneSnapshot snapshot = 2;
+    bool exited = 3; // the pane's child process has exited; no more output follows
   }
 }
