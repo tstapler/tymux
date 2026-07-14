@@ -19,13 +19,19 @@ pub struct TymuxDaemon {
     engine: Arc<Engine>,
 }
 
+/// Every session has exactly one window today (see
+/// docs/adr/0001-single-pane-per-session-for-now.md), so it's always
+/// window index 0 — tmux itself names windows by their index by default,
+/// so "0" here is that same convention, not an arbitrary placeholder.
+const SOLE_WINDOW_NAME: &str = "0";
+
 fn session_to_proto(info: SessionInfo) -> ProtoSession {
     ProtoSession {
         id: info.id.to_string(),
         name: info.name,
         windows: vec![ProtoWindow {
             id: info.window_id.to_string(),
-            name: "0".to_string(),
+            name: SOLE_WINDOW_NAME.to_string(),
             panes: vec![ProtoPane {
                 id: info.pane_id.to_string(),
                 rows: info.rows,

@@ -7,6 +7,25 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
 
+/// vt100's third `Parser::new` arg: how many scrolled-off lines it keeps
+/// for scrollback. 0 for now — `CapturePane` only ever reads the current
+/// on-screen grid, so there's nothing to gain from buffering history it
+/// can't expose yet (see the "no scrollback capture" gap in
+/// docs/ux/journey-map.md).
+const SCROLLBACK_LINES: usize = 0;
+
+/// Read chunk size for the pty output thread. Program output (e.g. `ls
+/// -la`, `cat` on a big file) comes in much chunkier bursts than a human's
+/// keystrokes, so this is deliberately larger than tymux-cli's 1024-byte
+/// stdin-forwarding buffer.
+const PTY_READ_BUF_SIZE: usize = 4096;
+
+/// Backlog for the output broadcast channel. Sized to absorb a burst of
+/// terminal output between two `Attach` clients' `recv()` polls without
+/// needing precise tuning — a slow consumer just gets `Lagged` and moves
+/// on, it isn't a correctness concern.
+const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
+
 /// A single pty-backed terminal. Owns the child process, the pty master
 /// (for resize + writing input), and a `vt100::Parser` that keeps a
 /// structured screen model in sync with everything the child prints.
@@ -62,8 +81,8 @@ impl Pane {
         let writer = pair.master.take_writer()?;
         let mut reader = pair.master.try_clone_reader()?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
-        let (output_tx, _) = broadcast::channel(1024);
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
+        let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
 
         let pane = Arc::new(Pane {
             id: Uuid::new_v4(),
@@ -81,7 +100,7 @@ impl Pane {
         // own OS thread rather than a tokio task.
         let pane_for_reader = pane.clone();
         let handle = std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; PTY_READ_BUF_SIZE];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -223,19 +242,26 @@ fn pack_color(color: vt100::Color) -> u32 {
     }
 }
 
+// Mirrors proto/tymux/v1/tymux.proto's Cell.attrs doc comment exactly —
+// keep the two in sync if either changes.
+const ATTR_BOLD: u32 = 1;
+const ATTR_UNDERLINE: u32 = 2;
+const ATTR_REVERSE: u32 = 4;
+const ATTR_ITALIC: u32 = 8;
+
 fn pack_attrs(cell: &vt100::Cell) -> u32 {
     let mut attrs = 0;
     if cell.bold() {
-        attrs |= 1;
+        attrs |= ATTR_BOLD;
     }
     if cell.underline() {
-        attrs |= 2;
+        attrs |= ATTR_UNDERLINE;
     }
     if cell.inverse() {
-        attrs |= 4;
+        attrs |= ATTR_REVERSE;
     }
     if cell.italic() {
-        attrs |= 8;
+        attrs |= ATTR_ITALIC;
     }
     attrs
 }
