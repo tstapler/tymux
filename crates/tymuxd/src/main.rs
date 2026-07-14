@@ -6,7 +6,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use tymux_core::Engine;
+use tymux_core::{Engine, SessionInfo};
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
     attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
@@ -19,17 +19,17 @@ pub struct TymuxDaemon {
     engine: Arc<Engine>,
 }
 
-fn session_to_proto(id: Uuid, name: String, window_id: Uuid, pane_id: Uuid) -> ProtoSession {
+fn session_to_proto(info: SessionInfo) -> ProtoSession {
     ProtoSession {
-        id: id.to_string(),
-        name,
+        id: info.id.to_string(),
+        name: info.name,
         windows: vec![ProtoWindow {
-            id: window_id.to_string(),
+            id: info.window_id.to_string(),
             name: "0".to_string(),
             panes: vec![ProtoPane {
-                id: pane_id.to_string(),
-                rows: 24,
-                cols: 80,
+                id: info.pane_id.to_string(),
+                rows: info.rows,
+                cols: info.cols,
             }],
         }],
     }
@@ -99,12 +99,7 @@ impl TymuxService for TymuxDaemon {
             .find(|s| s.id == id)
             .ok_or_else(|| Status::internal("session vanished after create"))?;
         tracing::info!(session_id = %info.id, name = %info.name, pane_id = %info.pane_id, "session created");
-        Ok(Response::new(session_to_proto(
-            info.id,
-            info.name,
-            info.window_id,
-            info.pane_id,
-        )))
+        Ok(Response::new(session_to_proto(info)))
     }
 
     async fn list_sessions(
@@ -115,7 +110,7 @@ impl TymuxService for TymuxDaemon {
             .engine
             .list_sessions()
             .into_iter()
-            .map(|s| session_to_proto(s.id, s.name, s.window_id, s.pane_id))
+            .map(session_to_proto)
             .collect();
         Ok(Response::new(ListSessionsResponse { sessions }))
     }
@@ -314,6 +309,9 @@ mod tests {
             .into_inner();
         assert_eq!(resp.name, "test");
         let pane_id = resp.windows[0].panes[0].id.clone();
+        // Reflects the pane's real size (not a stale hardcoded literal).
+        assert_eq!(resp.windows[0].panes[0].rows, 24);
+        assert_eq!(resp.windows[0].panes[0].cols, 80);
 
         let list = daemon
             .list_sessions(Request::new(ListSessionsRequest {}))
@@ -322,6 +320,8 @@ mod tests {
             .into_inner();
         assert_eq!(list.sessions.len(), 1);
         assert_eq!(list.sessions[0].windows[0].panes[0].id, pane_id);
+        assert_eq!(list.sessions[0].windows[0].panes[0].rows, 24);
+        assert_eq!(list.sessions[0].windows[0].panes[0].cols, 80);
     }
 
     #[tokio::test]

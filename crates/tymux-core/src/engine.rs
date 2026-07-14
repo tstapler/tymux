@@ -31,6 +31,8 @@ pub struct SessionInfo {
     pub name: String,
     pub window_id: Uuid,
     pub pane_id: Uuid,
+    pub rows: u32,
+    pub cols: u32,
 }
 
 #[derive(Default)]
@@ -63,11 +65,16 @@ impl Engine {
             .lock()
             .unwrap()
             .values()
-            .map(|s| SessionInfo {
-                id: s.id,
-                name: s.name.clone(),
-                window_id: s.window_id,
-                pane_id: s.pane.id,
+            .map(|s| {
+                let (rows, cols) = s.pane.size();
+                SessionInfo {
+                    id: s.id,
+                    name: s.name.clone(),
+                    window_id: s.window_id,
+                    pane_id: s.pane.id,
+                    rows,
+                    cols,
+                }
             })
             .collect()
     }

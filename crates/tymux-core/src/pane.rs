@@ -148,6 +148,13 @@ impl Pane {
         self.output_tx.subscribe()
     }
 
+    /// The pane's current (rows, cols) — cheap, unlike [`Self::snapshot`],
+    /// which also walks and copies the entire cell grid.
+    pub fn size(&self) -> (u32, u32) {
+        let (rows, cols) = self.parser.lock().unwrap().screen().size();
+        (rows as u32, cols as u32)
+    }
+
     pub fn snapshot(&self) -> PaneSnapshot {
         let parser = self.parser.lock().unwrap();
         let screen = parser.screen();

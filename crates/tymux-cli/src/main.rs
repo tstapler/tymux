@@ -9,7 +9,7 @@ use tonic::Request;
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
     attach_event, attach_request, AttachRequest, CreateSessionRequest, KillSessionRequest,
-    ListSessionsRequest, Session,
+    ListSessionsRequest, Resize, Session,
 };
 
 /// Every session today has exactly one window with one pane (see
@@ -130,6 +130,13 @@ async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Re
     })
     .await?;
 
+    // Sync the pane to the local terminal's real size immediately, and
+    // again on every SIGWINCH — without this the pane stays at whatever
+    // fixed default the daemon created it with, forever, regardless of the
+    // terminal it's actually attached to.
+    send_resize(&tx).await?;
+    spawn_resize_watcher(tx.clone());
+
     // stdin reads are blocking, so they get their own OS thread and feed
     // the outbound stream over a channel.
     let stdin_tx = tx.clone();
@@ -173,6 +180,47 @@ async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Re
 
     Ok(())
 }
+
+async fn send_resize(tx: &tokio::sync::mpsc::Sender<AttachRequest>) -> Result<()> {
+    // A failure here just means the local terminal size can't be queried
+    // (e.g. stdout isn't a real tty) — not worth aborting the attach over,
+    // the pane just keeps whatever size it already had.
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Resize(Resize {
+                rows: rows as u32,
+                cols: cols as u32,
+            })),
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// SIGWINCH only exists on Unix; on other platforms the pane just keeps
+/// whatever size it got at attach time (still an improvement over never
+/// syncing at all).
+#[cfg(unix)]
+fn spawn_resize_watcher(tx: tokio::sync::mpsc::Sender<AttachRequest>) {
+    tokio::spawn(async move {
+        let mut winch =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("tymux: failed to install SIGWINCH handler: {e}");
+                    return;
+                }
+            };
+        while winch.recv().await.is_some() {
+            if send_resize(&tx).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_resize_watcher(_tx: tokio::sync::mpsc::Sender<AttachRequest>) {}
 
 #[cfg(test)]
 mod tests {
