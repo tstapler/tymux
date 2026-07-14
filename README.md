@@ -81,4 +81,7 @@ for the next session.
   committing a proto change
 - `cargo fmt` / `cargo clippy --workspace --all-targets` — enforced in CI
   (`.github/workflows/ci.yml`)
+- **Releasing**: bump `[workspace.package] version` in `Cargo.toml`, then
+  push a matching `vX.Y.Z` tag. CI's `tag-version-check` job fails the
+  build if the tag and workspace version ever drift.
 
