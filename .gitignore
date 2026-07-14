@@ -1,5 +1,7 @@
 # Project gitignore
 /target
+/clients/ts/node_modules
+/clients/ts/dist
 
 # Stray debris, not part of this project
 /~

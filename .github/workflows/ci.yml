@@ -59,6 +59,40 @@ jobs:
       # (and thus portable-pty's musl linking) continuously, on every PR.
       - run: cargo build --workspace --target x86_64-unknown-linux-musl
 
+  ts-client:
+    # Story 7.1 Task 4 (buf generate drift check) + Story 7.2 Task 3 /
+    # Story 7.3 Task 7 (standing cross-language RPC proof on every PR —
+    # plan.md §5 Risk Control pre-mortem.md Failure #5: a proof that isn't
+    # re-run on every PR is the same class of gap as a test that doesn't run).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: bufbuild/buf-setup-action@v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ts-client
+      - run: cargo build --bin tymuxd
+      - working-directory: clients/ts
+        run: npm install
+      - name: buf generate drift check
+        working-directory: proto
+        run: |
+          buf generate
+          git diff --exit-code -- ../clients/ts/gen
+      - working-directory: clients/ts
+        run: npm run build
+      - working-directory: clients/ts
+        run: npm test
+        env:
+          TYMUXD_BIN: ${{ github.workspace }}/target/debug/tymuxd
+
   tag-version-check:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

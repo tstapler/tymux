@@ -16,7 +16,8 @@ scripts in any language buf can generate a client for.
 - **Structured pane capture** — `CapturePane`/`Attach` return cells with
   attributes, not raw ANSI text you have to re-parse
 - **One proto schema, buf-managed** — add a TS/Python/Go client without
-  touching the Rust core
+  touching the Rust core; [`clients/ts/`](clients/ts/README.md) is a real,
+  working TypeScript client proving this, not an aspirational claim
 - **Built PTY-up for programmatic control** — not a human-scripting tool
   with an API bolted on afterward
 
