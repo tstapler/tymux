@@ -8,7 +8,8 @@ use tonic::Request;
 
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
-    attach_event, attach_request, AttachRequest, CreateSessionRequest, ListSessionsRequest, Session,
+    attach_event, attach_request, AttachRequest, CreateSessionRequest, KillSessionRequest,
+    ListSessionsRequest, Session,
 };
 
 /// Every session today has exactly one window with one pane (see
@@ -51,6 +52,8 @@ enum Command {
     Ls,
     /// Attach to an existing session by id.
     Attach { session_id: String },
+    /// End a session and its pane's process entirely.
+    Kill { session_id: String },
 }
 
 /// Restores the local terminal out of raw mode on drop, including on
@@ -109,6 +112,11 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no such session: {session_id}"))?;
             let pane_id = first_pane_id(&session)?;
             attach(&mut client, pane_id).await?;
+        }
+        Command::Kill { session_id } => {
+            client
+                .kill_session(KillSessionRequest { session_id })
+                .await?;
         }
     }
 
@@ -227,6 +235,15 @@ mod tests {
             other => panic!("expected Command::Attach, got a different variant: {other:?}"),
         }
         assert!(Cli::try_parse_from(["tymux", "attach"]).is_err());
+    }
+
+    #[test]
+    fn kill_requires_session_id() {
+        match parse(&["kill", "some-uuid"]).command {
+            Command::Kill { session_id } => assert_eq!(session_id, "some-uuid"),
+            other => panic!("expected Command::Kill, got a different variant: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["tymux", "kill"]).is_err());
     }
 
     fn session_with(windows: Vec<tymux_proto::v1::Window>) -> Session {
