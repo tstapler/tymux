@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g id="icon">
+    <!-- base fill (safety net beneath the pane grid) -->
+    <rect x="0" y="0" width="512" height="512" fill="#0c0a08"/>
+
+    <!-- Recursive golden-ratio pane grid (tmux-style splits):
+         1) horizontal split of the whole canvas at y=196 (512*0.382)
+         2) each half split vertically at x=316 (512*0.618), forming one
+            continuous seam down the middle from both independent splits
+         3) the bottom-left pane split again at y=391 (196 + 316*0.618)
+         5 panes total, alternating tone, all with bronze seams -->
+    <rect x="0"   y="0"   width="316" height="196" fill="#1a1510" stroke="#3d3020" stroke-width="8"/>
+    <rect x="316" y="0"   width="196" height="196" fill="#0c0a08" stroke="#3d3020" stroke-width="8"/>
+    <rect x="0"   y="196" width="316" height="195" fill="#0c0a08" stroke="#3d3020" stroke-width="8"/>
+    <rect x="0"   y="391" width="316" height="121" fill="#1a1510" stroke="#3d3020" stroke-width="8"/>
+    <rect x="316" y="196" width="196" height="316" fill="#1a1510" stroke="#3d3020" stroke-width="8"/>
+
+    <!-- Gold T traced exactly along the two structural seams above:
+         crossbar is centered on the y=196 split line (168..224),
+         stem is centered on the x=316 split line (288..344) -->
+    <rect x="0"   y="168" width="512" height="56"  fill="#c0a020" stroke="#3d3020" stroke-width="4"/>
+    <rect x="288" y="224" width="56"  height="288" fill="#c0a020" stroke="#3d3020" stroke-width="4"/>
+  </g>
+</svg>

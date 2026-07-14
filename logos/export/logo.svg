@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>tymux — recursive golden-ratio pane split, panes labeled T-Y-M-U-X like tmux's prefix+q pane-select overlay</title>
+  <g id="icon">
+    <rect x="0" y="0" width="316" height="512" fill="#0c0a08" stroke="#3d3020" stroke-width="14"/>
+    <rect x="316" y="0" width="196" height="316" fill="#1a1510" stroke="#3d3020" stroke-width="14"/>
+    <rect x="316" y="316" width="121" height="196" fill="#1a1510" stroke="#3d3020" stroke-width="14"/>
+    <rect x="437" y="316" width="75" height="121" fill="#221e18" stroke="#3d3020" stroke-width="14"/>
+    <rect x="437" y="437" width="75" height="75" fill="#c0a020" stroke="#3d3020" stroke-width="14"/>
+
+    <!-- Pane-select labels, tmux prefix+q style: one bold centered glyph per
+         pane, fixed size regardless of pane size (matching tmux's own
+         display-panes overlay, which doesn't scale to the pane either).
+         Parchment on the near-black panes, near-black on the gold pane for
+         contrast (same text-on-gold pairing as the brand palette's
+         primaryText token). Reading order largest->smallest spells TYMUX. -->
+    <g id="labels" font-family="'DejaVu Sans Mono', 'Courier New', Consolas, monospace" font-weight="bold" font-size="72" text-anchor="middle">
+      <text x="158" y="256" dominant-baseline="central" fill="#c8b89a">T</text>
+      <text x="414" y="158" dominant-baseline="central" fill="#c8b89a">Y</text>
+      <text x="376" y="414" dominant-baseline="central" fill="#c8b89a">M</text>
+      <text x="474" y="376" dominant-baseline="central" font-size="56" fill="#c8b89a">U</text>
+      <text x="474" y="474" dominant-baseline="central" font-size="56" fill="#0c0a08">X</text>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,24 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <title>tymux — shallow golden-rectangle pane spiral with hidden prompt cursor</title>
+  <g id="icon">
+    <rect x="0" y="0" width="512" height="512" fill="#0c0a08"/>
+
+    <!-- Top-half golden-rectangle whirling-square spiral, 3 squares + 1 terminal panel
+         (box 66,21 -> 446,256, 380x235 ~= 1.618 golden rectangle)
+         Fibonacci progression: 90, 145, 235 (leftover panel closes the box) -->
+    <rect x="66" y="21" width="235" height="235" fill="#1a1510" stroke="#3d3020" stroke-width="8"/>
+    <rect x="301" y="21" width="145" height="145" fill="#0c0a08" stroke="#3d3020" stroke-width="8"/>
+    <rect x="301" y="166" width="90" height="90" fill="#1a1510" stroke="#3d3020" stroke-width="8"/>
+    <rect x="391" y="166" width="55" height="90" fill="#0c0a08" stroke="#3d3020" stroke-width="8"/>
+
+    <!-- Bottom-half spiral, exact mirror about y=256 (box 66,256 -> 446,491) -->
+    <rect x="66" y="256" width="235" height="235" fill="#1a1510" stroke="#3d3020" stroke-width="8"/>
+    <rect x="301" y="346" width="145" height="145" fill="#0c0a08" stroke="#3d3020" stroke-width="8"/>
+    <rect x="301" y="256" width="90" height="90" fill="#1a1510" stroke="#3d3020" stroke-width="8"/>
+    <rect x="391" y="256" width="55" height="90" fill="#0c0a08" stroke="#3d3020" stroke-width="8"/>
+
+    <!-- Hidden cursor/prompt arrow: rectilinear path along the real pane-split corners -->
+    <path d="M66,21 L301,21 L301,166 L391,166 L391,256 L391,346 L301,346 L301,491 L66,491"
+          fill="none" stroke="#c0a020" stroke-width="52" stroke-linejoin="miter" stroke-linecap="square"/>
+  </g>
+</svg>

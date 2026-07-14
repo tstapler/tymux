@@ -4,3 +4,6 @@
 # Stray debris, not part of this project
 /~
 /.stapler_squad_history
+
+# Claude Code session runtime state, not project content
+/.claude/scheduled_tasks.lock

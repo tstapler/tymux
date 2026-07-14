@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g id="icon">
+    <!-- base pane: near-black background, dominant fill (~67.7% of viewBox) -->
+    <rect x="0" y="0" width="512" height="512" fill="#0c0a08"/>
+
+    <!-- secondary panel-tone panes, positioned at recursive golden-ratio split
+         coordinates (512/phi=316, 512/phi^2=196, 512/phi^3=121, 512/phi^4=75)
+         to read as split-off tmux-style panes -->
+    <rect x="0" y="0" width="512" height="47" fill="#1a1510"/>
+    <rect x="391" y="437" width="121" height="75" fill="#1a1510"/>
+
+    <!-- gold split-lines: the crossbar (centered on the y=75 golden split line,
+         56 units thick) and the stem (centered on x=256, the midpoint of the
+         two primary golden divisions 316 and 196, 56 units thick), meeting
+         flush at y=103 to compose a single unbroken capital T -->
+    <rect x="0" y="47" width="512" height="56" fill="#c0a020"/>
+    <rect x="228" y="103" width="56" height="409" fill="#c0a020"/>
+  </g>
+</svg>

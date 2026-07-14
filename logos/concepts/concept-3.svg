@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<g id="icon">
+  <!-- Pane 1: largest, left column, full height (316 x 512) -->
+  <rect x="0" y="0" width="316" height="512" fill="#0c0a08" stroke="#3d3020" stroke-width="6"/>
+  <!-- Pane 2: top-right (196 x 316) -->
+  <rect x="316" y="0" width="196" height="316" fill="#1a1510" stroke="#3d3020" stroke-width="6"/>
+  <!-- Pane 3: mid-right, below pane 2 (121 x 196) -->
+  <rect x="316" y="316" width="121" height="196" fill="#0c0a08" stroke="#3d3020" stroke-width="6"/>
+  <!-- Pane 4: smallest, active pane, bottom-right corner (75 x 196) -->
+  <rect x="437" y="316" width="75" height="196" fill="#8b1a1a" stroke="#3d3020" stroke-width="6"/>
+
+  <!-- Gold stair-step spiral accent: connects outer corners of panes 1->2->3->4, rectilinear turns only.
+       fix: points inset 10 units (half the 20-unit stroke) wherever the path ran flush along
+       the canvas edge (y=0, x=512, y=512) — otherwise half the stroke rendered off-canvas,
+       leaving those segments visibly thinner than the interior ones. -->
+  <polyline points="10,10 502,10 502,316 316,316 316,502 502,502"
+            fill="none" stroke="#c0a020" stroke-width="20"
+            stroke-linejoin="miter" stroke-linecap="square"/>
+</g>
+</svg>

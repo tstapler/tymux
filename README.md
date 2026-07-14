@@ -1,4 +1,9 @@
-# tymux
+<p align="center">
+  <img src="logos/export/logo.svg" width="160" alt="tymux logo — a recursive golden-ratio pane split, panes labeled T Y M U X like tmux's own pane-select overlay">
+</p>
+
+<h1 align="center">tymux</h1>
+<p align="center"><strong>tmux's model, rebuilt with a typed API.</strong></p>
 
 A tmux-inspired terminal multiplexer, rebuilt from scratch in Rust with a
 first-class gRPC/protobuf API. tmux's session/window/pane model is the
@@ -7,6 +12,13 @@ the API — the multiplexer's core state (what's on screen, structured, not
 scraped) is meant to be driven by things other than a human at a terminal:
 AI coding agents, web frontends (e.g. [stapler-squad](https://github.com/tstapler/stapler-squad)),
 scripts in any language buf can generate a client for.
+
+- **Structured pane capture** — `CapturePane`/`Attach` return cells with
+  attributes, not raw ANSI text you have to re-parse
+- **One proto schema, buf-managed** — add a TS/Python/Go client without
+  touching the Rust core
+- **Built PTY-up for programmatic control** — not a human-scripting tool
+  with an API bolted on afterward
 
 ## Why not just script tmux?
 

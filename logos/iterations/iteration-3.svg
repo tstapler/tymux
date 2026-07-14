@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<g id="icon">
+  <rect x="0" y="0" width="316" height="512" fill="#0c0a08" stroke="#3d3020" stroke-width="6"/>
+  <rect x="316" y="0" width="196" height="316" fill="#1a1510" stroke="#3d3020" stroke-width="6"/>
+  <rect x="316" y="316" width="121" height="196" fill="#0c0a08" stroke="#3d3020" stroke-width="6"/>
+  <rect x="437" y="316" width="75" height="196" fill="#8b1a1a" stroke="#3d3020" stroke-width="6"/>
+  <!-- discovered gold accent: a "pane-split" crosshair centered exactly on the internal
+       3-way pane junction (316,316) where rect1/rect2/rect3 meet. Fully interior — its
+       nearest point is 268 units from the canvas edge, nothing like a border. Arms are
+       32 units thick (well over the 16-20 minimum) and 96 units long, so it reads as a
+       solid gold plus at small sizes, not a hairline. -->
+  <polygon points="300,268 332,268 332,300 364,300 364,332 332,332 332,364 300,364 300,332 268,332 268,300 300,300"
+           fill="#c0a020"/>
+</g>
+</svg>
