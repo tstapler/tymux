@@ -17,9 +17,9 @@ use tymux_proto::v1::{
     CreateWindowRequest, KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
     LayoutChild as ProtoLayoutChild, ListSessionsRequest, ListSessionsResponse, Liveness,
     Orientation as ProtoOrientation, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
-    ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow, Session as ProtoSession,
-    Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow,
-    WindowLayoutEvent,
+    ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest,
+    SearchScrollbackResponse, Session as ProtoSession, Split as ProtoSplit, SplitPaneRequest,
+    WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
 };
 
 pub struct TymuxDaemon {
@@ -272,16 +272,39 @@ impl TymuxService for TymuxDaemon {
         &self,
         request: Request<CapturePaneRequest>,
     ) -> Result<Response<ProtoSnapshot>, Status> {
-        let pane_id_str = request.into_inner().pane_id;
-        let pane_id = parse_uuid(&pane_id_str)?;
+        let req = request.into_inner();
+        let pane_id = parse_uuid(&req.pane_id)?;
         let pane = resolve_live_pane(&self.engine, pane_id).inspect_err(|status| {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "capture_pane: pane unavailable");
         })?;
         Ok(Response::new(snapshot_to_proto(
-            &pane_id_str,
-            pane.snapshot(),
+            &req.pane_id,
+            pane.snapshot_at_offset(req.scrollback_offset as usize),
             true,
         )))
+    }
+
+    async fn search_scrollback(
+        &self,
+        request: Request<SearchScrollbackRequest>,
+    ) -> Result<Response<SearchScrollbackResponse>, Status> {
+        let req = request.into_inner();
+        let pane_id = parse_uuid(&req.pane_id)?;
+        let pane = resolve_live_pane(&self.engine, pane_id).inspect_err(|status| {
+            tracing::warn!(pane_id = %pane_id, code = ?status.code(), "search_scrollback: pane unavailable");
+        })?;
+        match pane.search_scrollback(&req.pattern, req.start_offset as usize) {
+            Some((offset, line)) => Ok(Response::new(SearchScrollbackResponse {
+                found: true,
+                offset: offset as u32,
+                line,
+            })),
+            None => Ok(Response::new(SearchScrollbackResponse {
+                found: false,
+                offset: 0,
+                line: String::new(),
+            })),
+        }
     }
 
     async fn split_pane(
@@ -712,13 +735,18 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
+    fn capture_req(pane_id: String) -> CapturePaneRequest {
+        CapturePaneRequest {
+            pane_id,
+            scrollback_offset: 0,
+        }
+    }
+
     #[tokio::test]
     async fn capture_pane_unknown_id_is_not_found() {
         let daemon = test_daemon();
         let err = daemon
-            .capture_pane(Request::new(CapturePaneRequest {
-                pane_id: Uuid::new_v4().to_string(),
-            }))
+            .capture_pane(Request::new(capture_req(Uuid::new_v4().to_string())))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
@@ -735,7 +763,7 @@ mod tests {
         let pane_id = sole_pane(&session.windows[0]).id.clone();
 
         let snapshot = daemon
-            .capture_pane(Request::new(CapturePaneRequest { pane_id }))
+            .capture_pane(Request::new(capture_req(pane_id)))
             .await
             .unwrap()
             .into_inner();
@@ -841,17 +869,13 @@ mod tests {
         wait_for_pane_exit(&pane).await;
 
         let dead_err = daemon
-            .capture_pane(Request::new(CapturePaneRequest {
-                pane_id: pane_id_str,
-            }))
+            .capture_pane(Request::new(capture_req(pane_id_str)))
             .await
             .unwrap_err();
         assert_eq!(dead_err.code(), tonic::Code::FailedPrecondition);
 
         let unknown_err = daemon
-            .capture_pane(Request::new(CapturePaneRequest {
-                pane_id: Uuid::new_v4().to_string(),
-            }))
+            .capture_pane(Request::new(capture_req(Uuid::new_v4().to_string())))
             .await
             .unwrap_err();
         assert_eq!(unknown_err.code(), tonic::Code::NotFound);
