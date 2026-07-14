@@ -274,9 +274,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%addr, "tymuxd listening");
     Server::builder()
         .add_service(TymuxServiceServer::new(daemon))
-        .serve(socket_addr)
+        .serve_with_shutdown(socket_addr, shutdown_signal())
         .await?;
+    tracing::info!("tymuxd shut down");
     Ok(())
+}
+
+/// Resolves on Ctrl-C or SIGTERM, whichever comes first — so tonic stops
+/// accepting new connections and exits cleanly instead of dying mid-request
+/// with no log at all. There's nothing to drain beyond that (no
+/// persistence exists to flush — see the ADR/README), but a clean, logged
+/// stop instead of a silent kill is still worth having.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received Ctrl-C, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
 }
 
 #[cfg(test)]
