@@ -1520,6 +1520,7 @@ dependencies = [
  "anyhow",
  "portable-pty",
  "tokio",
+ "tracing",
  "uuid",
  "vt100",
 ]

@@ -80,3 +80,74 @@ impl Engine {
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // /bin/sh explicitly (not the default_shell() fallback) so these tests
+    // don't depend on $SHELL or bash being present, matching pane.rs's test.
+    fn sh() -> Option<String> {
+        Some("/bin/sh".to_string())
+    }
+
+    #[test]
+    fn create_and_list_session() {
+        let engine = Engine::new();
+        let id = engine.create_session("test".to_string(), sh()).unwrap();
+
+        let sessions = engine.list_sessions();
+        assert_eq!(sessions.len(), 1);
+        let (sid, name, _window_id, _pane_id) = &sessions[0];
+        assert_eq!(*sid, id);
+        assert_eq!(name, "test");
+    }
+
+    #[test]
+    fn multiple_sessions_are_independent() {
+        let engine = Engine::new();
+        let id1 = engine.create_session("one".to_string(), sh()).unwrap();
+        let id2 = engine.create_session("two".to_string(), sh()).unwrap();
+
+        let sessions = engine.list_sessions();
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<Uuid> = sessions.iter().map(|(id, ..)| *id).collect();
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+        assert_ne!(id1, id2);
+
+        let pane_ids: Vec<Uuid> = sessions.iter().map(|(.., pane_id)| *pane_id).collect();
+        assert_ne!(pane_ids[0], pane_ids[1], "each session gets its own pane");
+    }
+
+    #[test]
+    fn kill_session_removes_it() {
+        let engine = Engine::new();
+        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        assert_eq!(engine.list_sessions().len(), 1);
+
+        engine.kill_session(id).unwrap();
+        assert_eq!(engine.list_sessions().len(), 0);
+    }
+
+    #[test]
+    fn kill_session_unknown_id_errors() {
+        let engine = Engine::new();
+        let result = engine.kill_session(Uuid::new_v4());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pane_lookup_by_id() {
+        let engine = Engine::new();
+        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let (_, _, _, pane_id) = engine
+            .list_sessions()
+            .into_iter()
+            .find(|(sid, ..)| *sid == id)
+            .unwrap();
+
+        assert!(engine.pane(pane_id).is_some());
+        assert!(engine.pane(Uuid::new_v4()).is_none());
+    }
+}

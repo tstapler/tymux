@@ -259,3 +259,163 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
+
+    fn test_daemon() -> TymuxDaemon {
+        TymuxDaemon {
+            engine: Arc::new(Engine::new()),
+        }
+    }
+
+    // /bin/sh explicitly so these don't depend on $SHELL/bash being present.
+    fn create_req(name: &str) -> CreateSessionRequest {
+        CreateSessionRequest {
+            name: name.to_string(),
+            command: "/bin/sh".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_appears_in_list() {
+        let daemon = test_daemon();
+        let resp = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.name, "test");
+        let pane_id = resp.windows[0].panes[0].id.clone();
+
+        let list = daemon
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(list.sessions.len(), 1);
+        assert_eq!(list.sessions[0].windows[0].panes[0].id, pane_id);
+    }
+
+    #[tokio::test]
+    async fn kill_session_unknown_id_is_not_found() {
+        let daemon = test_daemon();
+        let err = daemon
+            .kill_session(Request::new(KillSessionRequest {
+                session_id: Uuid::new_v4().to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn kill_session_invalid_uuid_is_invalid_argument() {
+        let daemon = test_daemon();
+        let err = daemon
+            .kill_session(Request::new(KillSessionRequest {
+                session_id: "not-a-uuid".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn capture_pane_unknown_id_is_not_found() {
+        let daemon = test_daemon();
+        let err = daemon
+            .capture_pane(Request::new(CapturePaneRequest {
+                pane_id: Uuid::new_v4().to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn capture_pane_returns_structured_snapshot() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = session.windows[0].panes[0].id.clone();
+
+        let snapshot = daemon
+            .capture_pane(Request::new(CapturePaneRequest { pane_id }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(snapshot.rows, 24);
+        assert_eq!(snapshot.cols, 80);
+        assert_eq!(snapshot.grid.len(), 24);
+    }
+
+    /// End-to-end regression test for the Ctrl-d hang bug fixed earlier:
+    /// spins up a real server, attaches, tells the shell to exit, and
+    /// asserts the stream reports Exited and closes — instead of hanging.
+    #[tokio::test]
+    async fn attach_streams_output_and_signals_exit() {
+        let daemon = test_daemon();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TymuxServiceServer::new(daemon))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let mut client = TymuxServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client should connect to the just-bound listener");
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = session.windows[0].panes[0].id.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+        })
+        .await
+        .unwrap();
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
+        })
+        .await
+        .unwrap();
+
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let saw_exit = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = inbound.message().await.unwrap() {
+                if matches!(event.payload, Some(attach_event::Payload::Exited(_))) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("attach stream must close within 5s, not hang");
+
+        assert!(
+            saw_exit,
+            "expected an Exited event before the stream closed"
+        );
+    }
+}

@@ -21,7 +21,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Create a new session and attach to it.
     New {
@@ -147,4 +147,68 @@ async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Re
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("tymux").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // clap's own debug_assert! sanity checks (duplicate args, etc.).
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn default_addr_is_localhost() {
+        let cli = parse(&["ls"]);
+        assert_eq!(cli.addr, "http://127.0.0.1:7419");
+    }
+
+    #[test]
+    fn addr_can_be_overridden() {
+        let cli = parse(&["--addr", "http://example.com:1234", "ls"]);
+        assert_eq!(cli.addr, "http://example.com:1234");
+    }
+
+    #[test]
+    fn ls_parses() {
+        assert!(matches!(parse(&["ls"]).command, Command::Ls));
+    }
+
+    #[test]
+    fn new_defaults_to_name_default_and_no_command() {
+        match parse(&["new"]).command {
+            Command::New { name, command } => {
+                assert_eq!(name, "default");
+                assert_eq!(command, None);
+            }
+            other => panic!("expected Command::New, got a different variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_accepts_name_and_command() {
+        match parse(&["new", "--name", "work", "--command", "bash"]).command {
+            Command::New { name, command } => {
+                assert_eq!(name, "work");
+                assert_eq!(command, Some("bash".to_string()));
+            }
+            other => panic!("expected Command::New, got a different variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_requires_session_id() {
+        match parse(&["attach", "some-uuid"]).command {
+            Command::Attach { session_id } => assert_eq!(session_id, "some-uuid"),
+            other => panic!("expected Command::Attach, got a different variant: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["tymux", "attach"]).is_err());
+    }
 }
