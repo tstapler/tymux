@@ -56,5 +56,9 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: tymuxd,tymux-cli
+          # The default archive name ($bin-$target) only works for a
+          # single binary — tymuxd and tymux-cli ship together in one
+          # archive per target, so this must be named explicitly.
+          archive: tymux-$target
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
