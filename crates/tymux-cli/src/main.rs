@@ -75,7 +75,34 @@ impl Drop for RawGuard {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("tymux: {}", friendly_message(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Every failure used to funnel into Rust's default `Result`-returning-
+/// `main` handler, which prints the full anyhow Debug chain — a multi-line
+/// technical dump for something as ordinary as "the daemon isn't running."
+/// This gives the two common cases (can't connect; a clean server-side
+/// Status like "no such session") a short, actionable message instead.
+fn friendly_message(e: &anyhow::Error) -> String {
+    if e.downcast_ref::<tonic::transport::Error>().is_some() {
+        return "couldn't connect to tymuxd — is the daemon running? \
+                (start it with `cargo run -p tymuxd`)"
+            .to_string();
+    }
+    if let Some(status) = e.downcast_ref::<tonic::Status>() {
+        return status.message().to_string();
+    }
+    e.to_string()
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     let mut client = TymuxServiceClient::connect(cli.addr).await?;
 
@@ -235,6 +262,19 @@ mod tests {
     fn cli_definition_is_valid() {
         // clap's own debug_assert! sanity checks (duplicate args, etc.).
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn friendly_message_unwraps_tonic_status_to_its_plain_text() {
+        let status = tonic::Status::not_found("no such session: abc");
+        let err: anyhow::Error = status.into();
+        assert_eq!(friendly_message(&err), "no such session: abc");
+    }
+
+    #[test]
+    fn friendly_message_passes_through_generic_errors() {
+        let err = anyhow::anyhow!("no such session: abc");
+        assert_eq!(friendly_message(&err), "no such session: abc");
     }
 
     #[test]
