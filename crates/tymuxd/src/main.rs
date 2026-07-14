@@ -252,13 +252,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let addr = std::env::var("TYMUXD_ADDR").unwrap_or_else(|_| "127.0.0.1:7419".to_string());
+    let socket_addr: std::net::SocketAddr = addr.parse()?;
+
+    // There is no authentication anywhere in this daemon today: any client
+    // that can reach this port can CreateSession (spawning an arbitrary
+    // command) and Attach/CapturePane/KillSession against any pane_id with
+    // no ownership check. That's an acceptable default on loopback, where
+    // only local processes can reach it — it is unauthenticated remote
+    // code execution if bound to a non-loopback address. This can't be
+    // forbidden outright (a real multi-host deployment may need it and
+    // that's a legitimate choice), but it must not be silent.
+    if !socket_addr.ip().is_loopback() {
+        tracing::warn!(
+            %socket_addr,
+            "tymuxd is binding to a non-loopback address with NO authentication of any kind. \
+             Any client that can reach this port has full control: it can run arbitrary \
+             commands via CreateSession and attach to any existing pane. Do not do this on an \
+             untrusted network. Per-pane authorization is not implemented yet — see \
+             docs/reviews/is-it-ready-2026-07-13.md."
+        );
+    }
+
     let engine = Arc::new(Engine::new());
     let daemon = TymuxDaemon { engine };
 
     tracing::info!(%addr, "tymuxd listening");
     Server::builder()
         .add_service(TymuxServiceServer::new(daemon))
-        .serve(addr.parse()?)
+        .serve(socket_addr)
         .await?;
     Ok(())
 }
