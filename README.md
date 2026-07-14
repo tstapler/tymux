@@ -37,7 +37,7 @@ crates/
   tymux-core/   session/window/pane engine — PTY spawn (portable-pty) + vt100 screen state
   tymux-proto/  generated Rust types from proto/ (tonic-build via build.rs)
   tymuxd/       the daemon: gRPC server wrapping tymux-core
-  tymux-cli/    thin client: create/list/attach sessions from a terminal
+  tymux-cli/    thin client: create/list/attach/kill sessions from a terminal
 proto/          buf-managed .proto — lint/breaking-change checks, and the
                 source of truth for any future non-Rust client (buf.gen.yaml)
 ```
@@ -52,12 +52,18 @@ other-language clients (TS, Python, ...) get added later, in
 
 MVP: one pane per window per session (no splits yet — the proto already
 models `repeated windows`/`repeated panes`, so this is additive, not a
-breaking change, when splits get built). No auth — the daemon is meant to
-run locally or on a trusted network for now. No persistence — sessions
-live in the daemon's memory only; killing `tymuxd` kills every session,
-same as tmux's own server model but without tmux's socket-survives-crash
+breaking change, when splits get built; see `docs/adr/0001-single-pane-per-session-for-now.md`).
+No auth — the daemon is meant to run locally for now; it warns loudly at
+startup if `TYMUXD_ADDR` is set to a non-loopback address, since there's
+no per-pane authorization yet. No persistence — sessions live in the
+daemon's memory only; killing `tymuxd` kills every session, same as
+tmux's own server model but without tmux's socket-survives-crash
 guarantee (that's a real gap if this needs to survive a daemon restart —
 add it when it matters).
+
+See `docs/reviews/is-it-ready-2026-07-13.md` for the full readiness
+review this status section is drawn from, including what's since been
+fixed.
 
 ## Running it
 
