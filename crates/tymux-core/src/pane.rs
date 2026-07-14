@@ -187,6 +187,21 @@ impl Pane {
     }
 }
 
+impl Drop for Pane {
+    /// Joins the reader thread so a panic in it (as opposed to the normal
+    /// EOF/error exit, which already signals via `exited`/`exit_notify`)
+    /// gets surfaced instead of vanishing silently. In the common case the
+    /// thread has already finished by the time the last `Arc<Pane>` drops,
+    /// so this join returns immediately.
+    fn drop(&mut self) {
+        if let Some(handle) = self._reader_handle.lock().unwrap().take() {
+            if let Err(panic) = handle.join() {
+                tracing::error!(pane_id = %self.id, ?panic, "pane reader thread panicked");
+            }
+        }
+    }
+}
+
 /// Packs a vt100 color into one u32: top byte tags the variant so
 /// `Default`/`Idx`/`Rgb` round-trip without a separate enum crossing the
 /// gRPC boundary. 0x00 = default, 0x01 = indexed (low byte = index),

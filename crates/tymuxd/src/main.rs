@@ -67,6 +67,15 @@ fn parse_uuid(s: &str) -> Result<Uuid, Status> {
     Uuid::parse_str(s).map_err(|_| Status::invalid_argument("invalid id"))
 }
 
+/// Awaits a spawned task's handle purely to log if it panicked — a bare
+/// `tokio::spawn` with nothing ever awaiting the handle means a panic
+/// inside it disappears with no trace anywhere.
+async fn supervise(pane_id: Uuid, task: &'static str, handle: tokio::task::JoinHandle<()>) {
+    if let Err(e) = handle.await {
+        tracing::error!(pane_id = %pane_id, task, error = %e, "attach task panicked");
+    }
+}
+
 #[tonic::async_trait]
 impl TymuxService for TymuxDaemon {
     async fn create_session(
@@ -169,7 +178,7 @@ impl TymuxService for TymuxDaemon {
 
         let forward_tx = tx.clone();
         let pane_for_exit = pane.clone();
-        tokio::spawn(async move {
+        let forward_handle = tokio::spawn(async move {
             loop {
                 // `biased` checks output_rx first every iteration, so any
                 // output already sent before the child exited (the reader
@@ -201,9 +210,11 @@ impl TymuxService for TymuxDaemon {
                 }
             }
         });
+        // Spawned tasks that panic vanish silently by default — surface it.
+        tokio::spawn(supervise(pane_id, "forward", forward_handle));
 
         let pane_for_input = pane.clone();
-        tokio::spawn(async move {
+        let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
                     Some(attach_request::Payload::Input(bytes)) => {
@@ -220,6 +231,7 @@ impl TymuxService for TymuxDaemon {
                 }
             }
         });
+        tokio::spawn(supervise(pane_id, "input", input_handle));
 
         Ok(Response::new(
             Box::pin(ReceiverStream::new(rx)) as Self::AttachStream
