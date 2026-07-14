@@ -17,13 +17,37 @@ service TymuxService {
 
   // Bidirectional stream: client sends input/resize events, server streams
   // output back. This is what an interactive attach (human or agent) uses.
+  //
+  // Contract:
+  //  - The first AttachRequest on the stream MUST set the pane_id field of
+  //    the oneof; any other first message is rejected with
+  //    invalid_argument.
+  //  - Detaching means fully cancelling this call (dropping/closing both
+  //    directions). Half-closing only the send side does not stop the
+  //    receive side or end the attach — the server keeps streaming output
+  //    until the whole call is cancelled.
+  //  - output_gap=true on an AttachEvent means the server's internal
+  //    output broadcast channel dropped frames for this consumer (it fell
+  //    behind); some output between the previous and next Output event was
+  //    lost. This is not a fatal condition — normal streaming resumes
+  //    immediately after.
   rpc Attach(stream AttachRequest) returns (stream AttachEvent);
+}
+
+// Whether a pane's/session's backing process is still running. proto3
+// reserves 0 for UNSPECIFIED rather than overloading it as a real state, so
+// an absent/default field is never silently misread as LIVE or DEAD.
+enum Liveness {
+  LIVENESS_UNSPECIFIED = 0;
+  LIVENESS_LIVE = 1;
+  LIVENESS_DEAD = 2;
 }
 
 message Session {
   string id = 1;
   string name = 2;
   repeated Window windows = 3;
+  Liveness liveness = 4;
 }
 
 message Window {
@@ -36,6 +60,7 @@ message Pane {
   string id = 1;
   uint32 rows = 2;
   uint32 cols = 3;
+  Liveness liveness = 4;
 }
 
 message CreateSessionRequest {
@@ -66,6 +91,7 @@ message PaneSnapshot {
   repeated Row grid = 4;
   uint32 cursor_row = 5;
   uint32 cursor_col = 6;
+  Liveness liveness = 7;
 }
 
 message Row {
@@ -97,5 +123,10 @@ message AttachEvent {
     bytes output = 1; // raw pty output bytes, as they arrive
     PaneSnapshot snapshot = 2;
     bool exited = 3; // the pane's child process has exited; no more output follows
+    // The server's output broadcast channel dropped frames for this
+    // consumer (it fell behind a burst of pty output). Some output
+    // between the previous and next Output event was lost; normal
+    // streaming resumes immediately after this event.
+    bool output_gap = 4;
   }
 }
