@@ -9,6 +9,13 @@ service TymuxService {
   rpc CreateSession(CreateSessionRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc KillSession(KillSessionRequest) returns (KillSessionResponse);
+  // Respawns fresh ptys for a dead-flagged (restored-but-not-yet-revived)
+  // session, matching its persisted Layout shape — each pane's original
+  // command re-run in its persisted cwd. Never triggered automatically on
+  // daemon start (ADR-002); only an explicit call reaches this. A no-op
+  // (ReviveSessionResponse.already_live=true) if the session is already
+  // live — never a duplicate spawn.
+  rpc ReviveSession(ReviveSessionRequest) returns (ReviveSessionResponse);
 
   // One-shot structured read of a pane's current screen — the AI-friendly
   // alternative to `tmux capture-pane` (which returns raw text you'd have
@@ -133,6 +140,16 @@ message KillSessionRequest {
 }
 
 message KillSessionResponse {}
+
+message ReviveSessionRequest {
+  string session_id = 1;
+}
+
+message ReviveSessionResponse {
+  bool already_live = 1;
+  uint32 pane_count = 2; // number of panes respawned (0 if already_live)
+  Session session = 3;
+}
 
 message SplitPaneRequest {
   string pane_id = 1; // target leaf to split

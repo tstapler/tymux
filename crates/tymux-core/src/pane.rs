@@ -35,6 +35,11 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 /// directly instead of re-parsing ANSI escapes out of captured text.
 pub struct Pane {
     pub id: Uuid,
+    /// The command this pane was spawned with, and the daemon's working
+    /// directory at spawn time — persisted (Epic 4) so `tymux revive` can
+    /// respawn an equivalent process later; not otherwise used at runtime.
+    pub command: String,
+    pub cwd: String,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
@@ -66,6 +71,45 @@ pub struct CellSnapshot {
 
 impl Pane {
     pub fn spawn(command: &str, rows: u16, cols: u16) -> Result<Arc<Self>> {
+        Self::spawn_internal(command, None, None, rows, cols)
+    }
+
+    /// Like [`Self::spawn`], but with an explicit working directory — used
+    /// by `tymux revive` (Epic 4) to respawn a pane in its persisted `cwd`
+    /// rather than the daemon's own. `cwd: None` behaves exactly like
+    /// [`Self::spawn`] (inherits the daemon's current directory).
+    pub fn spawn_with_cwd(
+        command: &str,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_internal(command, cwd, None, rows, cols)
+    }
+
+    /// Like [`Self::spawn_with_cwd`], but assigns a specific `id` rather
+    /// than generating one — `tymux revive` (Epic 4) must respawn a pane
+    /// at the *same* id as the dead `PaneEntry` it replaces, so every
+    /// existing reference to that pane_id (the window's `LayoutNode` leaf,
+    /// a client that already resolved a `TargetString` to it) keeps
+    /// pointing at the right pane.
+    pub fn spawn_with_id(
+        id: Uuid,
+        command: &str,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_internal(command, cwd, Some(id), rows, cols)
+    }
+
+    fn spawn_internal(
+        command: &str,
+        cwd: Option<&str>,
+        id: Option<Uuid>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Arc<Self>> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -74,7 +118,10 @@ impl Pane {
             pixel_height: 0,
         })?;
 
-        let cmd = CommandBuilder::new(command);
+        let mut cmd = CommandBuilder::new(command);
+        if let Some(cwd) = cwd {
+            cmd.cwd(cwd);
+        }
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
@@ -84,8 +131,15 @@ impl Pane {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
 
+        let effective_cwd = cwd.map(str::to_string).unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        });
         let pane = Arc::new(Pane {
-            id: Uuid::new_v4(),
+            id: id.unwrap_or_else(Uuid::new_v4),
+            command: command.to_string(),
+            cwd: effective_cwd,
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             parser: parser.clone(),

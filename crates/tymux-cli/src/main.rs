@@ -10,7 +10,7 @@ use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
     attach_event, attach_request, layout::Node, AttachRequest, ClosePaneRequest,
     CreateSessionRequest, KillSessionRequest, ListSessionsRequest, Orientation, Pane as ProtoPane,
-    Resize, Session, SplitPaneRequest, Window,
+    Resize, ReviveSessionRequest, ReviveSessionResponse, Session, SplitPaneRequest, Window,
 };
 
 /// `session[:window.pane]` addressing grammar, replacing the old
@@ -62,8 +62,11 @@ impl TargetString {
     /// Resolves this target against a real `Session`, bounds-checked at
     /// every step — a real bounds check, not a formality, matching
     /// ADR 0001's original design property that this never panics on an
-    /// out-of-range index, it fails with a clear message instead.
-    fn resolve(&self, session: &Session) -> Result<String> {
+    /// out-of-range index, it fails with a clear message instead. Returns
+    /// the resolved pane in full (not just its id) so callers that care
+    /// about liveness (e.g. `attach`'s Story 4.6 fail-fast check) don't
+    /// need a second round trip.
+    fn resolve(&self, session: &Session) -> Result<ProtoPane> {
         let window = session.windows.get(self.window_index).ok_or_else(|| {
             anyhow::anyhow!(
                 "session '{}' has no window {} (it has {} window{})",
@@ -84,7 +87,7 @@ impl TargetString {
                 if panes.len() == 1 { "" } else { "s" }
             )
         })?;
-        Ok(pane.id.clone())
+        Ok((*pane).clone())
     }
 }
 
@@ -129,7 +132,7 @@ fn first_pane_id(session: &Session) -> Result<String> {
 async fn resolve_target(
     client: &mut TymuxServiceClient<Channel>,
     target: &TargetString,
-) -> Result<String> {
+) -> Result<ProtoPane> {
     let resp = client
         .list_sessions(ListSessionsRequest {})
         .await?
@@ -167,6 +170,8 @@ enum Command {
     Attach { target: String },
     /// End a session and every pane's process in it entirely.
     Kill { session_id: String },
+    /// Respawn a dead (restored-but-not-yet-revived) session's panes.
+    Revive { session: String },
     /// Split an existing pane, e.g. `tymux split myproject:0.0 --vertical`.
     Split {
         target: String,
@@ -249,18 +254,46 @@ async fn run() -> Result<()> {
                 .await?
                 .into_inner();
             for s in resp.sessions {
-                println!("{}\t{}", s.id, s.name);
+                println!("{}\t{}", s.id, ls_status_label(&s));
             }
         }
         Command::Attach { target } => {
             let target = TargetString::parse(&target)?;
-            let pane_id = resolve_target(&mut client, &target).await?;
-            attach(&mut client, pane_id).await?;
+            let pane = resolve_target(&mut client, &target).await?;
+            // Story 4.6 AC1: fail fast, naming the revive remediation,
+            // before ever opening the Attach stream — never a hang, a
+            // bare gRPC error, or a silent no-op on a dead session.
+            if pane.liveness == tymux_proto::v1::Liveness::Dead as i32 {
+                return Err(anyhow::anyhow!(
+                    "Session '{}' is not running (restored from disk after a restart). \
+                     Run 'tymux revive {}' to respawn it, then attach again.",
+                    target.session,
+                    target.session
+                ));
+            }
+            attach(&mut client, pane.id).await?;
         }
         Command::Kill { session_id } => {
             client
                 .kill_session(KillSessionRequest { session_id })
                 .await?;
+        }
+        Command::Revive { session } => {
+            let resp = client
+                .list_sessions(ListSessionsRequest {})
+                .await?
+                .into_inner();
+            let session_id = resp
+                .sessions
+                .into_iter()
+                .find(|s| s.name == session)
+                .map(|s| s.id)
+                .ok_or_else(|| anyhow::anyhow!("no such session: {session}"))?;
+            let resp = client
+                .revive_session(ReviveSessionRequest { session_id })
+                .await?
+                .into_inner();
+            print_revive_outcome(&session, &resp);
         }
         Command::Split {
             target,
@@ -269,7 +302,7 @@ async fn run() -> Result<()> {
             command,
         } => {
             let target = TargetString::parse(&target)?;
-            let pane_id = resolve_target(&mut client, &target).await?;
+            let pane = resolve_target(&mut client, &target).await?;
             let orientation = if vertical {
                 Orientation::Vertical
             } else {
@@ -277,7 +310,7 @@ async fn run() -> Result<()> {
             };
             client
                 .split_pane(SplitPaneRequest {
-                    pane_id,
+                    pane_id: pane.id,
                     orientation: orientation as i32,
                     command: command.unwrap_or_default(),
                 })
@@ -285,9 +318,9 @@ async fn run() -> Result<()> {
         }
         Command::KillPane { target } => {
             let target = TargetString::parse(&target)?;
-            let pane_id = resolve_target(&mut client, &target).await?;
+            let pane = resolve_target(&mut client, &target).await?;
             let resp = client
-                .close_pane(ClosePaneRequest { pane_id })
+                .close_pane(ClosePaneRequest { pane_id: pane.id })
                 .await?
                 .into_inner();
             print_close_pane_outcome(&resp);
@@ -295,6 +328,35 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Story 4.4's two distinct message moments (task 3): a freshly succeeded
+/// revive states these are NEW processes with no carried-forward
+/// scrollback; an already-live session gets a friendly no-op pointing at
+/// `attach` instead, exiting 0 — never a duplicate-spawn error.
+fn print_revive_outcome(session_name: &str, resp: &ReviveSessionResponse) {
+    if resp.already_live {
+        println!(
+            "'{session_name}' is already live — nothing to revive. Use `tymux attach {session_name}` instead."
+        );
+    } else {
+        println!(
+            "Session revived: {} pane(s) respawned with their original command and working directory. \
+             These are NEW processes — scrollback from before the restart is not carried forward.",
+            resp.pane_count
+        );
+    }
+}
+
+/// Story 4.5 AC2: live and dead-restored sessions must render distinctly
+/// in `tymux ls` — never identical, so a user can tell at a glance which
+/// sessions need `tymux revive` before they can be attached to.
+fn ls_status_label(session: &Session) -> String {
+    if session.liveness == tymux_proto::v1::Liveness::Dead as i32 {
+        format!("{} [restored — not running]", session.name)
+    } else {
+        format!("{} [live]", session.name)
+    }
 }
 
 /// Story 3.5 AC3: a pane close that cascades to closing its window (and,
@@ -652,7 +714,7 @@ mod tests {
             windows: vec![window_with_panes(vec![pane("pane-0"), pane("pane-1")])],
             liveness: tymux_proto::v1::Liveness::Live as i32,
         };
-        assert_eq!(target.resolve(&session).unwrap(), "pane-1");
+        assert_eq!(target.resolve(&session).unwrap().id, "pane-1");
     }
 
     #[test]

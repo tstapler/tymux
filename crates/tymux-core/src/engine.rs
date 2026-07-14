@@ -8,6 +8,10 @@ use uuid::Uuid;
 
 use crate::layout::{LayoutNode, Orientation, RemoveOutcome, MIN_PANE_COLS, MIN_PANE_ROWS};
 use crate::pane::Pane;
+use crate::persistence::{
+    persisted_layout_to_live, NullPersistenceBackend, PersistedPaneRecord, PersistedSessionRecord,
+    PersistedWindowRecord, PersistenceBackend,
+};
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
@@ -39,14 +43,15 @@ pub struct SessionState {
     pub active_window_id: Uuid,
 }
 
-/// `Engine.panes`' value type. `Dead` carries nothing yet — once Epic 4's
-/// persistence lands it will carry a `PersistedPaneRecord` payload (see
-/// `plan.md`'s `PaneEntry` glossary entry); for now "dead" just means the
-/// pane's process is known to have exited (whether by natural exit or by
-/// `kill_session`/`close_pane` explicitly killing it before removal).
+/// `Engine.panes`' value type. `Dead(record)` means a session was loaded
+/// from a persisted record at daemon startup and hasn't been revived yet
+/// — there is no live process at all, only the metadata `tymux revive`
+/// needs to respawn one. A pane whose process merely *exited* while still
+/// tracked stays `Live(Arc<Pane>)`; `Pane::is_exited()` already answers
+/// that (see `pane_lookup`), no separate entry state is needed for it.
 pub enum PaneEntry {
     Live(Arc<Pane>),
-    Dead,
+    Dead(PersistedPaneRecord),
 }
 
 /// The three-way outcome of looking up a pane by id, replacing the old
@@ -128,6 +133,16 @@ pub struct ClosePaneOutcome {
     pub session: Option<SessionSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReviveOutcome {
+    Revived {
+        pane_count: usize,
+    },
+    /// The session wasn't dead-flagged to begin with — a friendly no-op,
+    /// never a second spawn (Story 4.4 AC3).
+    AlreadyLive,
+}
+
 /// Cross-cutting locking discipline (`architecture.md` §4, `pitfalls.md`'s
 /// closing observation): every method that touches both `sessions` and
 /// `panes` acquires `sessions` first, then `panes`, for the duration of a
@@ -156,6 +171,11 @@ pub struct Engine {
     /// subscriber — a `()` tick means "re-fetch this window's snapshot,
     /// something about its structure or geometry changed."
     window_watchers: Mutex<HashMap<Uuid, broadcast::Sender<()>>>,
+    /// Storage seam (Story 4.1 Task 5, architecture-review.md Blocker #2):
+    /// `Engine::new()` uses `NullPersistenceBackend` (tests never touch
+    /// disk unless they opt in via `Engine::with_persistence`); `tymuxd`'s
+    /// `main()` supplies a real `FsPersistenceBackend`.
+    persistence: Box<dyn PersistenceBackend>,
 }
 
 impl Default for Engine {
@@ -166,6 +186,7 @@ impl Default for Engine {
             viewports: Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(1),
             window_watchers: Mutex::new(HashMap::new()),
+            persistence: Box::new(NullPersistenceBackend),
         }
     }
 }
@@ -173,6 +194,72 @@ impl Default for Engine {
 impl Engine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_persistence(persistence: Box<dyn PersistenceBackend>) -> Self {
+        Self {
+            persistence,
+            ..Self::default()
+        }
+    }
+
+    /// Populates the engine with dead-flagged sessions reconstructed from
+    /// already-validated persisted records (Story 4.3) — only called at
+    /// daemon startup, before serving any RPC. Every leaf's `pane_id`
+    /// becomes a `PaneEntry::Dead(record)`; `tymux revive` is the only
+    /// path that ever turns one back into `Live` (ADR-002's "never
+    /// triggered automatically on daemon start" invariant).
+    pub fn load_persisted(&self, records: Vec<PersistedSessionRecord>) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut panes = self.panes.lock().unwrap();
+        for record in records {
+            let windows: Vec<WindowState> = record
+                .windows
+                .into_iter()
+                .map(|w: PersistedWindowRecord| WindowState {
+                    id: w.id,
+                    name: w.name,
+                    layout: persisted_layout_to_live(&w.layout, &mut panes),
+                    rows: DEFAULT_ROWS,
+                    cols: DEFAULT_COLS,
+                })
+                .collect();
+            sessions.insert(
+                record.session_id,
+                SessionState {
+                    id: record.session_id,
+                    name: record.name,
+                    windows,
+                    active_window_id: record.active_window_id,
+                },
+            );
+        }
+    }
+
+    /// Snapshots the record to persist — cheap, in-memory, done *while*
+    /// holding `sessions`/`panes` (the same shape as computing new window
+    /// geometry under lock). Deliberately does NOT call into
+    /// `self.persistence.save()` here: callers must drop both locks first
+    /// and call `Self::save_persisted` afterward, so a slow backend's I/O
+    /// never blocks a concurrent `list_sessions`/etc. on an unrelated
+    /// session (Story 4.2 AC2) — the same single-owner-writer shape
+    /// already established for `Pane::resize()`.
+    fn snapshot_persisted_record(
+        sessions: &HashMap<Uuid, SessionState>,
+        panes: &HashMap<Uuid, PaneEntry>,
+        session_id: Uuid,
+    ) -> Option<PersistedSessionRecord> {
+        sessions
+            .get(&session_id)
+            .map(|session| PersistedSessionRecord::from_session_state(session, panes))
+    }
+
+    fn save_persisted(&self, record: Option<PersistedSessionRecord>) {
+        let Some(record) = record else { return };
+        let session_id = record.session_id;
+        if let Err(e) = self.persistence.save(&record) {
+            tracing::warn!(session_id = %session_id, error = %e, "failed to persist session");
+        }
     }
 
     pub fn create_session(&self, name: String, command: Option<String>) -> Result<Uuid> {
@@ -202,6 +289,13 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(pane_id, PaneEntry::Live(pane));
+
+        let record = {
+            let sessions = self.sessions.lock().unwrap();
+            let panes = self.panes.lock().unwrap();
+            Self::snapshot_persisted_record(&sessions, &panes, id)
+        };
+        self.save_persisted(record);
         Ok(id)
     }
 
@@ -243,6 +337,8 @@ impl Engine {
                 }
             }
         }
+        drop(panes);
+        self.persistence.delete(id);
         Ok(())
     }
 
@@ -252,7 +348,7 @@ impl Engine {
     pub fn pane_lookup(&self, pane_id: Uuid) -> PaneLookup {
         match self.panes.lock().unwrap().get(&pane_id) {
             None => PaneLookup::Unknown,
-            Some(PaneEntry::Dead) => PaneLookup::Dead,
+            Some(PaneEntry::Dead(_)) => PaneLookup::Dead,
             Some(PaneEntry::Live(pane)) if pane.is_exited() => PaneLookup::Dead,
             Some(PaneEntry::Live(pane)) => PaneLookup::Live(pane.clone()),
         }
@@ -309,11 +405,14 @@ impl Engine {
             .unwrap()
             .insert(new_pane_id, PaneEntry::Live(new_pane));
 
-        let sessions = self.sessions.lock().unwrap();
-        let panes = self.panes.lock().unwrap();
-        let snapshot = session_to_snapshot(&sessions[&session_id], &panes);
-        drop(sessions);
-        drop(panes);
+        let (snapshot, record) = {
+            let sessions = self.sessions.lock().unwrap();
+            let panes = self.panes.lock().unwrap();
+            let snapshot = session_to_snapshot(&sessions[&session_id], &panes);
+            let record = Self::snapshot_persisted_record(&sessions, &panes, session_id);
+            (snapshot, record)
+        };
+        self.save_persisted(record);
         self.notify_window_changed(window_id);
         Ok(snapshot)
     }
@@ -367,16 +466,24 @@ impl Engine {
             }
         }
 
-        let (removed_session, final_snapshot) = if session_closed.is_some() {
-            (sessions.remove(&session_id), None)
+        let (removed_session, final_snapshot, record) = if session_closed.is_some() {
+            (sessions.remove(&session_id), None, None)
         } else {
-            let snapshot = {
+            let (snapshot, record) = {
                 let panes = self.panes.lock().unwrap();
-                Some(session_to_snapshot(&sessions[&session_id], &panes))
+                let record = Self::snapshot_persisted_record(&sessions, &panes, session_id);
+                (
+                    Some(session_to_snapshot(&sessions[&session_id], &panes)),
+                    record,
+                )
             };
-            (None, snapshot)
+            (None, snapshot, record)
         };
         drop(sessions);
+        if removed_session.is_some() {
+            self.persistence.delete(session_id);
+        }
+        self.save_persisted(record);
 
         // Kill the closed pane's process, and (if the session closed too)
         // every other pane that went down with it.
@@ -439,7 +546,83 @@ impl Engine {
             .insert(pane_id, PaneEntry::Live(pane));
 
         let panes = self.panes.lock().unwrap();
-        Ok(session_to_snapshot(&sessions[&session_id], &panes))
+        let record = Self::snapshot_persisted_record(&sessions, &panes, session_id);
+        let snapshot = session_to_snapshot(&sessions[&session_id], &panes);
+        drop(sessions);
+        drop(panes);
+        self.save_persisted(record);
+        Ok(snapshot)
+    }
+
+    /// Respawns fresh ptys for every dead-flagged pane in a session,
+    /// matching the persisted `LayoutNode` shape (same split tree, same
+    /// ratios) — each pane's original command re-run in its persisted
+    /// `cwd`. Never triggered automatically; only an explicit `tymux
+    /// revive` call reaches this (ADR-002).
+    pub fn revive_session(&self, session_id: Uuid) -> Result<ReviveOutcome, EngineError> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .get(&session_id)
+            .ok_or(EngineError::SessionNotFound(session_id))?;
+        let pane_ids: Vec<Uuid> = session
+            .windows
+            .iter()
+            .flat_map(|w| w.layout.leaves())
+            .collect();
+        drop(sessions);
+
+        // Guard clause (Story 4.4 AC3): if any pane is already live, this
+        // session isn't dead — never double-spawn. Checked before any
+        // respawn work begins.
+        let panes = self.panes.lock().unwrap();
+        let already_live = pane_ids
+            .iter()
+            .any(|id| matches!(panes.get(id), Some(PaneEntry::Live(_))));
+        drop(panes);
+        if already_live {
+            return Ok(ReviveOutcome::AlreadyLive);
+        }
+
+        let mut revived = 0usize;
+        for pane_id in &pane_ids {
+            let record = {
+                let panes = self.panes.lock().unwrap();
+                match panes.get(pane_id) {
+                    Some(PaneEntry::Dead(record)) => record.clone(),
+                    _ => continue,
+                }
+            };
+            match Pane::spawn_with_id(
+                *pane_id,
+                &record.command,
+                Some(&record.cwd),
+                record.rows.max(MIN_PANE_ROWS),
+                record.cols.max(MIN_PANE_COLS),
+            ) {
+                Ok(new_pane) => {
+                    self.panes
+                        .lock()
+                        .unwrap()
+                        .insert(*pane_id, PaneEntry::Live(new_pane));
+                    revived += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(pane_id = %pane_id, error = %e, "revive_session: failed to respawn pane");
+                }
+            }
+        }
+
+        let record = {
+            let sessions = self.sessions.lock().unwrap();
+            let panes = self.panes.lock().unwrap();
+            Self::snapshot_persisted_record(&sessions, &panes, session_id)
+        };
+        self.save_persisted(record);
+
+        tracing::info!(session_id = %session_id, pane_count = revived, "session revived");
+        Ok(ReviveOutcome::Revived {
+            pane_count: revived,
+        })
     }
 
     /// Registers (or updates) `client_id`'s reported viewport for
@@ -524,6 +707,19 @@ impl Engine {
         }
         tracing::debug!(window_id = %window_id, rows, cols, "window geometry recomputed");
         self.notify_window_changed(window_id);
+
+        let record = {
+            let sessions = self.sessions.lock().unwrap();
+            let panes = self.panes.lock().unwrap();
+            sessions
+                .values()
+                .find(|s| s.windows.iter().any(|w| w.id == window_id))
+                .map(|s| s.id)
+                .and_then(|session_id| {
+                    Self::snapshot_persisted_record(&sessions, &panes, session_id)
+                })
+        };
+        self.save_persisted(record);
 
         Some((rows, cols))
     }
@@ -615,7 +811,8 @@ fn layout_to_snapshot(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> La
                     let (rows, cols) = pane.size();
                     (rows, cols, !pane.is_exited())
                 }
-                Some(PaneEntry::Dead) | None => (0, 0, false),
+                Some(PaneEntry::Dead(record)) => (record.rows as u32, record.cols as u32, false),
+                None => (0, 0, false),
             };
             LayoutSnapshot::Leaf(PaneInfo {
                 id: *pane_id,
@@ -864,5 +1061,172 @@ mod tests {
             (20, 100),
             "effective size must be the dimension-wise minimum"
         );
+    }
+
+    /// Story 4.2 AC2 — the concurrency regression: a slow persistence
+    /// backend's `save()` must never block an unrelated `Engine` read
+    /// (here, `list_sessions`), because the lock is dropped before
+    /// `self.persistence.save()` is ever called (see
+    /// `Engine::snapshot_persisted_record`/`save_persisted`).
+    #[test]
+    fn engine_list_sessions_should_not_block_when_slow_mock_persistence_backend_is_saving() {
+        struct SlowMockPersistenceBackend {
+            saving: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl PersistenceBackend for SlowMockPersistenceBackend {
+            fn save(&self, _record: &PersistedSessionRecord) -> Result<()> {
+                self.saving.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                self.saving
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn load_all(&self) -> Vec<PersistedSessionRecord> {
+                Vec::new()
+            }
+            fn delete(&self, _session_id: Uuid) {}
+        }
+
+        let saving = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = Arc::new(Engine::with_persistence(Box::new(
+            SlowMockPersistenceBackend {
+                saving: saving.clone(),
+            },
+        )));
+
+        // Trigger a save on a background thread (create_session calls
+        // save_persisted internally) and wait until it's actually
+        // in-flight before proceeding.
+        let engine_for_save = engine.clone();
+        let save_thread = std::thread::spawn(move || {
+            engine_for_save
+                .create_session("slow".to_string(), sh())
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !saving.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            saving.load(std::sync::atomic::Ordering::SeqCst),
+            "the slow save should be in flight by now"
+        );
+
+        // While the slow save is in flight, an unrelated operation must
+        // complete quickly, not block on the save.
+        let unrelated_id = engine
+            .create_session("unrelated".to_string(), sh())
+            .unwrap();
+        let start = std::time::Instant::now();
+        let sessions = engine.list_sessions();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "list_sessions took {elapsed:?} — it must not block on the slow persistence save"
+        );
+        assert!(sessions.iter().any(|s| s.id == unrelated_id));
+
+        save_thread.join().unwrap();
+    }
+
+    #[test]
+    fn revive_session_should_respawn_ptys_matching_persisted_layout_shape_and_mark_live() {
+        let persist_dir =
+            std::env::temp_dir().join(format!("tymux-revive-test-{}", Uuid::new_v4()));
+        let backend = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let engine = Engine::with_persistence(Box::new(backend));
+        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let pane_id = sole_pane_id(
+            &engine
+                .list_sessions()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap(),
+        );
+        engine
+            .split_pane(pane_id, Orientation::Horizontal, sh())
+            .unwrap();
+
+        // Simulate a daemon restart: reload from the persisted records
+        // into a fresh Engine, rather than reusing the live one.
+        let backend2 = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let records = backend2.load_all();
+        assert_eq!(records.len(), 1);
+        let fresh_engine = Engine::with_persistence(Box::new(backend2));
+        fresh_engine.load_persisted(records);
+
+        let dead_snapshot = fresh_engine
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        assert!(
+            !dead_snapshot.live,
+            "freshly loaded session must be dead-flagged"
+        );
+        assert!(
+            matches!(
+                dead_snapshot.windows[0].layout,
+                LayoutSnapshot::Split { .. }
+            ),
+            "the split shape must survive the reload"
+        );
+
+        let outcome = fresh_engine.revive_session(id).unwrap();
+        assert!(matches!(outcome, ReviveOutcome::Revived { pane_count: 2 }));
+
+        let revived_snapshot = fresh_engine
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        assert!(revived_snapshot.live);
+        assert!(
+            matches!(
+                revived_snapshot.windows[0].layout,
+                LayoutSnapshot::Split { .. }
+            ),
+            "the split shape must be preserved through revival"
+        );
+
+        std::fs::remove_dir_all(&persist_dir).ok();
+    }
+
+    #[test]
+    fn daemon_restart_should_leave_session_dead_flagged_when_revive_never_called() {
+        let persist_dir =
+            std::env::temp_dir().join(format!("tymux-revive-test-{}", Uuid::new_v4()));
+        let backend = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let engine = Engine::with_persistence(Box::new(backend));
+        let id = engine.create_session("test".to_string(), sh()).unwrap();
+
+        for _ in 0..2 {
+            let backend =
+                crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+            let records = backend.load_all();
+            let fresh = Engine::with_persistence(Box::new(backend));
+            fresh.load_persisted(records);
+            let snapshot = fresh
+                .list_sessions()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            assert!(
+                !snapshot.live,
+                "a bare restart without revive must leave the session dead"
+            );
+        }
+
+        std::fs::remove_dir_all(&persist_dir).ok();
+    }
+
+    #[test]
+    fn revive_session_on_already_live_session_returns_already_live_outcome() {
+        let engine = Engine::new();
+        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let outcome = engine.revive_session(id).unwrap();
+        assert_eq!(outcome, ReviveOutcome::AlreadyLive);
     }
 }
