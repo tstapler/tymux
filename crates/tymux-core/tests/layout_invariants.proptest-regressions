@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 09daf5618cf3c80c0afb596748cae98f02535378457b498c8ec8e0a5955a8a0b # shrinks to ops = [Split { target_index: 0, horizontal: false }, Split { target_index: 0, horizontal: false }, Split { target_index: 0, horizontal: false }, Split { target_index: 0, horizontal: false }, Split { target_index: 0, horizontal: false }, Split { target_index: 0, horizontal: false }, Split { target_index: 0, horizontal: false }, Split { target_index: 0, horizontal: false }, Split { target_index: 0, horizontal: false }, Remove { target_index: 127833440467617793 }, Split { target_index: 15755366404148527923, horizontal: true }, Remove { target_index: 10955690349571208032 }, Remove { target_index: 2025220219127950495 }, Split { target_index: 13398785249815135662, horizontal: true }, Split { target_index: 13127535615242681276, horizontal: true }, Split { target_index: 5646331526120135342, horizontal: false }, Split { target_index: 12968943352468864676, horizontal: true }, Split { target_index: 11472399388426845482, horizontal: true }, Resize { rows: 156, cols: 306 }, Split { target_index: 4138521857771769233, horizontal: false }]

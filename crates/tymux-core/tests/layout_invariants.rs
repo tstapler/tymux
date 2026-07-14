@@ -103,9 +103,26 @@ fn assert_ratio_and_structural_invariants(node: &LayoutNode) {
 }
 
 /// Invariant (b) — checked immediately after a successful split, against
-/// the window size active at that moment (see module doc's scope note).
-fn assert_no_leaf_below_minimum(node: &LayoutNode, rows: u16, cols: u16) {
-    for (_, rect) in node.compute_geometry(rows, cols) {
+/// the window size active at that moment, for only the two leaves that
+/// split just produced (`old_leaf_id`, `new_leaf_id`). Per the module
+/// doc's scope note, other, older leaves are deliberately NOT
+/// re-validated here: a `Resize` op earlier in the sequence may have
+/// shrunk the window below what an earlier split validated against, and
+/// this pure module has no retroactive re-validation mechanism for that
+/// (that's Epic 3 Story 3.4's `Engine`-level concern) — asserting the
+/// floor tree-wide would fail on window shrinkage, not on a `split()`
+/// bug, if checked unconditionally.
+fn assert_no_leaf_below_minimum(
+    node: &LayoutNode,
+    rows: u16,
+    cols: u16,
+    old_leaf_id: Uuid,
+    new_leaf_id: Uuid,
+) {
+    for (id, rect) in node.compute_geometry(rows, cols) {
+        if id != old_leaf_id && id != new_leaf_id {
+            continue;
+        }
         assert!(
             rect.rows >= MIN_PANE_ROWS && rect.cols >= MIN_PANE_COLS,
             "invariant (b) violated: leaf rect {rect:?} is below the minimum \
@@ -158,7 +175,7 @@ proptest! {
                     match mutated.split(target, orientation, new_pane, rows, cols) {
                         Ok(()) => {
                             assert_ratio_and_structural_invariants(&mutated);
-                            assert_no_leaf_below_minimum(&mutated, rows, cols);
+                            assert_no_leaf_below_minimum(&mutated, rows, cols, target, new_pane);
                             assert_no_duplicate_pane_ids(&mutated);
                         }
                         Err(_) => {

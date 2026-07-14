@@ -15,6 +15,22 @@ service TymuxService {
   // to re-parse). Cells carry attributes directly.
   rpc CapturePane(CapturePaneRequest) returns (PaneSnapshot);
 
+  // Splits an existing pane into two, nesting a new Split node in its
+  // window's Layout tree in the target pane's place. Rejected with
+  // failed_precondition (naming the actual/minimum rows+cols) if the
+  // resulting leaf would fall below the daemon's hard minimum pane size.
+  rpc SplitPane(SplitPaneRequest) returns (Session);
+  // Closes one pane. If it was the last pane in its window, the window
+  // itself closes (cascading to KillSession if it was also the session's
+  // last window) — see ClosePaneResponse.window_closed/session_closed.
+  rpc ClosePane(ClosePaneRequest) returns (ClosePaneResponse);
+  // Adds a new window (single pane) to an existing session.
+  rpc CreateWindow(CreateWindowRequest) returns (Session);
+  // Streams the subscribed window's Layout every time its structure or
+  // geometry changes, so a client's local model stays in sync without
+  // polling ListSessions.
+  rpc WatchWindow(WatchWindowRequest) returns (stream WindowLayoutEvent);
+
   // Bidirectional stream: client sends input/resize events, server streams
   // output back. This is what an interactive attach (human or agent) uses.
   //
@@ -31,6 +47,10 @@ service TymuxService {
   //    behind); some output between the previous and next Output event was
   //    lost. This is not a fatal condition — normal streaming resumes
   //    immediately after.
+  //  - Resize is now window-scoped, not pane-scoped (ADR-004): the
+  //    daemon tracks every attached client's reported viewport per window
+  //    and applies the dimension-wise minimum across all of them, rather
+  //    than sizing this one pane to this one client's last report.
   rpc Attach(stream AttachRequest) returns (stream AttachEvent);
 }
 
@@ -50,10 +70,44 @@ message Session {
   Liveness liveness = 4;
 }
 
+// Horizontal = side-by-side (tmux's -h); Vertical = stacked (tmux's
+// default -v/no-flag). tymux names its own CLI verbs deliberately rather
+// than reusing tmux's -h/-v flags, which are only mnemonic in retrospect.
+enum Orientation {
+  ORIENTATION_UNSPECIFIED = 0;
+  ORIENTATION_HORIZONTAL = 1;
+  ORIENTATION_VERTICAL = 2;
+}
+
 message Window {
   string id = 1;
   string name = 2;
-  repeated Pane panes = 3;
+  Layout layout = 3;
+}
+
+// Recursive tree describing one window's pane arrangement — either a
+// single pane (leaf) or a Split of exactly two child Layouts. v1.0's
+// client-facing rendering model is explicit focus-cycling (one pane's
+// output on screen at a time), not composited multi-region rendering;
+// this tree exists so a client's local model of pane shape/geometry
+// stays correct even so (see WatchWindow).
+message Layout {
+  oneof node {
+    Pane pane = 1;
+    Split split = 2;
+  }
+}
+
+message Split {
+  Orientation orientation = 1;
+  // Always exactly 2 entries — tymux's split model is strictly binary
+  // (nested splits express any N-pane layout tmux itself supports).
+  repeated LayoutChild children = 2;
+}
+
+message LayoutChild {
+  Layout layout = 1;
+  float ratio = 2;
 }
 
 message Pane {
@@ -79,6 +133,44 @@ message KillSessionRequest {
 }
 
 message KillSessionResponse {}
+
+message SplitPaneRequest {
+  string pane_id = 1; // target leaf to split
+  Orientation orientation = 2;
+  string command = 3; // defaults to $SHELL if empty
+}
+
+message ClosePaneRequest {
+  string pane_id = 1;
+}
+
+message ClosePaneResponse {
+  // Set (non-empty) if closing this pane emptied its window, which
+  // therefore closed too. Absent/empty means the pane's sibling(s)
+  // survived and the window is still open.
+  string window_closed_id = 1;
+  string window_closed_name = 2;
+  // Set (non-empty) if the closed window was also the session's last
+  // window — the whole session cascaded closed (a semantic KillSession).
+  string session_closed_id = 3;
+  string session_closed_name = 4;
+  // The session as it stands after the close, if it still exists (absent
+  // if session_closed_id is set).
+  Session session = 5;
+}
+
+message CreateWindowRequest {
+  string session_id = 1;
+  string command = 2; // defaults to $SHELL if empty
+}
+
+message WatchWindowRequest {
+  string window_id = 1;
+}
+
+message WindowLayoutEvent {
+  Layout layout = 1;
+}
 
 message CapturePaneRequest {
   string pane_id = 1;

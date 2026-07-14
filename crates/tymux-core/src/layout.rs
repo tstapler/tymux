@@ -274,6 +274,16 @@ impl LayoutNode {
         }
     }
 
+    /// Every leaf's `pane_id` in this subtree, pre-order.
+    pub fn leaves(&self) -> Vec<Uuid> {
+        match self {
+            LayoutNode::Leaf { pane_id } => vec![*pane_id],
+            LayoutNode::Split { children, .. } => {
+                children.iter().flat_map(|(c, _)| c.leaves()).collect()
+            }
+        }
+    }
+
     /// Walks the tree, replacing the leaf matching `target` in place using
     /// `f`. Panics if `target` isn't present — callers must check
     /// `contains()` first (as `split` does), since this is a private,
