@@ -19,8 +19,15 @@ service TymuxService {
 
   // One-shot structured read of a pane's current screen — the AI-friendly
   // alternative to `tmux capture-pane` (which returns raw text you'd have
-  // to re-parse). Cells carry attributes directly.
+  // to re-parse). Cells carry attributes directly. scrollback_offset lets
+  // a caller read a historical screen (copy-mode's navigation primitive)
+  // instead of the live one.
   rpc CapturePane(CapturePaneRequest) returns (PaneSnapshot);
+  // Forward-only substring search through a pane's scrollback — the
+  // direct, non-interactive access path for programmatic/agent callers
+  // (one shared history buffer, two access paths: this and CapturePane's
+  // scrollback_offset).
+  rpc SearchScrollback(SearchScrollbackRequest) returns (SearchScrollbackResponse);
 
   // Splits an existing pane into two, nesting a new Split node in its
   // window's Layout tree in the target pane's place. Rejected with
@@ -191,6 +198,21 @@ message WindowLayoutEvent {
 
 message CapturePaneRequest {
   string pane_id = 1;
+  // 0 (default) = the live screen. Increasing values scroll further back
+  // into retained scrollback history.
+  uint32 scrollback_offset = 2;
+}
+
+message SearchScrollbackRequest {
+  string pane_id = 1;
+  string pattern = 2; // plain substring, not regex
+  uint32 start_offset = 3; // search starts here, scrolling further back
+}
+
+message SearchScrollbackResponse {
+  bool found = 1;
+  uint32 offset = 2; // the matching line's own scrollback offset
+  string line = 3;
 }
 
 message PaneSnapshot {

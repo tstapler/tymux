@@ -1,5 +1,9 @@
 use std::io::{Read, Write};
 
+mod config;
+mod copy_mode;
+mod input;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio_stream::wrappers::ReceiverStream;
@@ -8,10 +12,15 @@ use tonic::Request;
 
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
-    attach_event, attach_request, layout::Node, AttachRequest, ClosePaneRequest,
-    CreateSessionRequest, KillSessionRequest, ListSessionsRequest, Orientation, Pane as ProtoPane,
-    Resize, ReviveSessionRequest, ReviveSessionResponse, Session, SplitPaneRequest, Window,
+    attach_event, attach_request, layout::Node, AttachRequest, CapturePaneRequest,
+    ClosePaneRequest, CreateSessionRequest, CreateWindowRequest, KillSessionRequest,
+    ListSessionsRequest, Orientation, Pane as ProtoPane, Resize, ReviveSessionRequest,
+    ReviveSessionResponse, Session, SplitPaneRequest, Window,
 };
+
+use config::{Action, TymuxConfig};
+use copy_mode::{CopyModeEvent, CopyModeState};
+use input::{KeystrokeReassembler, ReassembledOutput};
 
 /// `session[:window.pane]` addressing grammar, replacing the old
 /// unchecked `windows[0].panes[0]` indexing (docs/adr/0001). The
@@ -235,18 +244,19 @@ fn friendly_message(e: &anyhow::Error) -> String {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let mut client = TymuxServiceClient::connect(cli.addr).await?;
+    let config = TymuxConfig::load_or_default();
 
     match cli.command {
         Command::New { name, command } => {
             let session = client
                 .create_session(CreateSessionRequest {
-                    name,
+                    name: name.clone(),
                     command: command.unwrap_or_default(),
                 })
                 .await?
                 .into_inner();
             let pane_id = first_pane_id(&session)?;
-            attach(&mut client, pane_id).await?;
+            attach_and_follow(&mut client, pane_id, &name, &config).await?;
         }
         Command::Ls => {
             let resp = client
@@ -271,7 +281,7 @@ async fn run() -> Result<()> {
                     target.session
                 ));
             }
-            attach(&mut client, pane.id).await?;
+            attach_and_follow(&mut client, pane.id, &target.session, &config).await?;
         }
         Command::Kill { session_id } => {
             client
@@ -377,10 +387,81 @@ fn print_close_pane_outcome(resp: &tymux_proto::v1::ClosePaneResponse) {
     }
 }
 
-async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Result<()> {
+/// What one `attach()` call ended with.
+enum AttachOutcome {
+    /// Detach, pane exited, or the stream ended — nothing more to do.
+    Done,
+    /// `NextWindow`/`PrevWindow` fired — re-attach to this pane instead
+    /// (client-side pane-focus cycling, Story 5.3 task 3: no RPC of its
+    /// own, just choosing a different pane to open a fresh Attach stream
+    /// against).
+    SwitchTo(String),
+}
+
+/// Loops `attach()` to follow `NextWindow`/`PrevWindow` reattachment
+/// requests until the user actually detaches (or the pane/stream ends).
+async fn attach_and_follow(
+    client: &mut TymuxServiceClient<Channel>,
+    mut pane_id: String,
+    session_name: &str,
+    config: &TymuxConfig,
+) -> Result<()> {
+    loop {
+        match attach(client, pane_id, session_name, config).await? {
+            AttachOutcome::Done => return Ok(()),
+            AttachOutcome::SwitchTo(next_pane_id) => pane_id = next_pane_id,
+        }
+    }
+}
+
+/// Resolves the pane adjacent (next or previous) to `current_pane_id`
+/// within its session's window list — the client-side state Action::
+/// NextWindow/PrevWindow cycle through (no server RPC; "next"/"prev" is
+/// purely an ordering over `ListSessions`' response).
+async fn adjacent_window_pane(
+    client: &mut TymuxServiceClient<Channel>,
+    session_name: &str,
+    current_pane_id: &str,
+    forward: bool,
+) -> Result<Option<String>> {
+    let resp = client
+        .list_sessions(ListSessionsRequest {})
+        .await?
+        .into_inner();
+    let session = resp
+        .sessions
+        .into_iter()
+        .find(|s| s.name == session_name)
+        .ok_or_else(|| anyhow::anyhow!("no such session: {session_name}"))?;
+    if session.windows.len() < 2 {
+        return Ok(None);
+    }
+    let current_idx = session
+        .windows
+        .iter()
+        .position(|w| flatten_panes(w).iter().any(|p| p.id == current_pane_id));
+    let Some(current_idx) = current_idx else {
+        return Ok(None);
+    };
+    let next_idx = if forward {
+        (current_idx + 1) % session.windows.len()
+    } else {
+        (current_idx + session.windows.len() - 1) % session.windows.len()
+    };
+    Ok(flatten_panes(&session.windows[next_idx])
+        .first()
+        .map(|p| p.id.clone()))
+}
+
+async fn attach(
+    client: &mut TymuxServiceClient<Channel>,
+    pane_id: String,
+    session_name: &str,
+    config: &TymuxConfig,
+) -> Result<AttachOutcome> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tx.send(AttachRequest {
-        payload: Some(attach_request::Payload::PaneId(pane_id)),
+        payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
     })
     .await?;
 
@@ -391,9 +472,13 @@ async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Re
     send_resize(&tx).await?;
     spawn_resize_watcher(tx.clone());
 
-    // stdin reads are blocking, so they get their own OS thread and feed
-    // the outbound stream over a channel.
-    let stdin_tx = tx.clone();
+    // stdin reads are blocking, so they get their own OS thread; raw
+    // bytes are handed to the async loop below over a channel rather than
+    // being turned into AttachRequests directly here, since they now need
+    // to pass through the keystroke reassembler / copy-mode dispatcher
+    // first (Story 5.2/5.5), which may fire local Actions instead of
+    // forwarding.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1024];
@@ -401,10 +486,7 @@ async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Re
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let msg = AttachRequest {
-                        payload: Some(attach_request::Payload::Input(buf[..n].to_vec())),
-                    };
-                    if stdin_tx.blocking_send(msg).is_err() {
+                    if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
@@ -416,29 +498,242 @@ async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Re
     let outbound = ReceiverStream::new(rx);
     let mut inbound = client.attach(Request::new(outbound)).await?.into_inner();
 
+    let mut reassembler = KeystrokeReassembler::new(config);
+    let mut copy_mode: Option<CopyModeState> = None;
     let mut stdout = std::io::stdout();
-    while let Some(event) = inbound.message().await? {
-        match event.payload {
-            Some(attach_event::Payload::Output(bytes)) => {
-                stdout.write_all(&bytes)?;
-                stdout.flush()?;
-            }
-            Some(attach_event::Payload::Exited(_)) => {
-                drop(_raw); // restore the terminal before printing
-                println!(
-                    "{}",
-                    chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap()
-                );
-                break;
-            }
-            Some(ref payload @ attach_event::Payload::OutputGap(_)) => {
-                print!("{}", chrome_message_for_event(payload).unwrap());
-                stdout.flush()?;
-            }
-            _ => {}
-        }
-    }
 
+    let outcome = 'attach_loop: loop {
+        tokio::select! {
+            biased;
+            maybe_event = inbound.message() => {
+                match maybe_event? {
+                    None => break AttachOutcome::Done,
+                    // Copy-mode owns the screen while active — its own
+                    // redraws happen out-of-band via CapturePane, not live
+                    // pty output, per its AC1 (navigation reads, never
+                    // forwards to the pane, and never lets live output
+                    // that arrived while paused clobber the frozen view).
+                    Some(event) => match event.payload {
+                        Some(attach_event::Payload::Output(bytes)) if copy_mode.is_none() => {
+                            stdout.write_all(&bytes)?;
+                            stdout.flush()?;
+                        }
+                        Some(attach_event::Payload::Exited(_)) => {
+                            drop(_raw);
+                            println!(
+                                "{}",
+                                chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap()
+                            );
+                            break AttachOutcome::Done;
+                        }
+                        Some(ref payload @ attach_event::Payload::OutputGap(_)) if copy_mode.is_none() => {
+                            print!("{}", chrome_message_for_event(payload).unwrap());
+                            stdout.flush()?;
+                        }
+                        _ => {}
+                    },
+                }
+            }
+            maybe_bytes = stdin_rx.recv() => {
+                let Some(bytes) = maybe_bytes else { break AttachOutcome::Done };
+
+                if let Some(cs) = copy_mode.as_mut() {
+                    // Story 5.5 AC4: copy-mode owns all key input while
+                    // active — bytes never reach the reassembler/prefix
+                    // logic at all, so the leader can't arm and no
+                    // prefix-based Action (including Detach) is reachable
+                    // until the user exits copy-mode first.
+                    let mut should_exit = false;
+                    let mut should_redraw = false;
+                    let mut yank_range = None;
+                    for &b in &bytes {
+                        match cs.handle_byte(b) {
+                            CopyModeEvent::Exit => should_exit = true,
+                            CopyModeEvent::Redraw => should_redraw = true,
+                            CopyModeEvent::Yanked => {
+                                if let Some(from) = cs.selecting_from {
+                                    yank_range = Some((from, cs.cursor));
+                                }
+                                should_exit = true;
+                            }
+                            CopyModeEvent::Consumed => {}
+                        }
+                        if should_exit {
+                            break;
+                        }
+                    }
+
+                    if let Some((from, to)) = yank_range {
+                        if let Ok(snapshot) = client
+                            .capture_pane(CapturePaneRequest {
+                                pane_id: pane_id.clone(),
+                                scrollback_offset: cs.scrollback_offset as u32,
+                            })
+                            .await
+                        {
+                            let grid: Vec<Vec<String>> = snapshot
+                                .into_inner()
+                                .grid
+                                .into_iter()
+                                .map(|row| row.cells.into_iter().map(|c| c.text).collect())
+                                .collect();
+                            cs.yanked = copy_mode::extract_selection(&grid, from, to);
+                        }
+                    }
+
+                    if should_exit {
+                        copy_mode = None;
+                        // Redraw the live screen copy-mode had been
+                        // covering.
+                        if let Ok(snapshot) = client
+                            .capture_pane(CapturePaneRequest { pane_id: pane_id.clone(), scrollback_offset: 0 })
+                            .await
+                        {
+                            render_plain_grid(&mut stdout, &snapshot.into_inner())?;
+                        }
+                    } else if should_redraw {
+                        redraw_copy_mode(&mut client.clone(), &pane_id, cs, &mut stdout).await?;
+                    }
+                    continue;
+                }
+
+                for output in reassembler.process(&bytes) {
+                    match output {
+                        ReassembledOutput::Forward(fwd) => {
+                            tx.send(AttachRequest {
+                                payload: Some(attach_request::Payload::Input(fwd)),
+                            }).await?;
+                        }
+                        ReassembledOutput::Action(action) => match action {
+                            Action::Detach => {
+                                drop(_raw);
+                                println!("\r\n[tymux: detached]");
+                                return Ok(AttachOutcome::Done);
+                            }
+                            Action::EnterCopyMode => {
+                                if let Ok(snapshot) = client
+                                    .capture_pane(CapturePaneRequest { pane_id: pane_id.clone(), scrollback_offset: 0 })
+                                    .await
+                                {
+                                    let snap = snapshot.into_inner();
+                                    let cs = CopyModeState::new(snap.rows as u16, snap.cols as u16);
+                                    redraw_copy_mode(&mut client.clone(), &pane_id, &cs, &mut stdout).await?;
+                                    copy_mode = Some(cs);
+                                }
+                            }
+                            Action::SplitHorizontal | Action::SplitVertical => {
+                                let orientation = if action == Action::SplitHorizontal {
+                                    Orientation::Horizontal
+                                } else {
+                                    Orientation::Vertical
+                                };
+                                let _ = client
+                                    .split_pane(SplitPaneRequest {
+                                        pane_id: pane_id.clone(),
+                                        orientation: orientation as i32,
+                                        command: String::new(),
+                                    })
+                                    .await;
+                            }
+                            Action::KillPane => {
+                                // Closing our own attached pane: the daemon
+                                // kills the process, which the existing
+                                // wait_exit path already reports as an
+                                // ordinary Exited event on this same
+                                // stream — no separate handling needed.
+                                let _ = client
+                                    .close_pane(ClosePaneRequest { pane_id: pane_id.clone() })
+                                    .await;
+                            }
+                            Action::NewWindow => {
+                                if let Ok(resp) = client
+                                    .list_sessions(ListSessionsRequest {})
+                                    .await
+                                {
+                                    if let Some(session) = resp
+                                        .into_inner()
+                                        .sessions
+                                        .into_iter()
+                                        .find(|s| s.name == session_name)
+                                    {
+                                        let _ = client
+                                            .create_window(CreateWindowRequest {
+                                                session_id: session.id,
+                                                command: String::new(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Action::NextWindow | Action::PrevWindow => {
+                                let forward = action == Action::NextWindow;
+                                if let Ok(Some(next_pane_id)) =
+                                    adjacent_window_pane(client, session_name, &pane_id, forward).await
+                                {
+                                    break 'attach_loop AttachOutcome::SwitchTo(next_pane_id);
+                                }
+                            }
+                            Action::ExitCopyMode | Action::SendPrefixLiteral => {
+                                // Structural actions, never produced by
+                                // KeystrokeReassembler::process() itself
+                                // (see input.rs) — unreachable here.
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(outcome)
+}
+
+/// Basic (non-chrome) full-screen redraw of a captured grid as plain
+/// text — clears the screen and prints each row. Epic 6 will replace this
+/// with proper status-bar/mode-reactive rendering; this is deliberately
+/// minimal, just enough for copy-mode to be genuinely usable now rather
+/// than blocked on rendering infrastructure that hasn't landed yet.
+fn render_plain_grid(
+    stdout: &mut std::io::Stdout,
+    snapshot: &tymux_proto::v1::PaneSnapshot,
+) -> Result<()> {
+    write!(stdout, "\x1b[2J\x1b[H")?; // clear screen, cursor to home
+    for row in &snapshot.grid {
+        for cell in &row.cells {
+            if cell.text.is_empty() {
+                stdout.write_all(b" ")?;
+            } else {
+                stdout.write_all(cell.text.as_bytes())?;
+            }
+        }
+        stdout.write_all(b"\r\n")?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Re-captures the pane at `cs`'s current scrollback offset and redraws
+/// it plus copy-mode's status line — the shared redraw path both entering
+/// copy-mode and every subsequent navigation keystroke use.
+async fn redraw_copy_mode(
+    client: &mut TymuxServiceClient<Channel>,
+    pane_id: &str,
+    cs: &CopyModeState,
+    stdout: &mut std::io::Stdout,
+) -> Result<()> {
+    let snapshot = client
+        .capture_pane(CapturePaneRequest {
+            pane_id: pane_id.to_string(),
+            scrollback_offset: cs.scrollback_offset as u32,
+        })
+        .await?
+        .into_inner();
+    let live = snapshot.liveness != tymux_proto::v1::Liveness::Dead as i32;
+    render_plain_grid(stdout, &snapshot)?;
+    println!(
+        "\r\n{}",
+        copy_mode::render_status_line(live, cs.scrollback_offset)
+    );
     Ok(())
 }
 
