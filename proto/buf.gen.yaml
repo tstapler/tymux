@@ -2,11 +2,17 @@ version: v2
 # Rust codegen does NOT go through here — crates/tymux-proto/build.rs calls
 # tonic-build directly against this proto tree, which is the idiomatic path
 # for a Rust service. This file is for *other* language clients (TS, Python,
-# Go, ...) as they show up — add plugins here, e.g.:
+# Go, ...) as they show up.
 #
-# plugins:
-#   - remote: buf.build/protocolbuffers/es
-#     out: ../clients/ts/gen
+# TS plugin is resolved from clients/ts/node_modules/.bin (local, not a
+# buf.build remote plugin) so generation works offline/in CI without a
+# network call to the buf schema registry. protobuf-es v2's protoc-gen-es
+# generates both messages and service client descriptors in one pass — the
+# separate protoc-gen-connect-es plugin was folded in and no longer exists
+# for connect-es v2.
 inputs:
   - directory: .
-plugins: []
+plugins:
+  - local: ../clients/ts/node_modules/.bin/protoc-gen-es
+    out: ../clients/ts/gen
+    opt: target=ts
