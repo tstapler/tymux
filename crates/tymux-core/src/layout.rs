@@ -1,10 +1,11 @@
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Split direction. `Horizontal` means side-by-side (tmux's `-h`);
 /// `Vertical` means stacked (tmux's default `-v`/no-flag). tymux picks its
 /// own CLI verb naming deliberately rather than reusing tmux's `-h`/`-v`
 /// flags, which are only mnemonic in retrospect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Orientation {
     Horizontal,
     Vertical,

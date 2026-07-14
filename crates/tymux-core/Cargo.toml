@@ -8,9 +8,12 @@ license.workspace = true
 tokio = { workspace = true }
 portable-pty = { workspace = true }
 vt100 = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

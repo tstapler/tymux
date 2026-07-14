@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use tymux_core::{
     Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneLookup,
-    SessionSnapshot, WindowSnapshot,
+    PersistenceBackend, SessionSnapshot, WindowSnapshot,
 };
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
@@ -17,8 +17,9 @@ use tymux_proto::v1::{
     CreateWindowRequest, KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
     LayoutChild as ProtoLayoutChild, ListSessionsRequest, ListSessionsResponse, Liveness,
     Orientation as ProtoOrientation, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
-    Row as ProtoRow, Session as ProtoSession, Split as ProtoSplit, SplitPaneRequest,
-    WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
+    ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow, Session as ProtoSession,
+    Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow,
+    WindowLayoutEvent,
 };
 
 pub struct TymuxDaemon {
@@ -239,6 +240,32 @@ impl TymuxService for TymuxDaemon {
         })?;
         tracing::info!(session_id = %id, "session killed");
         Ok(Response::new(KillSessionResponse {}))
+    }
+
+    async fn revive_session(
+        &self,
+        request: Request<ReviveSessionRequest>,
+    ) -> Result<Response<ReviveSessionResponse>, Status> {
+        let session_id = parse_uuid(&request.into_inner().session_id)?;
+        let outcome = self
+            .engine
+            .revive_session(session_id)
+            .map_err(engine_error_to_status)?;
+        let session = self
+            .engine
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.id == session_id);
+        let (already_live, pane_count) = match outcome {
+            tymux_core::ReviveOutcome::AlreadyLive => (true, 0),
+            tymux_core::ReviveOutcome::Revived { pane_count } => (false, pane_count as u32),
+        };
+        tracing::info!(session_id = %session_id, already_live, pane_count, "revive_session");
+        Ok(Response::new(ReviveSessionResponse {
+            already_live,
+            pane_count,
+            session: session.as_ref().map(session_to_proto),
+        }))
     }
 
     async fn capture_pane(
@@ -513,7 +540,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let engine = Arc::new(Engine::new());
+    // Story 4.3: reconcile persisted session records before serving any
+    // RPC — every session loads dead-flagged (ADR-002: never auto-revived
+    // on daemon start); a file that fails to parse or fails structural
+    // validation is logged and skipped, never fatal to daemon boot.
+    let sessions_dir = tymux_core::default_sessions_dir();
+    let backend = tymux_core::FsPersistenceBackend::new(sessions_dir.clone()).map_err(|e| {
+        format!(
+            "failed to prepare sessions directory {}: {e}",
+            sessions_dir.display()
+        )
+    })?;
+    let records = backend.load_all();
+    let restored_count = records.len();
+    let engine = Arc::new(Engine::with_persistence(Box::new(backend)));
+    engine.load_persisted(records);
+    if restored_count > 0 {
+        tracing::info!(count = restored_count, dir = %sessions_dir.display(), "restored dead-flagged sessions from disk");
+    }
+
     let daemon = TymuxDaemon { engine };
 
     tracing::info!(%addr, "tymuxd listening");
@@ -527,9 +572,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Resolves on Ctrl-C or SIGTERM, whichever comes first — so tonic stops
 /// accepting new connections and exits cleanly instead of dying mid-request
-/// with no log at all. There's nothing to drain beyond that (no
-/// persistence exists to flush — see the ADR/README), but a clean, logged
-/// stop instead of a silent kill is still worth having.
+/// with no log at all. Story 4.5: there is deliberately no separate
+/// "flush persisted state" step here — every mutation (`create_session`,
+/// `split_pane`, `close_pane`, `kill_session`, `create_window`, window
+/// resize, `revive_session`) already writes its session's record
+/// synchronously (atomic temp-file-then-rename) before the RPC handler
+/// returns, so by the time any of those calls has completed, the on-disk
+/// state is already current — there is nothing left to drain at shutdown
+/// that isn't already durable.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1169,5 +1219,41 @@ mod tests {
             second.layout.unwrap().node.unwrap(),
             Node::Split(_)
         ));
+    }
+
+    /// Story 4.6: the daemon-side rejection is the authoritative guard for
+    /// any client (Rust or not) — a dead pane must never let `attach` open
+    /// a stream, independent of the CLI's own pre-check.
+    #[tokio::test]
+    async fn attach_rpc_should_reject_with_failed_precondition_when_pane_lookup_is_dead() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let pane_uuid = parse_uuid(&pane_id).unwrap();
+        let pane = match engine.pane_lookup(pane_uuid) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"exit\n").unwrap();
+        wait_for_pane_exit(&pane).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+        })
+        .await
+        .unwrap();
+        let err = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }
