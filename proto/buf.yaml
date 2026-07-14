@@ -4,6 +4,10 @@ modules:
 lint:
   use:
     - STANDARD
+  except:
+    # tymux deliberately shares response messages (e.g. Session) across
+    # multiple RPCs rather than minting a dedicated FooResponse per RPC.
+    - RPC_RESPONSE_STANDARD_NAME
 breaking:
   use:
     - FILE

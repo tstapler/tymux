@@ -81,3 +81,4 @@ for the next session.
   committing a proto change
 - `cargo fmt` / `cargo clippy --workspace --all-targets` — enforced in CI
   (`.github/workflows/ci.yml`)
+
