@@ -1,7 +1,11 @@
 # ADR 0001: One window, one pane per session — deliberately, for now
 
 ## Status
-Accepted (deliberate deferral, not an oversight)
+Superseded by Epic 3 (v1.0 release plan) — sessions now support real
+multi-window/multi-pane layouts via a binary split tree
+(`crates/tymux-core/src/layout.rs`). This ADR is kept for the historical
+record of why the deferral was deliberate; it no longer describes current
+behavior.
 
 ## Context
 `proto/tymux/v1/tymux.proto` models `Session → repeated Window → repeated Pane`,

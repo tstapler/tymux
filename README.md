@@ -35,36 +35,85 @@ is the actual point of this project.
 
 ```
 crates/
-  tymux-core/   session/window/pane engine — PTY spawn (portable-pty) + vt100 screen state
+  tymux-core/   session/window/pane engine — PTY spawn (portable-pty), vt100
+                screen state, binary split-tree layout, Tier-0 persistence
   tymux-proto/  generated Rust types from proto/ (tonic-build via build.rs)
   tymuxd/       the daemon: gRPC server wrapping tymux-core
-  tymux-cli/    thin client: create/list/attach/kill sessions from a terminal
+  tymux-cli/    client: create/list/attach/split/kill sessions, config +
+                keybindings, copy-mode, status bar
 proto/          buf-managed .proto — lint/breaking-change checks, and the
-                source of truth for any future non-Rust client (buf.gen.yaml)
+                source of truth for every non-Rust client (buf.gen.yaml)
+clients/ts/     working TypeScript client generated from proto/ (see its
+                own README for scope/setup)
 ```
 
 Rust's own codegen goes through `tonic-build` directly against
 `proto/tymux/v1/tymux.proto` (the idiomatic path for a Rust service) — buf
-manages proto hygiene (`buf lint`, `buf breaking`) and is where plugins for
-other-language clients (TS, Python, ...) get added later, in
-`proto/buf.gen.yaml`.
+manages proto hygiene (`buf lint`, `buf breaking`) and generates
+`clients/ts/gen/` via `proto/buf.gen.yaml`.
 
 ## Status
 
-MVP: one pane per window per session (no splits yet — the proto already
-models `repeated windows`/`repeated panes`, so this is additive, not a
-breaking change, when splits get built; see `docs/adr/0001-single-pane-per-session-for-now.md`).
-No auth — the daemon is meant to run locally for now; it warns loudly at
-startup if `TYMUXD_ADDR` is set to a non-loopback address, since there's
-no per-pane authorization yet. No persistence — sessions live in the
-daemon's memory only; killing `tymuxd` kills every session, same as
-tmux's own server model but without tmux's socket-survives-crash
-guarantee (that's a real gap if this needs to survive a daemon restart —
-add it when it matters).
+v1.0: sessions have multiple windows, and windows split into panes (binary
+splits nest arbitrarily — `tymux split myproject:0.0 --vertical`; see
+`docs/adr/0001-single-pane-per-session-for-now.md`, superseded by Epic 3).
+Config and keybindings live in `$XDG_CONFIG_HOME/tymux/config.toml` (tmux-
+parity defaults, e.g. `C-b d` to detach, `C-b %`/`C-b "` to split — see
+`crates/tymux-cli/src/config.rs`'s `BINDABLE_ACTIONS`). Copy-mode
+(`C-b [`) scrolls and searches a pane's retained scrollback. A status bar
+shows the active window/pane and, when the prefix key is armed, a hint
+line of available bindings; `--no-status-bar` disables it entirely for a
+pure passthrough with zero added escape bytes, and `NO_COLOR` is
+respected.
 
-See `docs/reviews/is-it-ready-2026-07-13.md` for the full readiness
-review this status section is drawn from, including what's since been
-fixed.
+**Persistence is Tier-0 only**: session/window/pane *structure* (names,
+layout tree, working directories, the command each pane was running)
+survives a `tymuxd` restart, written to
+`$XDG_STATE_HOME/tymux/sessions/`. Scrollback *content* does not persist
+— a restarted daemon restores each session as dead-but-reviveable
+(`tymux revive <session>` respawns fresh panes in the persisted layout,
+re-running each pane's original command in its original cwd); it does not
+replay what was on screen before the restart.
+
+**No auth** — the daemon is meant to run locally for now (loopback-trust
+model); it warns loudly at startup if `TYMUXD_ADDR` is set to a
+non-loopback address, since there's no per-pane authorization yet.
+
+**Cross-language clients**: [`clients/ts/`](clients/ts/README.md) is a
+real, working Node.js TypeScript client proving `CreateSession`, `Attach`,
+and `CapturePane` all work from outside Rust (ADR-003). Browser support
+for live `Attach` sessions is a known, documented limitation, not yet
+solved — see that README for why.
+
+See `docs/reviews/is-it-ready-2026-07-13.md` for the pre-v1.0 readiness
+review this status section originally drew from.
+
+## Known Limitations
+
+- **Scrollback content does not survive a daemon restart** — only
+  session/window/pane structure does (Tier-0 persistence above). A richer
+  scrollback-persistence tier was considered and explicitly ruled out for
+  v1.0.
+- **Loopback-only trust model** — no authentication/authorization; do not
+  bind `tymuxd` to a non-loopback address without understanding the
+  daemon then has zero access control.
+- **Binary splits only** — a window's pane arrangement is a strictly
+  binary tree (nested splits express any N-pane layout, but there is no
+  single N-ary "even-horizontal" layout primitive like tmux's).
+- **No browser `Attach`** — see Cross-language clients above.
+- **No dedicated screen-reader navigation for multi-pane windows** —
+  v1.0 is fully keyboard-operable (no mouse dependency) and respects
+  `NO_COLOR`, but a screen-reader user with multiple panes/windows has no
+  non-visual navigation aid beyond the plain keyboard bindings.
+
+## Accessibility
+
+v1.0 supports fully keyboard-only operation (every action — split,
+switch window, copy-mode, detach — is a keybinding, never mouse-only);
+`NO_COLOR` is respected for color-free output; `--no-status-bar` gives a
+pure-passthrough mode with zero added chrome bytes. Out of scope for
+v1.0: screen-reader-aware navigation between panes/windows (see Known
+Limitations above).
 
 ## Running it
 
