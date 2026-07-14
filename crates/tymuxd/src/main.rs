@@ -89,6 +89,7 @@ impl TymuxService for TymuxDaemon {
             .into_iter()
             .find(|(sid, ..)| *sid == id)
             .ok_or_else(|| Status::internal("session vanished after create"))?;
+        tracing::info!(session_id = %id, name = %name, pane_id = %pane_id, "session created");
         Ok(Response::new(session_to_proto(
             id, name, window_id, pane_id,
         )))
@@ -112,9 +113,11 @@ impl TymuxService for TymuxDaemon {
         request: Request<KillSessionRequest>,
     ) -> Result<Response<KillSessionResponse>, Status> {
         let id = parse_uuid(&request.into_inner().session_id)?;
-        self.engine
-            .kill_session(id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+        self.engine.kill_session(id).map_err(|e| {
+            tracing::warn!(session_id = %id, error = %e, "kill_session: no such session");
+            Status::not_found(e.to_string())
+        })?;
+        tracing::info!(session_id = %id, "session killed");
         Ok(Response::new(KillSessionResponse {}))
     }
 
@@ -124,10 +127,10 @@ impl TymuxService for TymuxDaemon {
     ) -> Result<Response<ProtoSnapshot>, Status> {
         let pane_id_str = request.into_inner().pane_id;
         let pane_id = parse_uuid(&pane_id_str)?;
-        let pane = self
-            .engine
-            .pane(pane_id)
-            .ok_or_else(|| Status::not_found("no such pane"))?;
+        let pane = self.engine.pane(pane_id).ok_or_else(|| {
+            tracing::warn!(pane_id = %pane_id, "capture_pane: no such pane");
+            Status::not_found("no such pane")
+        })?;
         Ok(Response::new(snapshot_to_proto(
             &pane_id_str,
             pane.snapshot(),
@@ -155,10 +158,11 @@ impl TymuxService for TymuxDaemon {
             }
         };
         let pane_id = parse_uuid(&pane_id_str)?;
-        let pane = self
-            .engine
-            .pane(pane_id)
-            .ok_or_else(|| Status::not_found("no such pane"))?;
+        let pane = self.engine.pane(pane_id).ok_or_else(|| {
+            tracing::warn!(pane_id = %pane_id, "attach: no such pane");
+            Status::not_found("no such pane")
+        })?;
+        tracing::info!(pane_id = %pane_id, "attach started");
 
         let mut output_rx = pane.subscribe();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -187,6 +191,7 @@ impl TymuxService for TymuxDaemon {
                         }
                     }
                     _ = pane_for_exit.wait_exit() => {
+                        tracing::info!(pane_id = %pane_for_exit.id, "pane exited, closing attach stream");
                         let event = AttachEvent {
                             payload: Some(attach_event::Payload::Exited(true)),
                         };
@@ -235,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Arc::new(Engine::new());
     let daemon = TymuxDaemon { engine };
 
-    println!("tymuxd listening on {addr}");
+    tracing::info!(%addr, "tymuxd listening");
     Server::builder()
         .add_service(TymuxServiceServer::new(daemon))
         .serve(addr.parse()?)
