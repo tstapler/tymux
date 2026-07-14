@@ -463,11 +463,19 @@ mod tests {
         assert!(found, "expected pane output to contain echoed text");
     }
 
-    #[test]
-    fn capture_pane_should_return_historical_grid_when_scrollback_offset_specified() {
-        let pane = Pane::spawn("/bin/sh", 5, 40).unwrap();
-        pane.write_input(b"for i in $(seq 1 50); do echo line-$i; done; echo DONE-MARKER\n")
-            .unwrap();
+    /// Spawns a shell, has it print `line-1`..`line-{count}` (via a single
+    /// `awk` process — one exec, one output burst — rather than a shell
+    /// `for` loop with many separate `echo` calls, which is more
+    /// deterministic under process-scheduling variance on slower/loaded
+    /// CI runners) followed by a marker, and blocks until that marker is
+    /// visible on-screen plus a short settle delay for the reader thread
+    /// to finish draining the burst.
+    fn spawn_shell_with_numbered_lines(rows: u16, cols: u16, count: usize) -> Arc<Pane> {
+        let pane = Pane::spawn("/bin/sh", rows, cols).unwrap();
+        let cmd = format!(
+            "awk 'BEGIN{{for(i=1;i<={count};i++) print \"line-\" i; print \"DONE-MARKER\"}}'\n"
+        );
+        pane.write_input(cmd.as_bytes()).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -487,7 +495,17 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Settle delay: the marker being on-screen only guarantees the
+        // bytes up to and including it were processed, but a slow CI
+        // runner's scheduler could still be mid-flush on the reader
+        // thread's last read() — give it a moment to fully quiesce.
+        std::thread::sleep(Duration::from_millis(100));
+        pane
+    }
 
+    #[test]
+    fn capture_pane_should_return_historical_grid_when_scrollback_offset_specified() {
+        let pane = spawn_shell_with_numbered_lines(5, 40, 50);
         let live = pane.snapshot();
         let historical = pane.snapshot_at_offset(10);
         let live_text: String = live
@@ -521,25 +539,7 @@ mod tests {
 
     #[test]
     fn search_scrollback_rpc_should_return_matching_line_range_when_pattern_present() {
-        let pane = Pane::spawn("/bin/sh", 5, 40).unwrap();
-        pane.write_input(b"for i in $(seq 1 50); do echo line-$i; done; echo DONE-MARKER\n")
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let text: String = pane
-                .snapshot()
-                .grid
-                .iter()
-                .flatten()
-                .map(|c| c.text.as_str())
-                .collect();
-            if text.contains("DONE-MARKER") {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
+        let pane = spawn_shell_with_numbered_lines(5, 40, 50);
         let found = pane.search_scrollback("line-3", 0);
         assert!(
             found.is_some(),
