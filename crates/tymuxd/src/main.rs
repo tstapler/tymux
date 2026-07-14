@@ -202,10 +202,14 @@ impl TymuxService for TymuxDaemon {
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
                     Some(attach_request::Payload::Input(bytes)) => {
-                        let _ = pane_for_input.write_input(&bytes);
+                        if let Err(e) = pane_for_input.write_input(&bytes) {
+                            tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input failed");
+                        }
                     }
                     Some(attach_request::Payload::Resize(r)) => {
-                        let _ = pane_for_input.resize(r.rows as u16, r.cols as u16);
+                        if let Err(e) = pane_for_input.resize(r.rows as u16, r.cols as u16) {
+                            tracing::warn!(pane_id = %pane_for_input.id, error = %e, "resize failed");
+                        }
                     }
                     _ => {}
                 }
@@ -220,6 +224,13 @@ impl TymuxService for TymuxDaemon {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let addr = std::env::var("TYMUXD_ADDR").unwrap_or_else(|_| "127.0.0.1:7419".to_string());
     let engine = Arc::new(Engine::new());
     let daemon = TymuxDaemon { engine };
