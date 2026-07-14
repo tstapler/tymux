@@ -8,8 +8,25 @@ use tonic::Request;
 
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
-    attach_event, attach_request, AttachRequest, CreateSessionRequest, ListSessionsRequest,
+    attach_event, attach_request, AttachRequest, CreateSessionRequest, ListSessionsRequest, Session,
 };
+
+/// Every session today has exactly one window with one pane (see
+/// docs/adr/0001-single-pane-per-session-for-now.md), but the proto
+/// itself allows `repeated` windows/panes — so this is a real bounds
+/// check, not a formality, and fails with a clear message instead of
+/// panicking the moment that assumption is ever violated.
+fn first_pane_id(session: &Session) -> Result<String> {
+    let window = session
+        .windows
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("session {} has no windows", session.id))?;
+    let pane = window
+        .panes
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("window {} has no panes", window.id))?;
+    Ok(pane.id.clone())
+}
 
 #[derive(Parser)]
 #[command(name = "tymux")]
@@ -68,7 +85,7 @@ async fn main() -> Result<()> {
                 })
                 .await?
                 .into_inner();
-            let pane_id = session.windows[0].panes[0].id.clone();
+            let pane_id = first_pane_id(&session)?;
             attach(&mut client, pane_id).await?;
         }
         Command::Ls => {
@@ -90,7 +107,7 @@ async fn main() -> Result<()> {
                 .into_iter()
                 .find(|s| s.id == session_id)
                 .ok_or_else(|| anyhow::anyhow!("no such session: {session_id}"))?;
-            let pane_id = session.windows[0].panes[0].id.clone();
+            let pane_id = first_pane_id(&session)?;
             attach(&mut client, pane_id).await?;
         }
     }
@@ -210,5 +227,47 @@ mod tests {
             other => panic!("expected Command::Attach, got a different variant: {other:?}"),
         }
         assert!(Cli::try_parse_from(["tymux", "attach"]).is_err());
+    }
+
+    fn session_with(windows: Vec<tymux_proto::v1::Window>) -> Session {
+        Session {
+            id: "session-1".to_string(),
+            name: "test".to_string(),
+            windows,
+        }
+    }
+
+    fn window_with(panes: Vec<tymux_proto::v1::Pane>) -> tymux_proto::v1::Window {
+        tymux_proto::v1::Window {
+            id: "window-1".to_string(),
+            name: "0".to_string(),
+            panes,
+        }
+    }
+
+    fn pane(id: &str) -> tymux_proto::v1::Pane {
+        tymux_proto::v1::Pane {
+            id: id.to_string(),
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    #[test]
+    fn first_pane_id_returns_the_pane() {
+        let session = session_with(vec![window_with(vec![pane("pane-1")])]);
+        assert_eq!(first_pane_id(&session).unwrap(), "pane-1");
+    }
+
+    #[test]
+    fn first_pane_id_errors_on_no_windows() {
+        let session = session_with(vec![]);
+        assert!(first_pane_id(&session).is_err());
+    }
+
+    #[test]
+    fn first_pane_id_errors_on_no_panes() {
+        let session = session_with(vec![window_with(vec![])]);
+        assert!(first_pane_id(&session).is_err());
     }
 }
