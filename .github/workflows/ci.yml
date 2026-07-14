@@ -10,8 +10,13 @@ jobs:
   test:
     strategy:
       fail-fast: false
+      # macos-13 (Intel) deliberately excluded: GitHub-hosted macos-13
+      # runners queued indefinitely (50+ min, never started) when tried on
+      # this repo — a real capacity/deprecation issue, not flakiness.
+      # macos-latest (Apple Silicon) is the only macOS leg for now; see
+      # plan.md Unresolved Question #2 for the related ARM64 runner note.
       matrix:
-        os: [ubuntu-latest, macos-latest, macos-13]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
