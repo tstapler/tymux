@@ -770,6 +770,19 @@ impl Engine {
                 layout: layout_to_snapshot(&w.layout, &panes),
             })
     }
+
+    /// How many clients are currently attached to a pane within this
+    /// window — Story 6.1's `StatusBarModel` field, already tracked by
+    /// ADR-004's viewport tracker (one entry per attached client), so no
+    /// new bookkeeping is needed.
+    pub fn attached_client_count(&self, window_id: Uuid) -> u32 {
+        self.viewports
+            .lock()
+            .unwrap()
+            .get(&window_id)
+            .map(|clients| clients.len() as u32)
+            .unwrap_or(0)
+    }
 }
 
 fn session_to_snapshot(

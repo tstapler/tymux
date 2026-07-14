@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 mod config;
 mod copy_mode;
 mod input;
+mod status_bar;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -21,6 +22,7 @@ use tymux_proto::v1::{
 use config::{Action, TymuxConfig};
 use copy_mode::{CopyModeEvent, CopyModeState};
 use input::{KeystrokeReassembler, ReassembledOutput};
+use status_bar::{DisplayMode, StatusBarConfig};
 
 /// `session[:window.pane]` addressing grammar, replacing the old
 /// unchecked `windows[0].panes[0]` indexing (docs/adr/0001). The
@@ -160,6 +162,12 @@ struct Cli {
     #[arg(long, global = true, default_value = "http://127.0.0.1:7419")]
     addr: String,
 
+    /// Disable the status bar entirely — pure pty passthrough, no
+    /// DECSTBM scroll-region reservation, zero added escape bytes
+    /// (accessibility floor, ux.md §3).
+    #[arg(long, global = true)]
+    no_status_bar: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -245,6 +253,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     let mut client = TymuxServiceClient::connect(cli.addr).await?;
     let config = TymuxConfig::load_or_default();
+    let status_bar_cfg = StatusBarConfig::new(!cli.no_status_bar);
 
     match cli.command {
         Command::New { name, command } => {
@@ -256,7 +265,7 @@ async fn run() -> Result<()> {
                 .await?
                 .into_inner();
             let pane_id = first_pane_id(&session)?;
-            attach_and_follow(&mut client, pane_id, &name, &config).await?;
+            attach_and_follow(&mut client, pane_id, &name, &config, &status_bar_cfg).await?;
         }
         Command::Ls => {
             let resp = client
@@ -281,7 +290,14 @@ async fn run() -> Result<()> {
                     target.session
                 ));
             }
-            attach_and_follow(&mut client, pane.id, &target.session, &config).await?;
+            attach_and_follow(
+                &mut client,
+                pane.id,
+                &target.session,
+                &config,
+                &status_bar_cfg,
+            )
+            .await?;
         }
         Command::Kill { session_id } => {
             client
@@ -405,9 +421,10 @@ async fn attach_and_follow(
     mut pane_id: String,
     session_name: &str,
     config: &TymuxConfig,
+    status_bar_cfg: &StatusBarConfig,
 ) -> Result<()> {
     loop {
-        match attach(client, pane_id, session_name, config).await? {
+        match attach(client, pane_id, session_name, config, status_bar_cfg).await? {
             AttachOutcome::Done => return Ok(()),
             AttachOutcome::SwitchTo(next_pane_id) => pane_id = next_pane_id,
         }
@@ -458,19 +475,13 @@ async fn attach(
     pane_id: String,
     session_name: &str,
     config: &TymuxConfig,
+    status_bar_cfg: &StatusBarConfig,
 ) -> Result<AttachOutcome> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tx.send(AttachRequest {
         payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
     })
     .await?;
-
-    // Sync the pane to the local terminal's real size immediately, and
-    // again on every SIGWINCH — without this the pane stays at whatever
-    // fixed default the daemon created it with, forever, regardless of the
-    // terminal it's actually attached to.
-    send_resize(&tx).await?;
-    spawn_resize_watcher(tx.clone());
 
     // stdin reads are blocking, so they get their own OS thread; raw
     // bytes are handed to the async loop below over a channel rather than
@@ -500,11 +511,21 @@ async fn attach(
 
     let mut reassembler = KeystrokeReassembler::new(config);
     let mut copy_mode: Option<CopyModeState> = None;
+    let mut mode = DisplayMode::Normal;
     let mut stdout = std::io::stdout();
+    let mut resize_rx = spawn_resize_watcher();
+
+    // Sync the pane to the local terminal's real size immediately (Story
+    // 6.2 AC1: reserves the status bar's row via DECSTBM at the same
+    // time), and again on every SIGWINCH via the coordinated path below.
+    send_resize_and_repaint(&tx, &mut stdout, status_bar_cfg, mode, config).await?;
 
     let outcome = 'attach_loop: loop {
         tokio::select! {
             biased;
+            _ = resize_rx.recv() => {
+                send_resize_and_repaint(&tx, &mut stdout, status_bar_cfg, mode, config).await?;
+            }
             maybe_event = inbound.message() => {
                 match maybe_event? {
                     None => break AttachOutcome::Done,
@@ -520,14 +541,16 @@ async fn attach(
                         }
                         Some(attach_event::Payload::Exited(_)) => {
                             drop(_raw);
-                            println!(
+                            writeln!(
+                                stdout,
                                 "{}",
                                 chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap()
-                            );
+                            )?;
+                            stdout.flush()?;
                             break AttachOutcome::Done;
                         }
                         Some(ref payload @ attach_event::Payload::OutputGap(_)) if copy_mode.is_none() => {
-                            print!("{}", chrome_message_for_event(payload).unwrap());
+                            write!(stdout, "{}", chrome_message_for_event(payload).unwrap())?;
                             stdout.flush()?;
                         }
                         _ => {}
@@ -583,6 +606,7 @@ async fn attach(
 
                     if should_exit {
                         copy_mode = None;
+                        mode = DisplayMode::Normal;
                         // Redraw the live screen copy-mode had been
                         // covering.
                         if let Ok(snapshot) = client
@@ -591,12 +615,16 @@ async fn attach(
                         {
                             render_plain_grid(&mut stdout, &snapshot.into_inner())?;
                         }
+                        if let Ok((_, term_rows)) = crossterm::terminal::size() {
+                            redraw_status_line(&mut stdout, term_rows, mode, config, status_bar_cfg)?;
+                        }
                     } else if should_redraw {
                         redraw_copy_mode(&mut client.clone(), &pane_id, cs, &mut stdout).await?;
                     }
                     continue;
                 }
 
+                let was_armed = reassembler.is_armed();
                 for output in reassembler.process(&bytes) {
                     match output {
                         ReassembledOutput::Forward(fwd) => {
@@ -607,7 +635,8 @@ async fn attach(
                         ReassembledOutput::Action(action) => match action {
                             Action::Detach => {
                                 drop(_raw);
-                                println!("\r\n[tymux: detached]");
+                                writeln!(stdout, "\r\n[tymux: detached]")?;
+                                stdout.flush()?;
                                 return Ok(AttachOutcome::Done);
                             }
                             Action::EnterCopyMode => {
@@ -619,6 +648,7 @@ async fn attach(
                                     let cs = CopyModeState::new(snap.rows as u16, snap.cols as u16);
                                     redraw_copy_mode(&mut client.clone(), &pane_id, &cs, &mut stdout).await?;
                                     copy_mode = Some(cs);
+                                    mode = DisplayMode::CopyMode;
                                 }
                             }
                             Action::SplitHorizontal | Action::SplitVertical => {
@@ -681,6 +711,19 @@ async fn attach(
                         },
                     }
                 }
+
+                // Story 6.4: redraw the reserved status row whenever the
+                // prefix arms/disarms — this is the one place a stale
+                // hint from a prior mode could otherwise linger, so the
+                // redraw is unconditional on any change, not just on
+                // arming.
+                let is_armed = reassembler.is_armed();
+                if is_armed != was_armed {
+                    mode = if is_armed { DisplayMode::PrefixArmed } else { DisplayMode::Normal };
+                    if let Ok((_, term_rows)) = crossterm::terminal::size() {
+                        redraw_status_line(&mut stdout, term_rows, mode, config, status_bar_cfg)?;
+                    }
+                }
             }
         }
     };
@@ -730,10 +773,12 @@ async fn redraw_copy_mode(
         .into_inner();
     let live = snapshot.liveness != tymux_proto::v1::Liveness::Dead as i32;
     render_plain_grid(stdout, &snapshot)?;
-    println!(
+    writeln!(
+        stdout,
         "\r\n{}",
         copy_mode::render_status_line(live, cs.scrollback_offset)
-    );
+    )?;
+    stdout.flush()?;
     Ok(())
 }
 
@@ -749,27 +794,71 @@ fn chrome_message_for_event(payload: &attach_event::Payload) -> Option<&'static 
     }
 }
 
-async fn send_resize(tx: &tokio::sync::mpsc::Sender<AttachRequest>) -> Result<()> {
+/// Sends the pane's effective size (`term_rows - 1` when the status bar
+/// is reserving a row, the full terminal size otherwise) and, if the
+/// status bar is enabled, writes its DECSTBM scroll-region reservation
+/// and redraws the hint line — all through the caller's single owning
+/// `stdout` handle, in the same call, so a resize's pty-side effect and
+/// its status-bar-side effect are always one coordinated update (Story
+/// 6.2 AC2), never two independently-timed writes.
+async fn send_resize_and_repaint(
+    tx: &tokio::sync::mpsc::Sender<AttachRequest>,
+    stdout: &mut std::io::Stdout,
+    cfg: &StatusBarConfig,
+    mode: DisplayMode,
+    config: &TymuxConfig,
+) -> Result<()> {
     // A failure here just means the local terminal size can't be queried
     // (e.g. stdout isn't a real tty) — not worth aborting the attach over,
     // the pane just keeps whatever size it already had.
-    if let Ok((cols, rows)) = crossterm::terminal::size() {
-        tx.send(AttachRequest {
-            payload: Some(attach_request::Payload::Resize(Resize {
-                rows: rows as u32,
-                cols: cols as u32,
-            })),
-        })
-        .await?;
+    let Ok((cols, term_rows)) = crossterm::terminal::size() else {
+        return Ok(());
+    };
+    let pty_rows = status_bar::pty_rows(term_rows, cfg);
+    tx.send(AttachRequest {
+        payload: Some(attach_request::Payload::Resize(Resize {
+            rows: pty_rows as u32,
+            cols: cols as u32,
+        })),
+    })
+    .await?;
+
+    if cfg.enabled {
+        stdout.write_all(&status_bar::decstbm_reserve(term_rows, cfg))?;
+        redraw_status_line(stdout, term_rows, mode, config, cfg)?;
     }
+    Ok(())
+}
+
+/// Repaints just the reserved status-bar row in place — saves the
+/// terminal cursor, moves to the last row, clears it, writes the
+/// mode-reactive hint line, and restores the cursor, so the pty's own
+/// on-screen content is never disturbed.
+fn redraw_status_line(
+    stdout: &mut std::io::Stdout,
+    term_rows: u16,
+    mode: DisplayMode,
+    config: &TymuxConfig,
+    cfg: &StatusBarConfig,
+) -> Result<()> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    let line = status_bar::colorize(&status_bar::render_hint_line(mode, config), cfg);
+    write!(stdout, "\x1b7\x1b[{term_rows};1H\x1b[2K{line}\x1b8")?;
+    stdout.flush()?;
     Ok(())
 }
 
 /// SIGWINCH only exists on Unix; on other platforms the pane just keeps
 /// whatever size it got at attach time (still an improvement over never
-/// syncing at all).
+/// syncing at all). Only signals that a resize happened — the actual
+/// Resize RPC + DECSTBM/status-bar repaint happens in the main attach
+/// loop, which owns `stdout` (Story 6.3's single-owner-writer property);
+/// this task never writes to stdout itself.
 #[cfg(unix)]
-fn spawn_resize_watcher(tx: tokio::sync::mpsc::Sender<AttachRequest>) {
+fn spawn_resize_watcher() -> tokio::sync::mpsc::Receiver<()> {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
         let mut winch =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
@@ -780,15 +869,19 @@ fn spawn_resize_watcher(tx: tokio::sync::mpsc::Sender<AttachRequest>) {
                 }
             };
         while winch.recv().await.is_some() {
-            if send_resize(&tx).await.is_err() {
+            if tx.send(()).await.is_err() {
                 break;
             }
         }
     });
+    rx
 }
 
 #[cfg(not(unix))]
-fn spawn_resize_watcher(_tx: tokio::sync::mpsc::Sender<AttachRequest>) {}
+fn spawn_resize_watcher() -> tokio::sync::mpsc::Receiver<()> {
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    rx
+}
 
 #[cfg(test)]
 mod tests {
@@ -797,6 +890,40 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("tymux").chain(args.iter().copied())).unwrap()
+    }
+
+    /// Story 6.3 AC1 — structural, not just absence-of-observed-corruption:
+    /// scans `attach()`'s own source text (this file, at compile time via
+    /// `include_str!`) and asserts no bare `println!`/`print!`/
+    /// `std::io::stdout()` call site exists inside its body outside the
+    /// single `stdout` handle it declares once and threads through every
+    /// write (directly, or via `redraw_status_line`/`redraw_copy_mode`/
+    /// `render_plain_grid`, which all take `&mut std::io::Stdout` rather
+    /// than acquiring their own handle).
+    #[test]
+    fn attach_loop_should_route_all_stdout_writes_through_single_owning_task_never_directly() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn attach(\n")
+            .expect("attach() must exist in this file");
+        let end = source[start..]
+            .find("\n/// Basic (non-chrome) full-screen redraw")
+            .expect("attach() must be immediately followed by render_plain_grid's doc comment");
+        let attach_body = &source[start..start + end];
+
+        assert!(
+            !attach_body.contains("println!"),
+            "attach() must not call println! directly — route through the owned `stdout` handle"
+        );
+        assert!(
+            !attach_body.contains("print!("),
+            "attach() must not call print! directly — route through the owned `stdout` handle"
+        );
+        assert_eq!(
+            attach_body.matches("std::io::stdout()").count(),
+            1,
+            "attach() must acquire exactly one stdout handle (the single owner), not one per write site"
+        );
     }
 
     #[test]

@@ -28,6 +28,25 @@ pub enum Action {
     SendPrefixLiteral,
 }
 
+impl Action {
+    /// Short label for the status bar's prefix-armed hint line (Story
+    /// 6.4 AC1), e.g. `"detach"`, `"split-h"`.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Action::Detach => "detach",
+            Action::EnterCopyMode => "copy-mode",
+            Action::ExitCopyMode => "exit-copy-mode",
+            Action::SplitHorizontal => "split-h",
+            Action::SplitVertical => "split-v",
+            Action::NewWindow => "new-window",
+            Action::NextWindow => "next-window",
+            Action::PrevWindow => "prev-window",
+            Action::KillPane => "kill-pane",
+            Action::SendPrefixLiteral => "literal-prefix",
+        }
+    }
+}
+
 /// The config-file key naming for each bindable action, and its
 /// hardcoded tmux-parity default (`sequence` string form, `"C-b d"`
 /// style) — the single source of truth `TymuxConfig::load_or_default`

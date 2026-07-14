@@ -396,6 +396,7 @@ impl TymuxService for TymuxDaemon {
             let _ = tx
                 .send(Ok(WindowLayoutEvent {
                     layout: Some(layout_snapshot_to_proto(&window.layout)),
+                    attached_client_count: engine.attached_client_count(window_id),
                 }))
                 .await;
         }
@@ -409,6 +410,7 @@ impl TymuxService for TymuxDaemon {
                         };
                         let event = WindowLayoutEvent {
                             layout: Some(layout_snapshot_to_proto(&window.layout)),
+                            attached_client_count: engine.attached_client_count(window_id),
                         };
                         if tx.send(Ok(event)).await.is_err() {
                             return;
@@ -1243,6 +1245,62 @@ mod tests {
             second.layout.unwrap().node.unwrap(),
             Node::Split(_)
         ));
+    }
+
+    /// Story 6.1 AC1: `attached_client_count` is real gRPC-introspectable
+    /// data (ADR-004's viewport tracker), not something a client has to
+    /// scrape ANSI output to learn.
+    #[tokio::test]
+    async fn status_bar_model_rpc_should_return_structured_data_reflecting_two_attached_clients() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let window_id = parse_uuid(&session.windows[0].id).unwrap();
+
+        engine.report_viewport_and_recompute(window_id, engine.new_client_id(), 24, 80);
+        engine.report_viewport_and_recompute(window_id, engine.new_client_id(), 30, 100);
+
+        let mut watch_stream = daemon
+            .watch_window(Request::new(WatchWindowRequest {
+                window_id: session.windows[0].id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attached_client_count, 2);
+    }
+
+    #[tokio::test]
+    async fn status_bar_model_rpc_should_return_zero_attached_client_count_when_none_attached() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mut watch_stream = daemon
+            .watch_window(Request::new(WatchWindowRequest {
+                window_id: session.windows[0].id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attached_client_count, 0);
     }
 
     /// Story 4.6: the daemon-side rejection is the authoritative guard for
