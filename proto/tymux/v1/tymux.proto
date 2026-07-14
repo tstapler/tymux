@@ -192,8 +192,19 @@ message WatchWindowRequest {
   string window_id = 1;
 }
 
+// The status-bar-shaped read (Story 6.1) is folded into WatchWindow's
+// existing stream rather than a new dedicated RPC (plan.md Unresolved
+// Question #9, resolved at Epic 6 implementation time) — a client that
+// wants status-bar data already needs WatchWindow for layout changes, so
+// a second RPC would just be a redundant subscription to the same
+// window's state.
 message WindowLayoutEvent {
   Layout layout = 1;
+  // How many clients are currently attached to a pane within this window
+  // (ADR-004's viewport tracker, already counting this) — gRPC-
+  // introspectable so a programmatic/agent client gets this without
+  // ANSI-scraping the human-facing status bar.
+  uint32 attached_client_count = 2;
 }
 
 message CapturePaneRequest {

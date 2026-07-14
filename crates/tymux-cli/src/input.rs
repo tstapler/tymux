@@ -55,10 +55,8 @@ impl KeystrokeReassembler {
         }
     }
 
-    // Reserved for Epic 6's mode-reactive status bar (needs to know
-    // whether the prefix is currently armed to render the right hint
-    // table); not called from production code yet, only tests.
-    #[allow(dead_code)]
+    /// Used by the status bar's mode-reactive rendering (Story 6.4) to
+    /// know whether to show the prefix-armed hint table.
     pub fn is_armed(&self) -> bool {
         self.armed_bytes.is_some()
     }
