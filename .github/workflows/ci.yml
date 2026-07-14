@@ -41,23 +41,35 @@ jobs:
       - run: cargo test --workspace
 
   musl-build:
+    # Both musl targets the release workflow ships (Epic 8 Story 8.1) are
+    # validated on every PR, not just at release time — aarch64 needs a
+    # cross linker the x86_64 leg doesn't (see the per-target step below).
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: musl
-      # Build-only: the musl target has no bundled test runner on
+          key: ${{ matrix.target }}
+      # Build-only: the musl targets have no bundled test runner on
       # ubuntu-latest without extra setup, so this verifies compilation
       # (and thus portable-pty's musl linking) continuously, on every PR.
-      - run: cargo build --workspace --target x86_64-unknown-linux-musl
+      - run: cargo build --workspace --target ${{ matrix.target }}
 
   ts-client:
     # Story 7.1 Task 4 (buf generate drift check) + Story 7.2 Task 3 /
