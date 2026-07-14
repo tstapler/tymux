@@ -6,24 +6,24 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use tymux_core::{Engine, PaneLookup, SessionInfo};
+use tymux_core::{
+    Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneLookup,
+    SessionSnapshot, WindowSnapshot,
+};
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
     attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
-    Cell as ProtoCell, CreateSessionRequest, KillSessionRequest, KillSessionResponse,
-    ListSessionsRequest, ListSessionsResponse, Liveness, Pane as ProtoPane,
-    PaneSnapshot as ProtoSnapshot, Row as ProtoRow, Session as ProtoSession, Window as ProtoWindow,
+    Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse, CreateSessionRequest,
+    CreateWindowRequest, KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
+    LayoutChild as ProtoLayoutChild, ListSessionsRequest, ListSessionsResponse, Liveness,
+    Orientation as ProtoOrientation, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
+    Row as ProtoRow, Session as ProtoSession, Split as ProtoSplit, SplitPaneRequest,
+    WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
 };
 
 pub struct TymuxDaemon {
     engine: Arc<Engine>,
 }
-
-/// Every session has exactly one window today (see
-/// docs/adr/0001-single-pane-per-session-for-now.md), so it's always
-/// window index 0 — tmux itself names windows by their index by default,
-/// so "0" here is that same convention, not an arbitrary placeholder.
-const SOLE_WINDOW_NAME: &str = "0";
 
 fn liveness_of(live: bool) -> Liveness {
     if live {
@@ -33,22 +33,64 @@ fn liveness_of(live: bool) -> Liveness {
     }
 }
 
-fn session_to_proto(info: SessionInfo) -> ProtoSession {
-    let liveness = liveness_of(info.live);
+fn orientation_to_proto(o: CoreOrientation) -> ProtoOrientation {
+    match o {
+        CoreOrientation::Horizontal => ProtoOrientation::Horizontal,
+        CoreOrientation::Vertical => ProtoOrientation::Vertical,
+    }
+}
+
+// tonic::Status is a fixed ~176 bytes we don't control; boxing it here
+// would just push the cost onto every call site.
+#[allow(clippy::result_large_err)]
+fn orientation_from_proto(o: i32) -> Result<CoreOrientation, Status> {
+    match ProtoOrientation::try_from(o) {
+        Ok(ProtoOrientation::Horizontal) => Ok(CoreOrientation::Horizontal),
+        Ok(ProtoOrientation::Vertical) => Ok(CoreOrientation::Vertical),
+        _ => Err(Status::invalid_argument("orientation must be specified")),
+    }
+}
+
+fn layout_snapshot_to_proto(layout: &CoreLayout) -> ProtoLayout {
+    use tymux_proto::v1::layout::Node;
+    let node = match layout {
+        CoreLayout::Leaf(info) => Node::Pane(ProtoPane {
+            id: info.id.to_string(),
+            rows: info.rows,
+            cols: info.cols,
+            liveness: liveness_of(info.live) as i32,
+        }),
+        CoreLayout::Split {
+            orientation,
+            children,
+        } => Node::Split(ProtoSplit {
+            orientation: orientation_to_proto(*orientation) as i32,
+            children: children
+                .iter()
+                .map(|(child, ratio)| ProtoLayoutChild {
+                    layout: Some(layout_snapshot_to_proto(child)),
+                    ratio: *ratio,
+                })
+                .collect(),
+        }),
+    };
+    ProtoLayout { node: Some(node) }
+}
+
+fn window_to_proto(window: &WindowSnapshot) -> ProtoWindow {
+    ProtoWindow {
+        id: window.id.to_string(),
+        name: window.name.clone(),
+        layout: Some(layout_snapshot_to_proto(&window.layout)),
+    }
+}
+
+fn session_to_proto(session: &SessionSnapshot) -> ProtoSession {
     ProtoSession {
-        id: info.id.to_string(),
-        name: info.name,
-        windows: vec![ProtoWindow {
-            id: info.window_id.to_string(),
-            name: SOLE_WINDOW_NAME.to_string(),
-            panes: vec![ProtoPane {
-                id: info.pane_id.to_string(),
-                rows: info.rows,
-                cols: info.cols,
-                liveness: liveness as i32,
-            }],
-        }],
-        liveness: liveness as i32,
+        id: session.id.to_string(),
+        name: session.name.clone(),
+        windows: session.windows.iter().map(window_to_proto).collect(),
+        liveness: liveness_of(session.live) as i32,
     }
 }
 
@@ -91,6 +133,22 @@ fn parse_uuid(s: &str) -> Result<Uuid, Status> {
 async fn supervise(pane_id: Uuid, task: &'static str, handle: tokio::task::JoinHandle<()>) {
     if let Err(e) = handle.await {
         tracing::error!(pane_id = %pane_id, task, error = %e, "attach task panicked");
+    }
+}
+
+fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
+    match e {
+        tymux_core::EngineError::PaneNotFound(id) => {
+            Status::not_found(format!("no such pane: {id}"))
+        }
+        tymux_core::EngineError::SessionNotFound(id) => {
+            Status::not_found(format!("no such session: {id}"))
+        }
+        tymux_core::EngineError::BelowMinimumSize { rows, cols } => {
+            Status::failed_precondition(format!(
+                "split would produce a pane of {rows} rows x {cols} cols, below the minimum size"
+            ))
+        }
     }
 }
 
@@ -153,8 +211,8 @@ impl TymuxService for TymuxDaemon {
             .into_iter()
             .find(|s| s.id == id)
             .ok_or_else(|| Status::internal("session vanished after create"))?;
-        tracing::info!(session_id = %info.id, name = %info.name, pane_id = %info.pane_id, "session created");
-        Ok(Response::new(session_to_proto(info)))
+        tracing::info!(session_id = %info.id, name = %info.name, "session created");
+        Ok(Response::new(session_to_proto(&info)))
     }
 
     async fn list_sessions(
@@ -164,7 +222,7 @@ impl TymuxService for TymuxDaemon {
         let sessions = self
             .engine
             .list_sessions()
-            .into_iter()
+            .iter()
             .map(session_to_proto)
             .collect();
         Ok(Response::new(ListSessionsResponse { sessions }))
@@ -199,6 +257,124 @@ impl TymuxService for TymuxDaemon {
         )))
     }
 
+    async fn split_pane(
+        &self,
+        request: Request<SplitPaneRequest>,
+    ) -> Result<Response<ProtoSession>, Status> {
+        let req = request.into_inner();
+        let pane_id = parse_uuid(&req.pane_id)?;
+        let orientation = orientation_from_proto(req.orientation)?;
+        let command = if req.command.is_empty() {
+            None
+        } else {
+            Some(req.command)
+        };
+        let session = self
+            .engine
+            .split_pane(pane_id, orientation, command)
+            .map_err(engine_error_to_status)?;
+        tracing::info!(pane_id = %pane_id, session_id = %session.id, "pane split");
+        Ok(Response::new(session_to_proto(&session)))
+    }
+
+    async fn close_pane(
+        &self,
+        request: Request<ClosePaneRequest>,
+    ) -> Result<Response<ClosePaneResponse>, Status> {
+        let pane_id = parse_uuid(&request.into_inner().pane_id)?;
+        let outcome = self
+            .engine
+            .close_pane(pane_id)
+            .map_err(engine_error_to_status)?;
+        tracing::info!(pane_id = %pane_id, window_closed = outcome.window_closed.is_some(), session_closed = outcome.session_closed.is_some(), "pane closed");
+        Ok(Response::new(ClosePaneResponse {
+            window_closed_id: outcome
+                .window_closed
+                .as_ref()
+                .map(|(id, _)| id.to_string())
+                .unwrap_or_default(),
+            window_closed_name: outcome
+                .window_closed
+                .map(|(_, name)| name)
+                .unwrap_or_default(),
+            session_closed_id: outcome
+                .session_closed
+                .as_ref()
+                .map(|(id, _)| id.to_string())
+                .unwrap_or_default(),
+            session_closed_name: outcome
+                .session_closed
+                .map(|(_, name)| name)
+                .unwrap_or_default(),
+            session: outcome.session.as_ref().map(session_to_proto),
+        }))
+    }
+
+    async fn create_window(
+        &self,
+        request: Request<CreateWindowRequest>,
+    ) -> Result<Response<ProtoSession>, Status> {
+        let req = request.into_inner();
+        let session_id = parse_uuid(&req.session_id)?;
+        let command = if req.command.is_empty() {
+            None
+        } else {
+            Some(req.command)
+        };
+        let session = self
+            .engine
+            .create_window(session_id, command)
+            .map_err(engine_error_to_status)?;
+        tracing::info!(session_id = %session_id, "window created");
+        Ok(Response::new(session_to_proto(&session)))
+    }
+
+    type WatchWindowStream = Pin<Box<dyn Stream<Item = Result<WindowLayoutEvent, Status>> + Send>>;
+
+    async fn watch_window(
+        &self,
+        request: Request<WatchWindowRequest>,
+    ) -> Result<Response<Self::WatchWindowStream>, Status> {
+        let window_id = parse_uuid(&request.into_inner().window_id)?;
+        let mut changes = self.engine.watch_window(window_id);
+        let engine = self.engine.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // Emit the current snapshot immediately, so a subscriber doesn't
+        // have to wait for the *next* change to learn the current shape.
+        if let Some(window) = engine.window_snapshot(window_id) {
+            let _ = tx
+                .send(Ok(WindowLayoutEvent {
+                    layout: Some(layout_snapshot_to_proto(&window.layout)),
+                }))
+                .await;
+        }
+
+        tokio::spawn(async move {
+            loop {
+                match changes.recv().await {
+                    Ok(()) => {
+                        let Some(window) = engine.window_snapshot(window_id) else {
+                            return; // window closed — end the stream
+                        };
+                        let event = WindowLayoutEvent {
+                            layout: Some(layout_snapshot_to_proto(&window.layout)),
+                        };
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::WatchWindowStream
+        ))
+    }
+
     type AttachStream = Pin<Box<dyn Stream<Item = Result<AttachEvent, Status>> + Send>>;
 
     async fn attach(
@@ -224,6 +400,13 @@ impl TymuxService for TymuxDaemon {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "attach: pane unavailable");
         })?;
         tracing::info!(pane_id = %pane_id, "attach started");
+
+        // Resize is window-scoped (ADR-004): track this client's reported
+        // viewport against the pane's window and apply the dimension-wise
+        // minimum across every attached client, rather than sizing this
+        // one pane to this one client's report 1:1.
+        let window_id = self.engine.window_id_for_pane(pane_id);
+        let client_id = self.engine.new_client_id();
 
         let mut output_rx = pane.subscribe();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -262,6 +445,7 @@ impl TymuxService for TymuxDaemon {
         tokio::spawn(supervise(pane_id, "forward", forward_handle));
 
         let pane_for_input = pane.clone();
+        let engine_for_input = self.engine.clone();
         let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
@@ -271,12 +455,23 @@ impl TymuxService for TymuxDaemon {
                         }
                     }
                     Some(attach_request::Payload::Resize(r)) => {
-                        if let Err(e) = pane_for_input.resize(r.rows as u16, r.cols as u16) {
-                            tracing::warn!(pane_id = %pane_for_input.id, error = %e, "resize failed");
+                        if let Some(window_id) = window_id {
+                            engine_for_input.report_viewport_and_recompute(
+                                window_id,
+                                client_id,
+                                r.rows as u16,
+                                r.cols as u16,
+                            );
+                        } else {
+                            tracing::warn!(pane_id = %pane_for_input.id, "resize: pane's window not found, ignoring");
                         }
                     }
                     _ => {}
                 }
+            }
+            if let Some(window_id) = window_id {
+                engine_for_input.unregister_viewport(window_id, client_id);
+                engine_for_input.recompute_window_geometry(window_id);
             }
         });
         tokio::spawn(supervise(pane_id, "input", input_handle));
@@ -373,6 +568,17 @@ mod tests {
         }
     }
 
+    /// Extracts the pane from a freshly created single-pane window's
+    /// `Layout` — the common case throughout these tests, which mostly
+    /// predate splits.
+    fn sole_pane(window: &ProtoWindow) -> &ProtoPane {
+        use tymux_proto::v1::layout::Node;
+        match window.layout.as_ref().unwrap().node.as_ref().unwrap() {
+            Node::Pane(p) => p,
+            Node::Split(_) => panic!("expected a single-leaf window"),
+        }
+    }
+
     // /bin/sh explicitly so these don't depend on $SHELL/bash being present.
     fn create_req(name: &str) -> CreateSessionRequest {
         CreateSessionRequest {
@@ -416,10 +622,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(resp.name, "test");
-        let pane_id = resp.windows[0].panes[0].id.clone();
+        let pane_id = sole_pane(&resp.windows[0]).id.clone();
         // Reflects the pane's real size (not a stale hardcoded literal).
-        assert_eq!(resp.windows[0].panes[0].rows, 24);
-        assert_eq!(resp.windows[0].panes[0].cols, 80);
+        assert_eq!(sole_pane(&resp.windows[0]).rows, 24);
+        assert_eq!(sole_pane(&resp.windows[0]).cols, 80);
 
         let list = daemon
             .list_sessions(Request::new(ListSessionsRequest {}))
@@ -427,9 +633,9 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(list.sessions.len(), 1);
-        assert_eq!(list.sessions[0].windows[0].panes[0].id, pane_id);
-        assert_eq!(list.sessions[0].windows[0].panes[0].rows, 24);
-        assert_eq!(list.sessions[0].windows[0].panes[0].cols, 80);
+        assert_eq!(sole_pane(&list.sessions[0].windows[0]).id, pane_id);
+        assert_eq!(sole_pane(&list.sessions[0].windows[0]).rows, 24);
+        assert_eq!(sole_pane(&list.sessions[0].windows[0]).cols, 80);
     }
 
     #[tokio::test]
@@ -476,7 +682,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let pane_id = session.windows[0].panes[0].id.clone();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
 
         let snapshot = daemon
             .capture_pane(Request::new(CapturePaneRequest { pane_id }))
@@ -497,7 +703,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(session.liveness, Liveness::Live as i32);
-        assert_eq!(session.windows[0].panes[0].liveness, Liveness::Live as i32);
+        assert_eq!(
+            sole_pane(&session.windows[0]).liveness,
+            Liveness::Live as i32
+        );
     }
 
     #[tokio::test]
@@ -508,7 +717,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let pane_id = parse_uuid(&session.windows[0].panes[0].id).unwrap();
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
 
         let pane = match daemon.engine.pane_lookup(pane_id) {
             PaneLookup::Live(pane) => pane,
@@ -524,7 +733,7 @@ mod tests {
             .into_inner();
         assert_eq!(list.sessions[0].liveness, Liveness::Dead as i32);
         assert_eq!(
-            list.sessions[0].windows[0].panes[0].liveness,
+            sole_pane(&list.sessions[0].windows[0]).liveness,
             Liveness::Dead as i32
         );
     }
@@ -543,7 +752,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let pane_id = parse_uuid(&session.windows[0].panes[0].id).unwrap();
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
         let pane = match engine.pane_lookup(pane_id) {
             PaneLookup::Live(pane) => pane,
             _ => panic!("expected freshly created pane to be Live"),
@@ -557,7 +766,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(
-            list.sessions[0].windows[0].panes[0].liveness,
+            sole_pane(&list.sessions[0].windows[0]).liveness,
             Liveness::Dead as i32
         );
     }
@@ -571,7 +780,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let pane_id_str = session.windows[0].panes[0].id.clone();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
         let pane_id = parse_uuid(&pane_id_str).unwrap();
 
         let pane = match daemon.engine.pane_lookup(pane_id) {
@@ -692,7 +901,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let pane_id = session.windows[0].panes[0].id.clone();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(AttachRequest {
@@ -746,7 +955,7 @@ mod tests {
             .unwrap()
             .into_inner();
         let session_id = session.id.clone();
-        let pane_id = session.windows[0].panes[0].id.clone();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(AttachRequest {
@@ -789,5 +998,176 @@ mod tests {
             saw_clean_exit,
             "expected a clean Exited event before the stream closed, not a raw error or silent hang"
         );
+    }
+
+    #[tokio::test]
+    async fn split_pane_rpc_should_produce_two_leaf_layout_visible_in_list_sessions() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        daemon
+            .split_pane(Request::new(SplitPaneRequest {
+                pane_id,
+                orientation: ProtoOrientation::Vertical as i32,
+                command: "/bin/sh".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let list = daemon
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let layout = list.sessions[0].windows[0].layout.as_ref().unwrap();
+        use tymux_proto::v1::layout::Node;
+        match layout.node.as_ref().unwrap() {
+            Node::Split(split) => assert_eq!(split.children.len(), 2),
+            Node::Pane(_) => panic!("expected the window's layout to be a Split after SplitPane"),
+        }
+    }
+
+    #[tokio::test]
+    async fn split_pane_rpc_should_return_not_found_when_pane_id_unknown() {
+        let daemon = test_daemon();
+        let err = daemon
+            .split_pane(Request::new(SplitPaneRequest {
+                pane_id: Uuid::new_v4().to_string(),
+                orientation: ProtoOrientation::Horizontal as i32,
+                command: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn close_pane_should_collapse_and_report_no_window_closed_when_sibling_survives() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let split = daemon
+            .split_pane(Request::new(SplitPaneRequest {
+                pane_id,
+                orientation: ProtoOrientation::Horizontal as i32,
+                command: "/bin/sh".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        use tymux_proto::v1::layout::Node;
+        let second_pane_id = match split.windows[0]
+            .layout
+            .as_ref()
+            .unwrap()
+            .node
+            .as_ref()
+            .unwrap()
+        {
+            Node::Split(s) => match s.children[1]
+                .layout
+                .as_ref()
+                .unwrap()
+                .node
+                .as_ref()
+                .unwrap()
+            {
+                Node::Pane(p) => p.id.clone(),
+                _ => panic!("expected a leaf"),
+            },
+            _ => panic!("expected a split"),
+        };
+
+        let resp = daemon
+            .close_pane(Request::new(ClosePaneRequest {
+                pane_id: second_pane_id,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.window_closed_id.is_empty());
+        assert!(resp.session_closed_id.is_empty());
+        assert!(resp.session.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_window_rpc_should_add_a_second_window() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let updated = daemon
+            .create_window(Request::new(CreateWindowRequest {
+                session_id: session.id,
+                command: "/bin/sh".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(updated.windows.len(), 2);
+    }
+
+    /// Story 3.3 AC2: a `WatchWindow` subscriber observes a `WindowLayoutEvent`
+    /// reflecting the new tree shape when another client calls `SplitPane`,
+    /// without polling `ListSessions`.
+    #[tokio::test]
+    async fn watch_window_should_emit_layout_event_when_another_client_calls_split_pane() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let window_id = session.windows[0].id.clone();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let mut watch_stream = daemon
+            .watch_window(Request::new(WatchWindowRequest {
+                window_id: window_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // First event: the current (single-leaf) shape, sent immediately.
+        let first = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("watch stream should emit promptly")
+            .unwrap()
+            .unwrap();
+        use tymux_proto::v1::layout::Node;
+        assert!(matches!(first.layout.unwrap().node.unwrap(), Node::Pane(_)));
+
+        daemon
+            .split_pane(Request::new(SplitPaneRequest {
+                pane_id,
+                orientation: ProtoOrientation::Vertical as i32,
+                command: "/bin/sh".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let second = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("watch stream should emit after SplitPane, not require polling ListSessions")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            second.layout.unwrap().node.unwrap(),
+            Node::Split(_)
+        ));
     }
 }

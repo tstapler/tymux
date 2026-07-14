@@ -11,3 +11,6 @@ vt100 = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

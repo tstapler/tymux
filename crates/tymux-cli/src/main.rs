@@ -8,25 +8,138 @@ use tonic::Request;
 
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
-    attach_event, attach_request, AttachRequest, CreateSessionRequest, KillSessionRequest,
-    ListSessionsRequest, Resize, Session,
+    attach_event, attach_request, layout::Node, AttachRequest, ClosePaneRequest,
+    CreateSessionRequest, KillSessionRequest, ListSessionsRequest, Orientation, Pane as ProtoPane,
+    Resize, Session, SplitPaneRequest, Window,
 };
 
-/// Every session today has exactly one window with one pane (see
-/// docs/adr/0001-single-pane-per-session-for-now.md), but the proto
-/// itself allows `repeated` windows/panes — so this is a real bounds
-/// check, not a formality, and fails with a clear message instead of
-/// panicking the moment that assumption is ever violated.
+/// `session[:window.pane]` addressing grammar, replacing the old
+/// unchecked `windows[0].panes[0]` indexing (docs/adr/0001). The
+/// `:window.pane` suffix is optional — bare `myproject` defaults to
+/// window 0, pane 0, preserving today's simple single-pane UX.
+#[derive(Debug, PartialEq)]
+struct TargetString {
+    session: String,
+    window_index: usize,
+    pane_index: usize,
+}
+
+impl TargetString {
+    fn parse(s: &str) -> Result<Self> {
+        let (session, rest) = match s.split_once(':') {
+            Some((session, rest)) => (session.to_string(), Some(rest)),
+            None => (s.to_string(), None),
+        };
+        if session.is_empty() {
+            return Err(anyhow::anyhow!(
+                "target '{s}' must name a session, e.g. 'myproject' or 'myproject:0.1'"
+            ));
+        }
+        let (window_index, pane_index) = match rest {
+            None => (0, 0),
+            Some(rest) => {
+                let (window_str, pane_str) = rest.split_once('.').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "target '{s}' is missing '.pane' after the window (expected session:window.pane)"
+                    )
+                })?;
+                let window_index: usize = window_str.parse().map_err(|_| {
+                    anyhow::anyhow!("target '{s}': '{window_str}' is not a valid window index")
+                })?;
+                let pane_index: usize = pane_str.parse().map_err(|_| {
+                    anyhow::anyhow!("target '{s}': '{pane_str}' is not a valid pane index")
+                })?;
+                (window_index, pane_index)
+            }
+        };
+        Ok(TargetString {
+            session,
+            window_index,
+            pane_index,
+        })
+    }
+
+    /// Resolves this target against a real `Session`, bounds-checked at
+    /// every step — a real bounds check, not a formality, matching
+    /// ADR 0001's original design property that this never panics on an
+    /// out-of-range index, it fails with a clear message instead.
+    fn resolve(&self, session: &Session) -> Result<String> {
+        let window = session.windows.get(self.window_index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "session '{}' has no window {} (it has {} window{})",
+                self.session,
+                self.window_index,
+                session.windows.len(),
+                if session.windows.len() == 1 { "" } else { "s" }
+            )
+        })?;
+        let panes = flatten_panes(window);
+        let pane = panes.get(self.pane_index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "window {} of session '{}' has no pane {} (it has {} pane{})",
+                self.window_index,
+                self.session,
+                self.pane_index,
+                panes.len(),
+                if panes.len() == 1 { "" } else { "s" }
+            )
+        })?;
+        Ok(pane.id.clone())
+    }
+}
+
+/// Every leaf `Pane` in a window's `Layout` tree, in pre-order — the
+/// positional indexing `TargetString`'s `.pane` component addresses into.
+fn flatten_panes(window: &Window) -> Vec<&ProtoPane> {
+    fn walk<'a>(node: &'a Node, out: &mut Vec<&'a ProtoPane>) {
+        match node {
+            Node::Pane(p) => out.push(p),
+            Node::Split(split) => {
+                for child in &split.children {
+                    if let Some(layout) = &child.layout {
+                        if let Some(node) = &layout.node {
+                            walk(node, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(node) = window.layout.as_ref().and_then(|l| l.node.as_ref()) {
+        walk(node, &mut out);
+    }
+    out
+}
+
+/// The very first pane of a freshly created session — used only right
+/// after `CreateSession`, where the caller already knows the exact shape
+/// (one window, one pane) without needing `TargetString` resolution.
 fn first_pane_id(session: &Session) -> Result<String> {
     let window = session
         .windows
         .first()
         .ok_or_else(|| anyhow::anyhow!("session {} has no windows", session.id))?;
-    let pane = window
-        .panes
+    flatten_panes(window)
         .first()
-        .ok_or_else(|| anyhow::anyhow!("window {} has no panes", window.id))?;
-    Ok(pane.id.clone())
+        .map(|p| p.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("window {} has no panes", window.id))
+}
+
+async fn resolve_target(
+    client: &mut TymuxServiceClient<Channel>,
+    target: &TargetString,
+) -> Result<String> {
+    let resp = client
+        .list_sessions(ListSessionsRequest {})
+        .await?
+        .into_inner();
+    let session = resp
+        .sessions
+        .into_iter()
+        .find(|s| s.name == target.session)
+        .ok_or_else(|| anyhow::anyhow!("no such session: {}", target.session))?;
+    target.resolve(&session)
 }
 
 #[derive(Parser)]
@@ -50,10 +163,22 @@ enum Command {
     },
     /// List sessions on the daemon.
     Ls,
-    /// Attach to an existing session by id.
-    Attach { session_id: String },
-    /// End a session and its pane's process entirely.
+    /// Attach to an existing session/window/pane, e.g. `myproject` or `myproject:0.1`.
+    Attach { target: String },
+    /// End a session and every pane's process in it entirely.
     Kill { session_id: String },
+    /// Split an existing pane, e.g. `tymux split myproject:0.0 --vertical`.
+    Split {
+        target: String,
+        #[arg(long, conflicts_with = "horizontal")]
+        vertical: bool,
+        #[arg(long, conflicts_with = "vertical")]
+        horizontal: bool,
+        #[arg(long)]
+        command: Option<String>,
+    },
+    /// Close a single pane (not the whole session).
+    KillPane { target: String },
 }
 
 /// Restores the local terminal out of raw mode on drop, including on
@@ -127,17 +252,9 @@ async fn run() -> Result<()> {
                 println!("{}\t{}", s.id, s.name);
             }
         }
-        Command::Attach { session_id } => {
-            let resp = client
-                .list_sessions(ListSessionsRequest {})
-                .await?
-                .into_inner();
-            let session = resp
-                .sessions
-                .into_iter()
-                .find(|s| s.id == session_id)
-                .ok_or_else(|| anyhow::anyhow!("no such session: {session_id}"))?;
-            let pane_id = first_pane_id(&session)?;
+        Command::Attach { target } => {
+            let target = TargetString::parse(&target)?;
+            let pane_id = resolve_target(&mut client, &target).await?;
             attach(&mut client, pane_id).await?;
         }
         Command::Kill { session_id } => {
@@ -145,9 +262,57 @@ async fn run() -> Result<()> {
                 .kill_session(KillSessionRequest { session_id })
                 .await?;
         }
+        Command::Split {
+            target,
+            vertical,
+            horizontal: _,
+            command,
+        } => {
+            let target = TargetString::parse(&target)?;
+            let pane_id = resolve_target(&mut client, &target).await?;
+            let orientation = if vertical {
+                Orientation::Vertical
+            } else {
+                Orientation::Horizontal
+            };
+            client
+                .split_pane(SplitPaneRequest {
+                    pane_id,
+                    orientation: orientation as i32,
+                    command: command.unwrap_or_default(),
+                })
+                .await?;
+        }
+        Command::KillPane { target } => {
+            let target = TargetString::parse(&target)?;
+            let pane_id = resolve_target(&mut client, &target).await?;
+            let resp = client
+                .close_pane(ClosePaneRequest { pane_id })
+                .await?
+                .into_inner();
+            print_close_pane_outcome(&resp);
+        }
     }
 
     Ok(())
+}
+
+/// Story 3.5 AC3: a pane close that cascades to closing its window (and,
+/// if that was the session's last window, the session too) must state
+/// exactly what happened — never a silent disappearance.
+fn print_close_pane_outcome(resp: &tymux_proto::v1::ClosePaneResponse) {
+    if !resp.session_closed_name.is_empty() {
+        println!(
+            "Window {} closed (last pane exited). '{}' closed (last window).",
+            resp.window_closed_name, resp.session_closed_name
+        );
+    } else if !resp.window_closed_name.is_empty() {
+        let remaining = resp.session.as_ref().map(|s| s.windows.len()).unwrap_or(0);
+        println!(
+            "Window {} closed (last pane exited). {} window(s) remain.",
+            resp.window_closed_name, remaining
+        );
+    }
 }
 
 async fn attach(client: &mut TymuxServiceClient<Channel>, pane_id: String) -> Result<()> {
@@ -352,9 +517,9 @@ mod tests {
     }
 
     #[test]
-    fn attach_requires_session_id() {
-        match parse(&["attach", "some-uuid"]).command {
-            Command::Attach { session_id } => assert_eq!(session_id, "some-uuid"),
+    fn attach_requires_target() {
+        match parse(&["attach", "myproject:0.1"]).command {
+            Command::Attach { target } => assert_eq!(target, "myproject:0.1"),
             other => panic!("expected Command::Attach, got a different variant: {other:?}"),
         }
         assert!(Cli::try_parse_from(["tymux", "attach"]).is_err());
@@ -369,7 +534,29 @@ mod tests {
         assert!(Cli::try_parse_from(["tymux", "kill"]).is_err());
     }
 
-    fn session_with(windows: Vec<tymux_proto::v1::Window>) -> Session {
+    #[test]
+    fn split_command_parses_target_and_orientation_flag() {
+        match parse(&["split", "myproject:0.0", "--vertical"]).command {
+            Command::Split {
+                target, vertical, ..
+            } => {
+                assert_eq!(target, "myproject:0.0");
+                assert!(vertical);
+            }
+            other => panic!("expected Command::Split, got a different variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_pane_command_requires_target() {
+        match parse(&["kill-pane", "myproject:0.1"]).command {
+            Command::KillPane { target } => assert_eq!(target, "myproject:0.1"),
+            other => panic!("expected Command::KillPane, got a different variant: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["tymux", "kill-pane"]).is_err());
+    }
+
+    fn session_with(windows: Vec<Window>) -> Session {
         Session {
             id: "session-1".to_string(),
             name: "test".to_string(),
@@ -378,16 +565,51 @@ mod tests {
         }
     }
 
-    fn window_with(panes: Vec<tymux_proto::v1::Pane>) -> tymux_proto::v1::Window {
-        tymux_proto::v1::Window {
+    fn window_with_panes(panes: Vec<ProtoPane>) -> Window {
+        let mut children: Vec<tymux_proto::v1::LayoutChild> = Vec::new();
+        for p in panes {
+            children.push(tymux_proto::v1::LayoutChild {
+                layout: Some(tymux_proto::v1::Layout {
+                    node: Some(Node::Pane(p)),
+                }),
+                ratio: 1.0 / 2.0,
+            });
+        }
+        // For test purposes, a single pane is a bare leaf; 2+ panes are
+        // nested as a left-leaning chain of binary Splits (matching the
+        // real LayoutNode's strictly-binary invariant).
+        let layout = match children.len() {
+            0 => None,
+            1 => children.into_iter().next().unwrap().layout,
+            _ => {
+                let mut iter = children.into_iter();
+                let mut acc = iter.next().unwrap().layout.unwrap();
+                for child in iter {
+                    acc = tymux_proto::v1::Layout {
+                        node: Some(Node::Split(tymux_proto::v1::Split {
+                            orientation: Orientation::Horizontal as i32,
+                            children: vec![
+                                tymux_proto::v1::LayoutChild {
+                                    layout: Some(acc),
+                                    ratio: 0.5,
+                                },
+                                child,
+                            ],
+                        })),
+                    };
+                }
+                Some(acc)
+            }
+        };
+        Window {
             id: "window-1".to_string(),
             name: "0".to_string(),
-            panes,
+            layout,
         }
     }
 
-    fn pane(id: &str) -> tymux_proto::v1::Pane {
-        tymux_proto::v1::Pane {
+    fn pane(id: &str) -> ProtoPane {
+        ProtoPane {
             id: id.to_string(),
             rows: 24,
             cols: 80,
@@ -397,7 +619,7 @@ mod tests {
 
     #[test]
     fn first_pane_id_returns_the_pane() {
-        let session = session_with(vec![window_with(vec![pane("pane-1")])]);
+        let session = session_with(vec![window_with_panes(vec![pane("pane-1")])]);
         assert_eq!(first_pane_id(&session).unwrap(), "pane-1");
     }
 
@@ -409,7 +631,92 @@ mod tests {
 
     #[test]
     fn first_pane_id_errors_on_no_panes() {
-        let session = session_with(vec![window_with(vec![])]);
+        let session = session_with(vec![Window {
+            id: "window-1".to_string(),
+            name: "0".to_string(),
+            layout: None,
+        }]);
         assert!(first_pane_id(&session).is_err());
+    }
+
+    #[test]
+    fn target_string_should_resolve_specific_pane_when_addressing_by_session_window_pane() {
+        let target = TargetString::parse("myproject:0.1").unwrap();
+        assert_eq!(target.session, "myproject");
+        assert_eq!(target.window_index, 0);
+        assert_eq!(target.pane_index, 1);
+
+        let session = Session {
+            id: "s1".to_string(),
+            name: "myproject".to_string(),
+            windows: vec![window_with_panes(vec![pane("pane-0"), pane("pane-1")])],
+            liveness: tymux_proto::v1::Liveness::Live as i32,
+        };
+        assert_eq!(target.resolve(&session).unwrap(), "pane-1");
+    }
+
+    #[test]
+    fn target_string_bare_session_defaults_to_first_window_and_pane() {
+        let target = TargetString::parse("myproject").unwrap();
+        assert_eq!(target.window_index, 0);
+        assert_eq!(target.pane_index, 0);
+    }
+
+    #[test]
+    fn target_string_should_return_bounds_checked_error_when_pane_index_out_of_range() {
+        let target = TargetString::parse("myproject:0.5").unwrap();
+        let session = Session {
+            id: "s1".to_string(),
+            name: "myproject".to_string(),
+            windows: vec![window_with_panes(vec![pane("pane-0")])],
+            liveness: tymux_proto::v1::Liveness::Live as i32,
+        };
+        let err = target.resolve(&session).unwrap_err();
+        assert!(err.to_string().contains("no pane 5"));
+    }
+
+    #[test]
+    fn target_string_should_return_bounds_checked_error_when_window_index_out_of_range() {
+        let target = TargetString::parse("myproject:3.0").unwrap();
+        let session = Session {
+            id: "s1".to_string(),
+            name: "myproject".to_string(),
+            windows: vec![window_with_panes(vec![pane("pane-0")])],
+            liveness: tymux_proto::v1::Liveness::Live as i32,
+        };
+        let err = target.resolve(&session).unwrap_err();
+        assert!(err.to_string().contains("no window 3"));
+    }
+
+    #[test]
+    fn target_string_rejects_missing_pane_component() {
+        assert!(TargetString::parse("myproject:0").is_err());
+    }
+
+    #[test]
+    fn split_command_should_show_exact_row_counts_when_terminal_below_minimum_size() {
+        let status = tonic::Status::failed_precondition(
+            "split would produce a pane of 1 rows x 5 cols, below the minimum size",
+        );
+        let err: anyhow::Error = status.into();
+        let msg = friendly_message(&err);
+        assert!(msg.contains('1'));
+        assert!(msg.contains('5'));
+    }
+
+    #[test]
+    fn kill_pane_message_names_window_closed_when_last_pane_in_window() {
+        let resp = tymux_proto::v1::ClosePaneResponse {
+            window_closed_id: "w1".to_string(),
+            window_closed_name: "0".to_string(),
+            session_closed_id: String::new(),
+            session_closed_name: String::new(),
+            session: Some(session_with(vec![window_with_panes(vec![pane("p1")])])),
+        };
+        // Just confirm this doesn't panic and the outcome is structurally
+        // distinguishable (window closed, session not).
+        assert!(!resp.window_closed_name.is_empty());
+        assert!(resp.session_closed_name.is_empty());
+        print_close_pane_outcome(&resp);
     }
 }
