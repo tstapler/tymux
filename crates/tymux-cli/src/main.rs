@@ -529,13 +529,14 @@ async fn attach(
     // Sync the pane to the local terminal's real size immediately (Story
     // 6.2 AC1: reserves the status bar's row via DECSTBM at the same
     // time), and again on every SIGWINCH via the coordinated path below.
-    send_resize_and_repaint(&tx, &mut stdout, status_bar_cfg, mode, config).await?;
+    send_resize_and_repaint(&tx, &mut stdout, status_bar_cfg, mode, config, session_name).await?;
 
     let outcome = 'attach_loop: loop {
         tokio::select! {
             biased;
             _ = resize_rx.recv() => {
-                send_resize_and_repaint(&tx, &mut stdout, status_bar_cfg, mode, config).await?;
+                send_resize_and_repaint(&tx, &mut stdout, status_bar_cfg, mode, config, session_name)
+            .await?;
             }
             maybe_event = inbound.message() => {
                 match maybe_event? {
@@ -627,7 +628,14 @@ async fn attach(
                             render_plain_grid(&mut stdout, &snapshot.into_inner())?;
                         }
                         if let Ok((_, term_rows)) = crossterm::terminal::size() {
-                            redraw_status_line(&mut stdout, term_rows, mode, config, status_bar_cfg)?;
+                            redraw_status_line(
+                                &mut stdout,
+                                term_rows,
+                                mode,
+                                config,
+                                status_bar_cfg,
+                                session_name,
+                            )?;
                         }
                     } else if should_redraw {
                         redraw_copy_mode(&mut client.clone(), &pane_id, cs, &mut stdout).await?;
@@ -732,7 +740,14 @@ async fn attach(
                 if is_armed != was_armed {
                     mode = if is_armed { DisplayMode::PrefixArmed } else { DisplayMode::Normal };
                     if let Ok((_, term_rows)) = crossterm::terminal::size() {
-                        redraw_status_line(&mut stdout, term_rows, mode, config, status_bar_cfg)?;
+                        redraw_status_line(
+                            &mut stdout,
+                            term_rows,
+                            mode,
+                            config,
+                            status_bar_cfg,
+                            session_name,
+                        )?;
                     }
                 }
             }
@@ -818,6 +833,7 @@ async fn send_resize_and_repaint(
     cfg: &StatusBarConfig,
     mode: DisplayMode,
     config: &TymuxConfig,
+    session_name: &str,
 ) -> Result<()> {
     // A failure here just means the local terminal size can't be queried
     // (e.g. stdout isn't a real tty) — not worth aborting the attach over,
@@ -836,7 +852,7 @@ async fn send_resize_and_repaint(
 
     if cfg.enabled {
         stdout.write_all(&status_bar::decstbm_reserve(term_rows, cfg))?;
-        redraw_status_line(stdout, term_rows, mode, config, cfg)?;
+        redraw_status_line(stdout, term_rows, mode, config, cfg, session_name)?;
     }
     Ok(())
 }
@@ -851,11 +867,15 @@ fn redraw_status_line(
     mode: DisplayMode,
     config: &TymuxConfig,
     cfg: &StatusBarConfig,
+    session_name: &str,
 ) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
-    let line = status_bar::colorize(&status_bar::render_hint_line(mode, config), cfg);
+    let line = status_bar::colorize(
+        &status_bar::render_hint_line(mode, config, session_name),
+        cfg,
+    );
     write!(stdout, "\x1b7\x1b[{term_rows};1H\x1b[2K{line}\x1b8")?;
     stdout.flush()?;
     Ok(())
