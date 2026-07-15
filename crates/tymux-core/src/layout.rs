@@ -13,13 +13,27 @@ pub enum Orientation {
 
 /// Hard structural floor enforced by [`LayoutNode::split`] itself — no
 /// split is ever allowed to produce a leaf smaller than this, regardless
-/// of caller intent. This is a different, lower tier than the CLI's own
-/// user-facing `RECOMMENDED_SPLIT_MIN_ROWS` warning threshold (Epic 3
-/// Story 3.5): this constant is the anti-corruption floor that must never
-/// be violated at any size; the CLI's is a friendlier, higher bar it warns
-/// against before a caller ever reaches this one.
+/// of caller intent. This is a different, lower tier than
+/// [`RECOMMENDED_SPLIT_MIN_ROWS`] below (Epic 3 Story 3.5 AC2): this
+/// constant is the anti-corruption floor that must never be violated at
+/// any size; `RECOMMENDED_SPLIT_MIN_ROWS` is a friendlier, higher bar
+/// `split` rejects against before a caller ever reaches this one.
 pub const MIN_PANE_ROWS: u16 = 2;
 pub const MIN_PANE_COLS: u16 = 10;
+
+/// Usability-oriented threshold (Epic 3 Story 3.5 AC2), distinct from and
+/// higher than [`MIN_PANE_ROWS`]. A *horizontal* (side-by-side) split
+/// never changes a pane's row count — only its column count — so a pane
+/// that already has fewer than this many rows stays exactly that short
+/// after splitting side-by-side; the split just adds a second short pane
+/// rather than fixing anything. `LayoutNode::split` rejects a horizontal
+/// split whose target pane's rows are already below this bar, with a
+/// distinct [`LayoutError::BelowRecommendedSize`] carrying the actual row
+/// count so the caller can state real numbers, not just "too cramped".
+/// Vertical splits (which do change row count, and are already covered by
+/// `MIN_PANE_ROWS`'s hard floor) are intentionally out of scope for this
+/// check — see plan.md Story 3.5 AC2's note.
+pub const RECOMMENDED_SPLIT_MIN_ROWS: u16 = 20;
 
 /// A leaf's or split's on-screen rectangle, in cells. `row`/`col` are the
 /// top-left corner's offset within the window; `rows`/`cols` are the
@@ -72,6 +86,11 @@ pub enum LayoutError {
     /// [`MIN_PANE_COLS`]. Carries the actual would-be size so the caller
     /// can state the real numbers, not just "too small" (`ux.md` §4).
     BelowMinimumSize { rows: u16, cols: u16 },
+    /// A *horizontal* split whose target pane already has fewer than
+    /// [`RECOMMENDED_SPLIT_MIN_ROWS`] rows (Epic 3 Story 3.5 AC2) — a
+    /// friendlier, higher-tier rejection than [`LayoutError::BelowMinimumSize`].
+    /// Carries the pane's actual row count.
+    BelowRecommendedSize { rows: u16 },
     /// `target` does not name any leaf in this tree.
     PaneNotFound { pane_id: Uuid },
 }
@@ -83,6 +102,12 @@ impl std::fmt::Display for LayoutError {
                 f,
                 "split would produce a pane of {rows} rows x {cols} cols, \
                  below the minimum of {MIN_PANE_ROWS} rows x {MIN_PANE_COLS} cols"
+            ),
+            LayoutError::BelowRecommendedSize { rows } => write!(
+                f,
+                "Can't split: pane is {rows} rows, minimum for a horizontal split is \
+                 ~{RECOMMENDED_SPLIT_MIN_ROWS} rows. Resize your terminal or close another \
+                 pane first."
             ),
             LayoutError::PaneNotFound { pane_id } => {
                 write!(f, "no leaf with pane_id {pane_id} in this layout")
@@ -164,7 +189,10 @@ impl LayoutNode {
     /// the given `ratio` (and its complement). Rejects (leaving the tree
     /// untouched) if the resulting geometry — computed against the
     /// window's current `(window_rows, window_cols)` — would put either
-    /// new leaf below [`MIN_PANE_ROWS`]/[`MIN_PANE_COLS`].
+    /// new leaf below [`MIN_PANE_ROWS`]/[`MIN_PANE_COLS`] (the hard floor),
+    /// or, for a horizontal split only, if the target pane's rows are
+    /// already below [`RECOMMENDED_SPLIT_MIN_ROWS`] (the friendlier,
+    /// usability-tier check, Epic 3 Story 3.5 AC2).
     pub fn split(
         &mut self,
         target: Uuid,
@@ -196,6 +224,13 @@ impl LayoutNode {
                 rows: new_rows,
                 cols: new_cols,
             });
+        }
+        // AC2's friendlier, higher-tier check — horizontal-only, since a
+        // horizontal split leaves rows unchanged (see
+        // RECOMMENDED_SPLIT_MIN_ROWS's doc comment for why vertical splits
+        // are out of scope here).
+        if orientation == Orientation::Horizontal && new_rows < RECOMMENDED_SPLIT_MIN_ROWS {
+            return Err(LayoutError::BelowRecommendedSize { rows: new_rows });
         }
 
         self.replace_leaf(target, |old_leaf| LayoutNode::Split {
@@ -473,6 +508,55 @@ mod tests {
             leaf(a),
             "a rejected split must leave the tree untouched"
         );
+    }
+
+    #[test]
+    fn layout_node_split_should_reject_horizontal_split_when_pane_rows_below_recommended_threshold()
+    {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut tree = leaf(a);
+        // 15 rows x 80 cols window, horizontal split -> rows stay 15 (a
+        // horizontal split only halves columns), below
+        // RECOMMENDED_SPLIT_MIN_ROWS (20) but well above MIN_PANE_ROWS.
+        let err = tree
+            .split(a, Orientation::Horizontal, b, 15, 80)
+            .unwrap_err();
+        assert_eq!(err, LayoutError::BelowRecommendedSize { rows: 15 });
+        assert_eq!(
+            tree,
+            leaf(a),
+            "a rejected split must leave the tree untouched"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Can't split: pane is 15 rows, minimum for a horizontal split is ~20 rows. \
+             Resize your terminal or close another pane first."
+        );
+    }
+
+    #[test]
+    fn layout_node_split_should_allow_vertical_split_even_when_resulting_rows_below_recommended_threshold(
+    ) {
+        // Vertical splits are intentionally exempt from the
+        // RECOMMENDED_SPLIT_MIN_ROWS check (they change row count, and are
+        // already covered by the hard MIN_PANE_ROWS floor) — a normal
+        // 24-row terminal split vertically into 12/12 must still succeed.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut tree = leaf(a);
+        tree.split(a, Orientation::Vertical, b, 24, 80).unwrap();
+        assert!(matches!(tree, LayoutNode::Split { .. }));
+    }
+
+    #[test]
+    fn layout_node_split_should_allow_horizontal_split_when_pane_rows_at_or_above_recommended_threshold(
+    ) {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut tree = leaf(a);
+        tree.split(a, Orientation::Horizontal, b, 20, 80).unwrap();
+        assert!(matches!(tree, LayoutNode::Split { .. }));
     }
 
     #[test]
