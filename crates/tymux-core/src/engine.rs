@@ -708,6 +708,19 @@ impl Engine {
         rows: u16,
         cols: u16,
     ) -> Option<(u16, u16)> {
+        // Clamped to the same anti-corruption floor `split` enforces
+        // (`MIN_PANE_ROWS`/`MIN_PANE_COLS`) — a client reporting a
+        // degenerate viewport (0x0, or anything below the floor, whether
+        // from a buggy client or a real terminal transiently reporting a
+        // bogus size mid-resize) must never reach `Pane::resize()`: vt100
+        // 0.16.2 panics internally on a resize that leaves the tracked
+        // cursor position out of bounds, and that panic poisons the
+        // pane's parser mutex permanently (found via v1.0.0-alpha.7's
+        // manual release verification — every subsequent operation on
+        // that pane, and transitively on Engine-wide state depending on
+        // the call path, then fails forever until the daemon restarts).
+        let rows = rows.max(MIN_PANE_ROWS);
+        let cols = cols.max(MIN_PANE_COLS);
         self.viewports
             .lock()
             .unwrap()
@@ -1065,6 +1078,46 @@ mod tests {
             LayoutSnapshot::Leaf(info) => info.id,
             _ => panic!("expected a single-leaf window"),
         }
+    }
+
+    /// Regression test for a real crash found via v1.0.0-alpha.7's manual
+    /// release verification: a client reporting a degenerate 0x0 viewport
+    /// (e.g. `pty.fork()` in a test harness never calling `TIOCSWINSZ`, or
+    /// any other buggy/misbehaving client) reached `Pane::resize(0, 0)`
+    /// unclamped, which panicked inside `vt100` 0.16.2's internal cursor-
+    /// position invariant and permanently poisoned that pane's parser
+    /// mutex. `report_viewport_and_recompute` must clamp to the same
+    /// `MIN_PANE_ROWS`/`MIN_PANE_COLS` anti-corruption floor `split`
+    /// already enforces, so a degenerate report can never reach
+    /// `Pane::resize()` at all.
+    #[test]
+    fn report_viewport_and_recompute_should_clamp_degenerate_zero_size_to_minimum_floor() {
+        let engine = Engine::new();
+        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let sessions = engine.list_sessions();
+        let window_id = sessions.iter().find(|s| s.id == id).unwrap().windows[0].id;
+        let pane_id = sole_pane_id(sessions.iter().find(|s| s.id == id).unwrap());
+
+        let client = engine.new_client_id();
+        let (rows, cols) = engine
+            .report_viewport_and_recompute(window_id, client, 0, 0)
+            .expect("window exists");
+
+        assert_eq!(
+            (rows, cols),
+            (MIN_PANE_ROWS, MIN_PANE_COLS),
+            "a 0x0 viewport report must clamp to the anti-corruption floor, not pass through"
+        );
+
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("pane must still be Live — resize must not have crashed it"),
+        };
+        assert_eq!(
+            pane.size(),
+            (MIN_PANE_ROWS as u32, MIN_PANE_COLS as u32),
+            "the pane itself must have been resized to the clamped floor, not 0x0"
+        );
     }
 
     #[test]
