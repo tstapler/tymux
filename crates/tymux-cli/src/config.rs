@@ -203,9 +203,16 @@ fn parse_key_token(token: &str, raw: &str) -> Result<KeyEvent, KeySequenceParseE
     }
 }
 
+// Same $XDG_STATE_HOME-on-macOS gap as `persistence::default_sessions_dir`
+// (`crates/tymux-core/src/persistence.rs`): `dirs::config_dir()` maps
+// $XDG_CONFIG_HOME only on Linux, silently ignoring it on macOS. Checked
+// explicitly first so a user's override is honored on every platform.
 #[allow(dead_code)]
 fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("tymux").join("config.toml"))
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .map(|d| d.join("tymux").join("config.toml"))
 }
 
 #[cfg(test)]

@@ -294,12 +294,19 @@ impl PersistenceBackend for FsPersistenceBackend {
 }
 
 /// Resolves the directory persisted session records live in:
-/// `$XDG_STATE_HOME/tymux/sessions` (or the platform-appropriate
-/// equivalent `dirs::state_dir()` resolves — falling back to
-/// `dirs::data_local_dir()` on platforms without a native state dir, e.g.
-/// macOS, then finally the current directory if neither is available).
+/// `$XDG_STATE_HOME/tymux/sessions` if that env var is set — checked
+/// explicitly rather than relying solely on `dirs::state_dir()`, which
+/// only maps `$XDG_STATE_HOME` on Linux; on macOS it always returns
+/// `None` regardless of the env var (state_dir isn't a native macOS
+/// concept in the `dirs` crate's model), which would otherwise silently
+/// ignore a user's `$XDG_STATE_HOME` override on that platform. Falls
+/// back to `dirs::state_dir()`, then `dirs::data_local_dir()` on
+/// platforms without a native state dir (e.g. macOS), then finally the
+/// current directory if none are available.
 pub fn default_sessions_dir() -> PathBuf {
-    let base = dirs::state_dir()
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::state_dir)
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("tymux").join("sessions")
@@ -309,6 +316,37 @@ pub fn default_sessions_dir() -> PathBuf {
 mod tests {
     use super::*;
     use crate::layout::Orientation as O;
+
+    // Serializes tests that mutate the process-global XDG_STATE_HOME env
+    // var — cargo runs tests in this module in parallel by default.
+    static ENV_VAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Regression test for the macOS bug this fix closes: `dirs::state_dir()`
+    // returns `None` unconditionally on macOS (state_dir isn't a native
+    // macOS concept in the `dirs` crate's model) — without checking
+    // $XDG_STATE_HOME explicitly first, a caller's override was silently
+    // ignored on that platform, even though it was correctly honored on
+    // Linux. This must pass identically on every CI platform.
+    #[test]
+    fn default_sessions_dir_should_honor_xdg_state_home_override_on_every_platform() {
+        let guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/tymux-xdg-override-test") };
+
+        let resolved = default_sessions_dir();
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        drop(guard);
+
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/tymux-xdg-override-test/tymux/sessions"),
+            "XDG_STATE_HOME must be honored on every platform, not just Linux"
+        );
+    }
 
     fn leaf(id: Uuid) -> PersistedLayoutNode {
         PersistedLayoutNode::Leaf {
