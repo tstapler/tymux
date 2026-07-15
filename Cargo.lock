@@ -1776,6 +1776,7 @@ version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "futures",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
