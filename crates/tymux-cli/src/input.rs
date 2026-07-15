@@ -36,11 +36,18 @@ enum ScanState {
 pub struct KeystrokeReassembler {
     bindings: Vec<KeyBinding>,
     leader: KeyEvent,
-    /// `Some(bytes)` while the leader is armed, holding the exact raw
-    /// byte(s) that armed it — needed so an unmatched follow-up can
-    /// forward the literal leader bytes plus itself, rather than losing
-    /// them.
-    armed_bytes: Option<Vec<u8>>,
+    /// `Some((bytes, key_event))` while a leader is armed: `bytes` holds
+    /// the exact raw byte(s) that armed it, for forwarding on no-match;
+    /// `key_event` is that same byte classified, used to match a
+    /// binding's *first* key — not just its second — so a per-action
+    /// override with a leader other than the global `leader` (e.g.
+    /// `detach = "C-a d"` while the global leader stays `C-b`) is
+    /// actually reachable. Matching only on the second key (as an
+    /// earlier version of this reassembler did) let any binding whose
+    /// second key happened to match fire regardless of which key armed
+    /// it, and made a different-leader override permanently unreachable
+    /// (found via v1.0.0-alpha.7's manual release verification).
+    armed: Option<(Vec<u8>, KeyEvent)>,
     scan: ScanState,
 }
 
@@ -50,7 +57,7 @@ impl KeystrokeReassembler {
         Self {
             bindings: config.bindings.clone(),
             leader,
-            armed_bytes: None,
+            armed: None,
             scan: ScanState::Normal,
         }
     }
@@ -58,7 +65,7 @@ impl KeystrokeReassembler {
     /// Used by the status bar's mode-reactive rendering (Story 6.4) to
     /// know whether to show the prefix-armed hint table.
     pub fn is_armed(&self) -> bool {
-        self.armed_bytes.is_some()
+        self.armed.is_some()
     }
 
     pub fn process(&mut self, bytes: &[u8]) -> Vec<ReassembledOutput> {
@@ -109,30 +116,40 @@ impl KeystrokeReassembler {
 
     fn handle_normal_byte(&mut self, b: u8, out: &mut Vec<ReassembledOutput>) {
         let key_event = classify_byte(b);
-        match self.armed_bytes.take() {
+        match self.armed.take() {
             None => {
-                if key_event == self.leader {
-                    self.armed_bytes = Some(vec![b]);
+                // Arms on the global leader, or on the first key of any
+                // configured binding — a per-action override's own
+                // leader byte must be able to arm even when it differs
+                // from the global default.
+                let arms = key_event == self.leader
+                    || self
+                        .bindings
+                        .iter()
+                        .any(|bnd| bnd.sequence.first() == Some(&key_event));
+                if arms {
+                    self.armed = Some((vec![b], key_event));
                 } else {
                     out.push(ReassembledOutput::Forward(vec![b]));
                 }
             }
-            Some(armed) => {
-                if key_event == self.leader {
-                    // Escape hatch (AC3): leader pressed twice forwards
-                    // the literal leader byte once and returns to Idle.
+            Some((armed_bytes, armed_key)) => {
+                if key_event == armed_key {
+                    // Escape hatch (AC3): the same key that armed this
+                    // pressed twice forwards the literal byte once and
+                    // returns to Idle.
                     out.push(ReassembledOutput::Forward(vec![b]));
-                } else if let Some(binding) = self
-                    .bindings
-                    .iter()
-                    .find(|bnd| bnd.sequence.len() == 2 && bnd.sequence[1] == key_event)
-                {
+                } else if let Some(binding) = self.bindings.iter().find(|bnd| {
+                    bnd.sequence.len() == 2
+                        && bnd.sequence[0] == armed_key
+                        && bnd.sequence[1] == key_event
+                }) {
                     out.push(ReassembledOutput::Action(binding.action));
                 } else {
                     // No binding matched — forward the leader bytes plus
                     // this one as literal input rather than swallowing
                     // real keystrokes the user didn't intend as a prefix.
-                    let mut forwarded = armed;
+                    let mut forwarded = armed_bytes;
                     forwarded.push(b);
                     out.push(ReassembledOutput::Forward(forwarded));
                 }
@@ -173,6 +190,48 @@ mod tests {
 
     fn reassembler() -> KeystrokeReassembler {
         KeystrokeReassembler::new(&TymuxConfig::defaults())
+    }
+
+    /// Regression test (found via v1.0.0-alpha.7's manual release
+    /// verification): a per-action binding using a leader byte other
+    /// than the global default was silently unreachable — the
+    /// reassembler only ever armed on `config.leader`, so a binding like
+    /// `detach = "C-a d"` (global leader stays `C-b`) never fired;
+    /// `C-a` passed straight through to the pty instead.
+    #[test]
+    fn keystroke_reassembler_should_fire_action_when_binding_uses_a_different_leader_than_the_global_default(
+    ) {
+        let config = TymuxConfig::from_toml_str("[keybindings]\ndetach = \"C-a d\"\n");
+        let mut r = KeystrokeReassembler::new(&config);
+
+        let armed = r.process(&[0x01]); // Ctrl-a, not the global C-b leader
+        assert!(
+            armed.is_empty(),
+            "C-a must arm since a binding starts with it"
+        );
+        assert!(r.is_armed());
+
+        let fired = r.process(b"d");
+        assert_eq!(fired, vec![ReassembledOutput::Action(Action::Detach)]);
+    }
+
+    /// The other half of the same regression: a binding matching only by
+    /// its *second* key, regardless of which key armed it, would have
+    /// let an unrelated leader's follow-up wrongly fire this binding —
+    /// confirms C-b (the global leader, distinct from this binding's own
+    /// C-a) does NOT fire the C-a-d binding.
+    #[test]
+    fn keystroke_reassembler_should_not_fire_action_when_second_key_matches_but_leader_differs() {
+        let config = TymuxConfig::from_toml_str("[keybindings]\ndetach = \"C-a d\"\n");
+        let mut r = KeystrokeReassembler::new(&config);
+
+        r.process(&[0x02]); // Ctrl-b, the global leader — arms, but isn't this binding's leader
+        let out = r.process(b"d");
+        assert_eq!(
+            out,
+            vec![ReassembledOutput::Forward(vec![0x02, b'd'])],
+            "C-b d must not fire a binding whose configured leader is C-a"
+        );
     }
 
     #[test]
