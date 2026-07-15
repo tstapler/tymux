@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -82,6 +82,21 @@ pub struct Pane {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Mirrors the `vt100::Parser` screen's current size, updated by
+    /// [`Self::resize`] right after the screen itself is resized. Lets
+    /// [`Self::size`] answer "what size is this pane right now" without
+    /// locking `parser` — a caller that only wants the current dimensions
+    /// (e.g. `Engine::list_sessions`'s snapshot walk, Story 3.4 AC3) would
+    /// otherwise contend with `resize`'s `Screen::set_size` call, which
+    /// holds `parser` for the real, occasionally non-trivial (for a very
+    /// large resize) duration of a grid reallocation — genuinely slow
+    /// pty/vt100 work, not a mock. Reading two atomics instead avoids that
+    /// contention entirely, at the cost of a caller occasionally seeing
+    /// the pre-resize size for the instant between the ioctl and this
+    /// store — an already-accepted class of narrow race (see
+    /// `recompute_window_geometry`'s doc comment).
+    rows: AtomicU32,
+    cols: AtomicU32,
     /// This pane's granted share of `GLOBAL_SCROLLBACK_BUDGET_LINES` —
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
@@ -186,6 +201,8 @@ impl Pane {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             parser: parser.clone(),
+            rows: AtomicU32::new(rows as u32),
+            cols: AtomicU32::new(cols as u32),
             scrollback_lines,
             output_tx: output_tx.clone(),
             exited: AtomicBool::new(false),
@@ -274,6 +291,13 @@ impl Pane {
             .unwrap()
             .screen_mut()
             .set_size(rows, cols);
+        // Updated *after* the parser resize actually completes, so a
+        // concurrent `size()` reader never observes the new dimensions
+        // before the grid itself has been reallocated to match. Cheap
+        // atomics, deliberately not gated on `self.parser`'s lock — see
+        // `size()`'s doc comment for why.
+        self.rows.store(rows as u32, Ordering::SeqCst);
+        self.cols.store(cols as u32, Ordering::SeqCst);
         Ok(())
     }
 
@@ -282,10 +306,15 @@ impl Pane {
     }
 
     /// The pane's current (rows, cols) — cheap, unlike [`Self::snapshot`],
-    /// which also walks and copies the entire cell grid.
+    /// which also walks and copies the entire cell grid. Deliberately
+    /// reads the cached atomics `resize()` maintains rather than locking
+    /// `parser` — see the `rows`/`cols` fields' doc comment for why
+    /// (Story 3.4 AC3).
     pub fn size(&self) -> (u32, u32) {
-        let (rows, cols) = self.parser.lock().unwrap().screen().size();
-        (rows as u32, cols as u32)
+        (
+            self.rows.load(Ordering::SeqCst),
+            self.cols.load(Ordering::SeqCst),
+        )
     }
 
     pub fn snapshot(&self) -> PaneSnapshot {
