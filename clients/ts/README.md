@@ -34,19 +34,30 @@ committed `gen/` output) — regenerate and commit if the proto changes.
 
 ## Running the examples
 
-Start a `tymuxd` first (from the repo root):
+Start a `tymuxd` first — either from a checkout (from the repo root):
 
 ```sh
 cargo run --bin tymuxd
+```
+
+or, with no Rust toolchain at all, a downloaded release binary:
+
+```sh
+./tymuxd
 ```
 
 Then, from `clients/ts/`:
 
 ```sh
 npm run list-sessions
-npm run attach -- <pane_id>       # pane_id from list-sessions or `tymux ls`
+npm run attach -- <pane_id>       # pane_id from list-sessions's own output (below)
 npm run capture-pane -- <pane_id>
 ```
+
+`list-sessions.ts` prints each session's id/name/liveness, then every
+pane_id in its layout, one per line — that's where `<pane_id>` above
+comes from. (`tymux ls`, the Rust CLI's own listing, does not print
+pane IDs — only `list-sessions.ts` does.)
 
 `examples/attach.ts` opens `Attach` as a bidi stream, sends the pane's id as
 the required first message, forwards a keystroke, reads output until it
