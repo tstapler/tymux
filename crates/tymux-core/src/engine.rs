@@ -6,7 +6,10 @@ use anyhow::{anyhow, Result};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::layout::{LayoutNode, Orientation, RemoveOutcome, MIN_PANE_COLS, MIN_PANE_ROWS};
+use crate::layout::{
+    LayoutNode, Orientation, RemoveOutcome, MIN_PANE_COLS, MIN_PANE_ROWS,
+    RECOMMENDED_SPLIT_MIN_ROWS,
+};
 use crate::pane::Pane;
 use crate::persistence::{
     persisted_layout_to_live, NullPersistenceBackend, PersistedPaneRecord, PersistedSessionRecord,
@@ -67,7 +70,15 @@ pub enum PaneLookup {
 pub enum EngineError {
     PaneNotFound(Uuid),
     SessionNotFound(Uuid),
-    BelowMinimumSize { rows: u16, cols: u16 },
+    BelowMinimumSize {
+        rows: u16,
+        cols: u16,
+    },
+    /// Epic 3 Story 3.5 AC2's friendlier, higher-tier rejection — see
+    /// [`crate::layout::LayoutError::BelowRecommendedSize`].
+    BelowRecommendedSize {
+        rows: u16,
+    },
 }
 
 impl std::fmt::Display for EngineError {
@@ -79,6 +90,12 @@ impl std::fmt::Display for EngineError {
                 f,
                 "split would produce a pane of {rows} rows x {cols} cols, \
                  below the minimum of {MIN_PANE_ROWS} rows x {MIN_PANE_COLS} cols"
+            ),
+            EngineError::BelowRecommendedSize { rows } => write!(
+                f,
+                "Can't split: pane is {rows} rows, minimum for a horizontal split is \
+                 ~{RECOMMENDED_SPLIT_MIN_ROWS} rows. Resize your terminal or close another \
+                 pane first."
             ),
         }
     }
@@ -390,6 +407,9 @@ impl Engine {
             Ok(()) => {}
             Err(crate::layout::LayoutError::BelowMinimumSize { rows, cols }) => {
                 return Err(EngineError::BelowMinimumSize { rows, cols });
+            }
+            Err(crate::layout::LayoutError::BelowRecommendedSize { rows }) => {
+                return Err(EngineError::BelowRecommendedSize { rows });
             }
             Err(crate::layout::LayoutError::PaneNotFound { pane_id }) => {
                 return Err(EngineError::PaneNotFound(pane_id));

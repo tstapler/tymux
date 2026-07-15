@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use tymux_core::{
     Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneLookup,
-    PersistenceBackend, SessionSnapshot, WindowSnapshot,
+    PersistenceBackend, SessionSnapshot, WindowSnapshot, RECOMMENDED_SPLIT_MIN_ROWS,
 };
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
@@ -148,6 +148,18 @@ fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
         tymux_core::EngineError::BelowMinimumSize { rows, cols } => {
             Status::failed_precondition(format!(
                 "split would produce a pane of {rows} rows x {cols} cols, below the minimum size"
+            ))
+        }
+        // Epic 3 Story 3.5 AC2: the friendlier, higher-tier usability
+        // warning — distinct from BelowMinimumSize's hard anti-corruption
+        // floor above. The exact wording here is pinned by
+        // `split_command_should_show_exact_row_counts_when_terminal_below_minimum_size`
+        // in crates/tymux-cli/src/main.rs.
+        tymux_core::EngineError::BelowRecommendedSize { rows } => {
+            Status::failed_precondition(format!(
+                "Can't split: pane is {rows} rows, minimum for a horizontal split is \
+                 ~{RECOMMENDED_SPLIT_MIN_ROWS} rows. Resize your terminal or close another \
+                 pane first."
             ))
         }
     }

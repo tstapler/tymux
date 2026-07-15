@@ -156,6 +156,24 @@ async fn resolve_target(
     target.resolve(&session)
 }
 
+/// Story 4.6 AC1/AC2's dead-session fail-fast check, pulled out of
+/// `run()`'s `Command::Attach` arm so it's unit-testable without a live
+/// daemon (`resolve_target`/`attach_and_follow` need a real gRPC
+/// connection; this pure check doesn't). Only `Liveness::Dead` ever
+/// blocks — a `Live` pane (including one just revived, AC2) always
+/// returns `Ok(())`, and since `run()` calls this before ever calling
+/// `attach_and_follow`, no `Attach` stream is opened when it returns an
+/// error.
+fn check_attach_liveness(pane: &ProtoPane, session_name: &str) -> Result<()> {
+    if pane.liveness == tymux_proto::v1::Liveness::Dead as i32 {
+        return Err(anyhow::anyhow!(
+            "Session '{session_name}' is not running (restored from disk after a restart). \
+             Run 'tymux revive {session_name}' to respawn it, then attach again."
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "tymux")]
 struct Cli {
@@ -282,14 +300,7 @@ async fn run() -> Result<()> {
             // Story 4.6 AC1: fail fast, naming the revive remediation,
             // before ever opening the Attach stream — never a hang, a
             // bare gRPC error, or a silent no-op on a dead session.
-            if pane.liveness == tymux_proto::v1::Liveness::Dead as i32 {
-                return Err(anyhow::anyhow!(
-                    "Session '{}' is not running (restored from disk after a restart). \
-                     Run 'tymux revive {}' to respawn it, then attach again.",
-                    target.session,
-                    target.session
-                ));
-            }
+            check_attach_liveness(&pane, &target.session)?;
             attach_and_follow(
                 &mut client,
                 pane.id,
@@ -1177,15 +1188,90 @@ mod tests {
         assert!(TargetString::parse("myproject:0").is_err());
     }
 
+    /// Story 3.5 AC2 — the friendlier, higher-tier `RECOMMENDED_SPLIT_MIN_ROWS`
+    /// usability warning, distinct from the hard `MIN_PANE_ROWS`/`MIN_PANE_COLS`
+    /// structural floor (which has its own dedicated coverage in
+    /// `crates/tymux-core/src/layout.rs`'s unit tests and the Story 3.2 AC3
+    /// property suite). This exact message text must stay in sync with
+    /// `engine_error_to_status`'s `BelowRecommendedSize` arm in
+    /// `crates/tymuxd/src/main.rs`.
     #[test]
     fn split_command_should_show_exact_row_counts_when_terminal_below_minimum_size() {
         let status = tonic::Status::failed_precondition(
-            "split would produce a pane of 1 rows x 5 cols, below the minimum size",
+            "Can't split: pane is 15 rows, minimum for a horizontal split is ~20 rows. \
+             Resize your terminal or close another pane first.",
         );
         let err: anyhow::Error = status.into();
         let msg = friendly_message(&err);
-        assert!(msg.contains('1'));
-        assert!(msg.contains('5'));
+        assert_eq!(
+            msg,
+            "Can't split: pane is 15 rows, minimum for a horizontal split is ~20 rows. \
+             Resize your terminal or close another pane first."
+        );
+        assert!(msg.contains("15"));
+        assert!(msg.contains("20"));
+    }
+
+    /// Story 4.6 AC1: a dead-flagged target pane must fail fast with the
+    /// exact remediation message naming `tymux revive <session>`.
+    #[test]
+    fn attach_should_fail_fast_with_revive_remediation_message_when_target_session_is_dead() {
+        let pane = ProtoPane {
+            id: "pane-1".to_string(),
+            rows: 24,
+            cols: 80,
+            liveness: tymux_proto::v1::Liveness::Dead as i32,
+        };
+        let err = check_attach_liveness(&pane, "myproject").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not running"));
+        assert!(
+            msg.contains("tymux revive myproject"),
+            "message must name the exact revive remediation command, got: {msg}"
+        );
+    }
+
+    /// Story 4.6 AC2: once a session is live again (e.g. after `tymux
+    /// revive`), the same check must never block — the fail-fast path
+    /// only triggers for `PaneLookup::Dead`, never for `Live`.
+    #[test]
+    fn attach_should_succeed_normally_when_target_session_is_live_after_revive() {
+        let pane = ProtoPane {
+            id: "pane-1".to_string(),
+            rows: 24,
+            cols: 80,
+            liveness: tymux_proto::v1::Liveness::Live as i32,
+        };
+        assert!(check_attach_liveness(&pane, "myproject").is_ok());
+    }
+
+    /// Story 4.5 AC2: live and dead-restored sessions must render
+    /// distinctly in `tymux ls` — never identical, so a user can tell at a
+    /// glance which sessions need `tymux revive` before they can be
+    /// attached to.
+    #[test]
+    fn ls_command_should_render_distinct_status_strings_for_live_versus_dead_restored_session() {
+        let live_session = Session {
+            id: "s1".to_string(),
+            name: "myproject".to_string(),
+            windows: vec![],
+            liveness: tymux_proto::v1::Liveness::Live as i32,
+        };
+        let dead_session = Session {
+            id: "s2".to_string(),
+            name: "myproject".to_string(),
+            windows: vec![],
+            liveness: tymux_proto::v1::Liveness::Dead as i32,
+        };
+        let live_label = ls_status_label(&live_session);
+        let dead_label = ls_status_label(&dead_session);
+        assert_ne!(
+            live_label, dead_label,
+            "live and dead-restored sessions must never render identically"
+        );
+        assert!(live_label.contains("live"));
+        assert!(dead_label.contains("restored"));
+        assert!(dead_label.contains("not running"));
     }
 
     #[test]
