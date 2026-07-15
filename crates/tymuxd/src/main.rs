@@ -1350,4 +1350,100 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
+
+    fn search_req(pane_id: String, pattern: &str, start_offset: u32) -> SearchScrollbackRequest {
+        SearchScrollbackRequest {
+            pane_id,
+            pattern: pattern.to_string(),
+            start_offset,
+        }
+    }
+
+    /// Story 5.4: `Pane::search_scrollback` itself already has unit test
+    /// coverage in `crates/tymux-core/src/pane.rs`; what's missing (and
+    /// what this covers) is an in-process round trip through the tonic
+    /// `SearchScrollback` RPC handler, matching `attach_rpc_should_reject_*`
+    /// above's real-network-server pattern.
+    #[tokio::test]
+    async fn search_scrollback_rpc_should_return_matching_line_range_when_pattern_present() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let pane_uuid = parse_uuid(&pane_id).unwrap();
+        let pane = match engine.pane_lookup(pane_uuid) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // Produce deterministic scrollback content to search, polling for a
+        // completion marker rather than sleeping a fixed duration — mirrors
+        // `spawn_shell_with_numbered_lines` in tymux-core's own
+        // `Pane::search_scrollback` unit tests.
+        pane.write_input(
+            b"awk 'BEGIN{for(i=1;i<=50;i++) print \"line-\" i; print \"DONE-MARKER\"}'\n",
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let text: String = pane
+                .snapshot()
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.clone())
+                .collect();
+            if text.contains("DONE-MARKER") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected DONE-MARKER to appear within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let response = client
+            .search_scrollback(search_req(pane_id, "line-3", 0))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            response.found,
+            "expected to find a historical line matching 'line-3'"
+        );
+        assert!(response.line.contains("line-3"));
+    }
+
+    #[tokio::test]
+    async fn search_scrollback_rpc_should_return_no_matches_when_pattern_absent() {
+        let daemon = test_daemon();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let response = client
+            .search_scrollback(search_req(
+                pane_id,
+                "this-pattern-never-appears-anywhere",
+                0,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.found);
+        assert_eq!(response.offset, 0);
+        assert!(response.line.is_empty());
+    }
 }
