@@ -66,13 +66,27 @@ fn key_glyph(code: &KeyCode) -> String {
 
 /// Story 6.4: renders the mode-reactive hint line's plain text — the
 /// live binding table while the prefix is armed, copy-mode's own key set
-/// while in copy-mode, and nothing while in `Normal` (a stale hint from a
-/// prior mode must never linger — returning the fixed empty string for
-/// `Normal` unconditionally is what guarantees that, rather than trying
-/// to diff against a remembered previous frame).
-pub fn render_hint_line(mode: DisplayMode, config: &TymuxConfig) -> String {
+/// while in copy-mode, and the current session name while in `Normal`.
+///
+/// `requirements.md`'s Success Metric ("a status bar renders current
+/// session/window state during an attached session") wasn't actually met
+/// by the original Epic 6 implementation: `Normal` mode unconditionally
+/// rendered the empty string, so a human attaching would only ever see
+/// chrome when the prefix was armed or in copy-mode — never a persistent
+/// indicator of which session they're in. Found via v1.0.0-alpha.7's
+/// manual release verification. `session_name` is the one piece of
+/// session/window state already available to `main.rs`'s attach loop
+/// with no new RPC subscription; a fuller "window N/M, pane count"
+/// display would need a `WatchWindow` stream wired into the CLI, which
+/// this fix deliberately doesn't add (larger scope, separate follow-up).
+///
+/// `Normal` mode never shows a *stale* hint from a prior mode — the
+/// prefix/copy-mode hint text and this persistent session-name text are
+/// mutually exclusive by construction (this match has no shared
+/// branches), not by diffing against a remembered previous frame.
+pub fn render_hint_line(mode: DisplayMode, config: &TymuxConfig, session_name: &str) -> String {
     match mode {
-        DisplayMode::Normal => String::new(),
+        DisplayMode::Normal => format!("[{session_name}]"),
         DisplayMode::PrefixArmed => {
             let hints: Vec<String> = config
                 .bindings
@@ -129,7 +143,7 @@ mod tests {
     #[test]
     fn status_bar_should_render_full_binding_table_when_prefix_state_armed() {
         let config = TymuxConfig::defaults();
-        let line = render_hint_line(DisplayMode::PrefixArmed, &config);
+        let line = render_hint_line(DisplayMode::PrefixArmed, &config, "myproject");
         assert!(line.contains("detach"));
         assert!(line.contains("split-h"));
         assert!(line.contains("split-v"));
@@ -138,18 +152,33 @@ mod tests {
     #[test]
     fn status_bar_should_render_copy_mode_key_set_when_input_mode_is_copy_mode() {
         let config = TymuxConfig::defaults();
-        let line = render_hint_line(DisplayMode::CopyMode, &config);
+        let line = render_hint_line(DisplayMode::CopyMode, &config, "myproject");
         assert!(line.contains("COPY MODE"));
         assert!(!line.contains("detach"));
+    }
+
+    /// requirements.md's Success Metric ("a status bar renders current
+    /// session/window state") wasn't actually met by the original Epic 6
+    /// implementation — Normal mode rendered the empty string
+    /// unconditionally. Found via v1.0.0-alpha.7's manual release
+    /// verification.
+    #[test]
+    fn status_bar_should_render_session_name_in_normal_mode() {
+        let config = TymuxConfig::defaults();
+        let line = render_hint_line(DisplayMode::Normal, &config, "myproject");
+        assert!(
+            line.contains("myproject"),
+            "Normal mode must show the current session's name, not stay blank"
+        );
     }
 
     #[test]
     fn status_bar_should_not_render_stale_prefix_hints_after_mode_reverts_to_normal() {
         let config = TymuxConfig::defaults();
-        let normal = render_hint_line(DisplayMode::Normal, &config);
+        let normal = render_hint_line(DisplayMode::Normal, &config, "myproject");
         assert!(
-            normal.is_empty(),
-            "Normal mode must never show a lingering hint line"
+            !normal.contains("detach") && !normal.contains("PREFIX"),
+            "Normal mode must never show a lingering prefix-armed hint"
         );
     }
 
