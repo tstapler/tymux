@@ -1730,7 +1730,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tymux-cli"
-version = "1.0.0-alpha.8"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "tymux-core"
-version = "1.0.0-alpha.8"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "tymux-proto"
-version = "1.0.0-alpha.8"
+version = "1.0.0"
 dependencies = [
  "prost",
  "tonic",
@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "tymuxd"
-version = "1.0.0-alpha.8"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "futures",

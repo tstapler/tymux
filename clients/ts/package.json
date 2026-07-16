@@ -1,6 +1,6 @@
 {
   "name": "@tymux/ts-client",
-  "version": "1.0.0-alpha.8",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "TypeScript client + examples proving tymuxd's gRPC API is usable cross-language (ADR-003).",
