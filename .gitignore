@@ -3,6 +3,10 @@
 /clients/ts/node_modules
 /clients/ts/dist
 
+# insta snapshot review state (crates/tymux-e2e) — pending/rejected
+# updates, never the accepted .snap files themselves
+*.snap.new
+
 # Stray debris, not part of this project
 /~
 /.stapler_squad_history

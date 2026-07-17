@@ -1,0 +1,6 @@
+---
+source: crates/tymux-e2e/tests/golden_snapshot_e2e.rs
+expression: deterministic_slice
+---
+GOLDEN_LINE_1
+GOLDEN_LINE_2

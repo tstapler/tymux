@@ -1,0 +1,22 @@
+[package]
+name = "tymux-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "tymux_e2e"
+path = "src/lib.rs"
+
+[dependencies]
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tymux-proto = { path = "../tymux-proto" }
+
+[dev-dependencies]
+tokio-stream = { workspace = true }
+insta = "1"

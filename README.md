@@ -131,6 +131,15 @@ for the next session.
   committing a proto change
 - `cargo fmt` / `cargo clippy --workspace --all-targets` — enforced in CI
   (`.github/workflows/ci.yml`)
+- **End-to-end tests** (`crates/tymux-e2e`): spawns the real `tymuxd`/`tymux`
+  binaries under a genuine pseudo-tty (`portable-pty` + `vt100`, the same
+  machinery `tymux-core::Pane` uses) and asserts on rendered screen content
+  instead of raw ANSI bytes. Includes `insta`-based golden-snapshot tests
+  (`cargo insta review` to accept an intentional rendering change). Run with
+  `cargo build --workspace && cargo test -p tymux-e2e` — the binaries must
+  already be built since this crate resolves them by path rather than via
+  `CARGO_BIN_EXE_*` (neither `tymuxd` nor `tymux-cli` has a `[lib]` target,
+  so Cargo won't set that env var across crates).
 - **Releasing**: bump `[workspace.package] version` in `Cargo.toml`, then
   push a matching `vX.Y.Z` tag. CI's `tag-version-check` job fails the
   build if the tag and workspace version ever drift.
