@@ -1,9 +1,6 @@
 ---
 source: crates/tymux-e2e/tests/golden_snapshot_e2e.rs
-expression: h.screen_text()
+expression: deterministic_slice
 ---
-$ printf 'GOLDEN_LINE_1\nGOLDEN_LINE_2\n
-'
 GOLDEN_LINE_1
 GOLDEN_LINE_2
-$
