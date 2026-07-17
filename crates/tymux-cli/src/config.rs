@@ -88,10 +88,11 @@ pub struct KeySequenceParseError {
 }
 
 impl TymuxConfig {
-    /// `~/.config/tymux/config.toml` (via the `dirs` crate's
-    /// `config_dir()`), or hardcoded defaults if it doesn't exist.
+    /// `$XDG_CONFIG_HOME/tymux/config.toml` if set, else the platform
+    /// default config dir (via the `dirs` crate), or hardcoded defaults if
+    /// no config.toml exists there.
     pub fn load_or_default() -> TymuxConfig {
-        let path = dirs::config_dir().map(|d| d.join("tymux").join("config.toml"));
+        let path = default_config_path();
         match path.as_deref().map(std::fs::read_to_string) {
             Some(Ok(contents)) => Self::from_toml_str(&contents),
             _ => Self::defaults(),
@@ -207,7 +208,6 @@ fn parse_key_token(token: &str, raw: &str) -> Result<KeyEvent, KeySequenceParseE
 // (`crates/tymux-core/src/persistence.rs`): `dirs::config_dir()` maps
 // $XDG_CONFIG_HOME only on Linux, silently ignoring it on macOS. Checked
 // explicitly first so a user's override is honored on every platform.
-#[allow(dead_code)]
 fn default_config_path() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
