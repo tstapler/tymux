@@ -279,6 +279,7 @@ async fn run() -> Result<()> {
                 .create_session(CreateSessionRequest {
                     name: name.clone(),
                     command: command.unwrap_or_default(),
+                    cwd: String::new(),
                 })
                 .await?
                 .into_inner();
@@ -1130,6 +1131,7 @@ mod tests {
             rows: 24,
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Live as i32,
+            cwd: String::new(),
         }
     }
 
@@ -1242,6 +1244,7 @@ mod tests {
             rows: 24,
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Dead as i32,
+            cwd: String::new(),
         };
         let err = check_attach_liveness(&pane, "myproject").unwrap_err();
         let msg = err.to_string();
@@ -1262,6 +1265,7 @@ mod tests {
             rows: 24,
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Live as i32,
+            cwd: String::new(),
         };
         assert!(check_attach_liveness(&pane, "myproject").is_ok());
     }

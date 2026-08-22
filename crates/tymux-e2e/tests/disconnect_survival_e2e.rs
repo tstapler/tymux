@@ -17,6 +17,7 @@ async fn pane_survives_graceful_detach() {
         .create_session(CreateSessionRequest {
             name: "survive-graceful".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap()
@@ -188,6 +189,7 @@ async fn pane_survives_abrupt_disconnect() {
         .create_session(CreateSessionRequest {
             name: "survive-abrupt".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap()

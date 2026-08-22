@@ -129,11 +129,17 @@ message Pane {
   uint32 rows = 2;
   uint32 cols = 3;
   Liveness liveness = 4;
+  // The pane's working directory at spawn time (Epic 1.5) — either the
+  // daemon's own cwd, or whatever CreateSessionRequest.cwd requested.
+  string cwd = 5;
 }
 
 message CreateSessionRequest {
   string name = 1;
   string command = 2; // defaults to $SHELL if empty
+  // Working directory for the spawned pane. Empty means "the daemon's own
+  // cwd" (matching `command`'s empty-means-default convention) — Epic 1.5.
+  string cwd = 3;
 }
 
 message ListSessionsRequest {}

@@ -90,6 +90,7 @@ async fn session_layout_should_match_pre_restart_shape_when_daemon_is_killed_and
             .create_session(CreateSessionRequest {
                 name: "restart-test".to_string(),
                 command: "/bin/sh".to_string(),
+                cwd: String::new(),
             })
             .await
             .unwrap()

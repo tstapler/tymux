@@ -205,6 +205,7 @@ async fn daemon_startup_should_skip_structurally_invalid_layout_file_without_rea
         .create_session(tymux_proto::v1::CreateSessionRequest {
             name: "post-startup-sanity-check".to_string(),
             command: "/bin/sh".to_string(),
+            cwd: String::new(),
         })
         .await
         .expect("daemon should still be able to service RPCs after skipping the bad file");

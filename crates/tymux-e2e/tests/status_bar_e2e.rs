@@ -19,6 +19,7 @@ async fn status_bar_should_show_session_name_in_normal_mode() {
         .create_session(CreateSessionRequest {
             name: "statusbar-e2e".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap();
@@ -55,6 +56,7 @@ async fn status_bar_should_show_prefix_hint_line_when_leader_armed() {
         .create_session(CreateSessionRequest {
             name: "statusbar-prefix-e2e".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap();
@@ -102,6 +104,7 @@ async fn no_status_bar_flag_should_add_zero_chrome_bytes() {
         .create_session(CreateSessionRequest {
             name: "nostatusbar-e2e".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap();

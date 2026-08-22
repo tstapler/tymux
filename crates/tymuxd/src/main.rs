@@ -124,6 +124,7 @@ fn layout_snapshot_to_proto(layout: &CoreLayout) -> ProtoLayout {
             rows: info.rows,
             cols: info.cols,
             liveness: liveness_of(info.live) as i32,
+            cwd: info.cwd.clone(),
         }),
         CoreLayout::Split {
             orientation,
@@ -333,9 +334,14 @@ impl TymuxService for TymuxDaemon {
         } else {
             Some(req.command)
         };
+        let cwd = if req.cwd.is_empty() {
+            None
+        } else {
+            Some(req.cwd)
+        };
         let id = self
             .engine
-            .create_session(req.name, command)
+            .create_session(req.name, command, cwd)
             .map_err(|e| Status::internal(e.to_string()))?;
         // O(1) lookup, not list_sessions().find() — the latter rebuilds a
         // full snapshot of every session under both locks just to find the
@@ -952,6 +958,7 @@ mod tests {
         CreateSessionRequest {
             name: name.to_string(),
             command: "/bin/sh".to_string(),
+            cwd: String::new(),
         }
     }
 
@@ -1004,6 +1011,84 @@ mod tests {
         assert_eq!(sole_pane(&list.sessions[0].windows[0]).id, pane_id);
         assert_eq!(sole_pane(&list.sessions[0].windows[0]).rows, 24);
         assert_eq!(sole_pane(&list.sessions[0].windows[0]).cols, 80);
+    }
+
+    /// REQ-8 (Epic 1.5) happy path — a nonempty `CreateSessionRequest.cwd`
+    /// both (a) reaches the spawned shell's actual working directory (not
+    /// just the returned field, which could otherwise be a no-op relabel)
+    /// and (b) is reflected back on the returned `Pane.cwd` field.
+    #[tokio::test]
+    async fn create_session_should_spawn_pane_in_requested_cwd_and_return_it_on_pane_cwd_field() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("tymux-cwd-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        // Canonicalize so a symlinked temp dir (e.g. macOS's /tmp ->
+        // /private/tmp) can't make the shell's real `pwd` output disagree
+        // with the path we asked for.
+        let tmp_dir = tmp_dir.canonicalize().unwrap();
+        let cwd = tmp_dir.display().to_string();
+
+        let mut req = create_req("test");
+        req.cwd = cwd.clone();
+        let session = daemon
+            .create_session(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(sole_pane(&session.windows[0]).cwd, cwd);
+
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"pwd; echo DONE-MARKER\n").unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let text: String = pane
+                .snapshot()
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.clone())
+                .collect();
+            if text.contains("DONE-MARKER") {
+                assert!(
+                    text.contains(&cwd),
+                    "expected `pwd` output to contain {cwd}, got: {text}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected DONE-MARKER to appear within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    /// REQ-8 (Epic 1.5) edge path — empty string means "the daemon's own
+    /// cwd," matching `command`'s existing empty-means-default convention.
+    /// Must not regress: this is today's implicit behavior for every
+    /// existing caller that never set `cwd`.
+    #[tokio::test]
+    async fn create_session_should_use_daemon_own_cwd_when_cwd_field_is_empty_string() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let daemon_cwd = std::env::current_dir().unwrap().display().to_string();
+        assert_eq!(sole_pane(&session.windows[0]).cwd, daemon_cwd);
     }
 
     #[tokio::test]
