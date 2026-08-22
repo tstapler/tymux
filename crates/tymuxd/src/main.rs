@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,14 @@ pub struct TymuxDaemon {
     /// an accepted simplification for a first-pass production signal.
     disconnect_tracker: Arc<Mutex<HashMap<Uuid, Instant>>>,
     disconnect_regression_window: Duration,
+    /// Task 1.3.1d: count of currently-open `Attach` streams. Incremented
+    /// once the pane resolves at the top of `attach()`, decremented once
+    /// (via [`AttachedGaugeGuard`]) when `forward_handle` ends for any
+    /// reason — normal `Exited`, an internal error, or the client
+    /// cancelling/disconnecting. Exposed via a `tracing::info!` line on
+    /// every change rather than a metrics crate (requirements.md's
+    /// security classification: internal/local, no on-call rotation).
+    attached_sessions_gauge: Arc<AtomicI64>,
 }
 
 impl TymuxDaemon {
@@ -58,7 +67,26 @@ impl TymuxDaemon {
             engine,
             disconnect_tracker: Arc::new(Mutex::new(HashMap::new())),
             disconnect_regression_window,
+            attached_sessions_gauge: Arc::new(AtomicI64::new(0)),
         }
+    }
+}
+
+/// RAII guard (Task 1.3.1d) that decrements `TymuxDaemon`'s
+/// `attached_sessions_gauge` and logs the new value when dropped —
+/// guaranteed to fire once `forward_handle`'s async block ends, via
+/// whichever of its several `return` points is taken, or if the task
+/// itself is aborted/cancelled, since all of those drop the block's
+/// locals the same way.
+struct AttachedGaugeGuard {
+    gauge: Arc<AtomicI64>,
+    pane_id: Uuid,
+}
+
+impl Drop for AttachedGaugeGuard {
+    fn drop(&mut self) {
+        let new_count = self.gauge.fetch_sub(1, Ordering::SeqCst) - 1;
+        tracing::info!(pane_id = %self.pane_id, tymux_attached_sessions_gauge = new_count, "attach: gauge decremented");
     }
 }
 
@@ -241,27 +269,54 @@ fn resolve_live_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::P
     }
 }
 
-/// Maps one `output_rx.recv()` result from the attach forwarding loop to
-/// the `AttachEvent` (if any) it produces — pulled out of the loop so the
-/// Lagged-becomes-`output_gap` transformation is unit-testable without a
-/// live pty/broadcast channel. `None` means the stream should end (the
-/// channel was permanently closed).
-fn attach_event_for_output_result(
-    result: Result<Vec<u8>, tokio::sync::broadcast::error::RecvError>,
+/// What one `output_rx.recv()` result means for the attach forwarding
+/// loop — pulled out of the loop so the Lagged-becomes-`OutputGap` and
+/// (Task 1.3.1b) seq-filtering transformations are unit-testable without
+/// a live pty/broadcast channel.
+#[derive(Debug, PartialEq)]
+enum ForwardStep {
+    /// Forward this event to the client.
+    Emit(AttachEvent),
+    /// Don't forward anything, but the stream continues normally — used
+    /// for output chunks already reflected in the priming snapshot.
+    Skip,
+    /// The stream should end (the broadcast channel was permanently
+    /// closed).
+    End,
+}
+
+/// Maps one `output_rx.recv()` result to a [`ForwardStep`], given the
+/// priming snapshot's sequence number (`snapshot_seq`, from
+/// `pane.snapshot_with_seq()`). Task 1.3.1b / ADR-003 Amendment: an
+/// output chunk whose sequence is `<= snapshot_seq` was already reflected
+/// in the just-sent `Snapshot` event's grid state — forwarding it again
+/// would double-render it, so it's dropped (`Skip`) without ending the
+/// stream. Everything else behaves exactly as before Task 1.3.1: a
+/// normal chunk becomes an `Output` event, a `Lagged` receive becomes
+/// `OutputGap`, and a closed channel ends the stream.
+fn forward_step_for_output_result(
+    result: Result<(u64, Vec<u8>), tokio::sync::broadcast::error::RecvError>,
     pane_id: Uuid,
-) -> Option<AttachEvent> {
+    snapshot_seq: u64,
+) -> ForwardStep {
     use tokio::sync::broadcast::error::RecvError;
     match result {
-        Ok(bytes) => Some(AttachEvent {
-            payload: Some(attach_event::Payload::Output(bytes)),
-        }),
+        Ok((seq, bytes)) => {
+            if seq <= snapshot_seq {
+                ForwardStep::Skip
+            } else {
+                ForwardStep::Emit(AttachEvent {
+                    payload: Some(attach_event::Payload::Output(bytes)),
+                })
+            }
+        }
         Err(RecvError::Lagged(n)) => {
             tracing::warn!(pane_id = %pane_id, skipped = n, "attach consumer lagged, output_gap signaled");
-            Some(AttachEvent {
+            ForwardStep::Emit(AttachEvent {
                 payload: Some(attach_event::Payload::OutputGap(true)),
             })
         }
-        Err(RecvError::Closed) => None,
+        Err(RecvError::Closed) => ForwardStep::End,
     }
 }
 
@@ -528,6 +583,13 @@ impl TymuxService for TymuxDaemon {
         })?;
         tracing::info!(pane_id = %pane_id, "attach started");
 
+        // Task 1.3.1d: count this as one more open Attach stream. The
+        // matching decrement happens via AttachedGaugeGuard, dropped when
+        // forward_handle ends for any reason.
+        let new_gauge_count = self.attached_sessions_gauge.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::info!(pane_id = %pane_id, tymux_attached_sessions_gauge = new_gauge_count, "attach: gauge incremented");
+        let attached_sessions_gauge = self.attached_sessions_gauge.clone();
+
         // Resize is window-scoped (ADR-004): track this client's reported
         // viewport against the pane's window and apply the dimension-wise
         // minimum across every attached client, rather than sizing this
@@ -535,14 +597,38 @@ impl TymuxService for TymuxDaemon {
         let window_id = self.engine.window_id_for_pane(pane_id);
         let client_id = self.engine.new_client_id();
 
+        // ADR-003 / Task 1.3.1b: subscribe *before* snapshotting, so no
+        // output produced between the two is lost — then send the
+        // snapshot as the very first AttachEvent, before any live Output.
+        // Its sequence number (read atomically with the grid under the
+        // same lock, Task 1.3.1a) is threaded into forward_handle so it
+        // can drop any already-subscribed chunk that predates the
+        // snapshot and would otherwise double-render it.
         let mut output_rx = pane.subscribe();
+        let (pane_snapshot, snapshot_seq) = pane.snapshot_with_seq();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let priming_event = AttachEvent {
+            payload: Some(attach_event::Payload::Snapshot(snapshot_to_proto(
+                &pane_id_str,
+                pane_snapshot,
+                true,
+            ))),
+        };
+        // Practically infallible this early (the receiver was just
+        // created), but a client that cancelled instantly could already
+        // be gone — benign either way, forward_handle's own sends will
+        // fail and end the stream the same way any other disconnect does.
+        let _ = tx.send(Ok(priming_event)).await;
 
         let forward_tx = tx.clone();
         let pane_for_exit = pane.clone();
         let disconnect_tracker_for_exit = self.disconnect_tracker.clone();
         let disconnect_regression_window = self.disconnect_regression_window;
         let forward_handle = tokio::spawn(async move {
+            let _gauge_guard = AttachedGaugeGuard {
+                gauge: attached_sessions_gauge,
+                pane_id,
+            };
             loop {
                 // `biased` checks output_rx first every iteration, so any
                 // output already sent before the child exited (the reader
@@ -551,12 +637,14 @@ impl TymuxService for TymuxDaemon {
                 tokio::select! {
                     biased;
                     result = output_rx.recv() => {
-                        if let Some(event) = attach_event_for_output_result(result, pane_for_exit.id) {
-                            if forward_tx.send(Ok(event)).await.is_err() {
-                                return;
+                        match forward_step_for_output_result(result, pane_for_exit.id, snapshot_seq) {
+                            ForwardStep::Emit(event) => {
+                                if forward_tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
                             }
-                        } else {
-                            return;
+                            ForwardStep::Skip => continue,
+                            ForwardStep::End => return,
                         }
                     }
                     _ = pane_for_exit.wait_exit() => {
@@ -1145,56 +1233,101 @@ mod tests {
     #[test]
     fn attach_should_not_emit_output_gap_event_when_consumer_keeps_pace() {
         let pane_id = Uuid::new_v4();
-        let event = attach_event_for_output_result(Ok(b"hello".to_vec()), pane_id).unwrap();
+        let step = forward_step_for_output_result(Ok((1, b"hello".to_vec())), pane_id, 0);
         assert!(matches!(
-            event.payload,
-            Some(attach_event::Payload::Output(_))
+            step,
+            ForwardStep::Emit(AttachEvent {
+                payload: Some(attach_event::Payload::Output(_))
+            })
         ));
     }
 
     #[test]
     fn attach_should_emit_output_gap_event_when_consumer_lags_behind_broadcast_channel() {
         let pane_id = Uuid::new_v4();
-        let event = attach_event_for_output_result(
+        let step = forward_step_for_output_result(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(5)),
             pane_id,
-        )
-        .unwrap();
+            0,
+        );
         assert!(matches!(
-            event.payload,
-            Some(attach_event::Payload::OutputGap(true))
+            step,
+            ForwardStep::Emit(AttachEvent {
+                payload: Some(attach_event::Payload::OutputGap(true))
+            })
         ));
     }
 
     #[test]
     fn attach_event_for_output_result_ends_stream_on_closed_channel() {
         let pane_id = Uuid::new_v4();
-        assert!(attach_event_for_output_result(
-            Err(tokio::sync::broadcast::error::RecvError::Closed),
-            pane_id
-        )
-        .is_none());
+        assert_eq!(
+            forward_step_for_output_result(
+                Err(tokio::sync::broadcast::error::RecvError::Closed),
+                pane_id,
+                0,
+            ),
+            ForwardStep::End
+        );
+    }
+
+    /// Task 1.3.1b / REQ-5: the exact double-render window
+    /// adversarial-review.md flagged as a Blocker — an output chunk whose
+    /// sequence number is `<=` the priming snapshot's must not be
+    /// forwarded (it's already reflected in that snapshot's grid state),
+    /// but the stream must *not* end either; it's a `Skip`, not `End`.
+    /// Chunks strictly newer than the snapshot forward normally.
+    #[test]
+    fn forward_handle_should_drop_output_chunks_with_sequence_less_than_or_equal_to_snapshot_sequence(
+    ) {
+        let pane_id = Uuid::new_v4();
+        let snapshot_seq = 10u64;
+
+        assert_eq!(
+            forward_step_for_output_result(Ok((10, b"already-in-snapshot".to_vec())), pane_id, snapshot_seq),
+            ForwardStep::Skip,
+            "a chunk at exactly the snapshot's sequence must be dropped, not forwarded"
+        );
+        assert_eq!(
+            forward_step_for_output_result(Ok((3, b"predates-snapshot".to_vec())), pane_id, snapshot_seq),
+            ForwardStep::Skip,
+            "a chunk older than the snapshot's sequence must be dropped, not forwarded"
+        );
+        assert!(
+            matches!(
+                forward_step_for_output_result(Ok((11, b"new-output".to_vec())), pane_id, snapshot_seq),
+                ForwardStep::Emit(AttachEvent {
+                    payload: Some(attach_event::Payload::Output(bytes))
+                }) if bytes == b"new-output"
+            ),
+            "a chunk newer than the snapshot's sequence must forward normally"
+        );
     }
 
     /// Integration-style proof (real `tokio::sync::broadcast` channel, tiny
     /// capacity, burst sender) that a lagged consumer observes an
     /// `OutputGap` event before normal `Output` events resume — exercising
-    /// `attach_event_for_output_result` against tokio's actual `Lagged`
+    /// `forward_step_for_output_result` against tokio's actual `Lagged`
     /// semantics rather than a hand-constructed `RecvError`.
     #[tokio::test]
     async fn attach_stream_should_observe_output_gap_before_output_resumes_when_consumer_lags() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel::<Vec<u8>>(2);
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<(u64, Vec<u8>)>(2);
         let pane_id = Uuid::new_v4();
 
         // Burst past the channel's capacity before the consumer ever reads,
         // guaranteeing the next recv() observes Lagged.
         for i in 0..5u8 {
-            let _ = tx.send(vec![i]);
+            let _ = tx.send((i as u64, vec![i]));
         }
 
-        let first = attach_event_for_output_result(rx.recv().await, pane_id).unwrap();
+        let first = forward_step_for_output_result(rx.recv().await, pane_id, 0);
         assert!(
-            matches!(first.payload, Some(attach_event::Payload::OutputGap(true))),
+            matches!(
+                first,
+                ForwardStep::Emit(AttachEvent {
+                    payload: Some(attach_event::Payload::OutputGap(true))
+                })
+            ),
             "first observed event after a burst past capacity must be OutputGap"
         );
 
@@ -1202,11 +1335,156 @@ mod tests {
         // its last `capacity` (2) buffered items (3, 4) — the next recv()
         // must yield one of them as an ordinary Output event, not another
         // Lagged/OutputGap.
-        let second = attach_event_for_output_result(rx.recv().await, pane_id).unwrap();
+        let second = forward_step_for_output_result(rx.recv().await, pane_id, 0);
         assert!(matches!(
-            second.payload,
-            Some(attach_event::Payload::Output(_))
+            second,
+            ForwardStep::Emit(AttachEvent {
+                payload: Some(attach_event::Payload::Output(_))
+            })
         ));
+    }
+
+    /// Task 1.3.1c / REQ-5: the regression test the previous ("wait for it
+    /// to settle, then attach") version of this test explicitly avoided —
+    /// adversarial-review.md's Blocker. Starts a pane emitting distinct
+    /// markers on a ~10ms-spaced loop, then calls `attach()` while that
+    /// loop is still actively running (only a short, deliberately-short
+    /// head start, not a settle), and asserts every marker observed
+    /// across the priming `Snapshot` plus every subsequent `Output` event
+    /// appears at most once — the exact double-render signature ADR-003's
+    /// Amendment (Tasks 1.3.1a/b) fixes: bytes that land in the window
+    /// between `pane.subscribe()` and `pane.snapshot()` must not be both
+    /// baked into the snapshot's grid *and* replayed as a queued `Output`
+    /// chunk on top of it.
+    #[tokio::test]
+    async fn attach_should_emit_snapshot_first_with_no_duplicated_bytes_when_output_streams_concurrently_not_after_settling(
+    ) {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // Fixed-width markers ("L00007E") so no marker is ever a substring
+        // of another (unlike "LINE-7" inside "LINE-70"), which lets the
+        // no-duplication check below use a plain substring count. Written
+        // directly to the pane (bypassing Attach, which isn't open yet)
+        // so the loop is already running before we ever call attach().
+        //
+        // Deliberately *no* sleep between lines: the actual race window
+        // this test must hit (bytes fed to the vt100 parser strictly
+        // between `pane.subscribe()` and `pane.snapshot_with_seq()`
+        // acquiring the parser lock, inside `attach()`) is only a few
+        // Rust statements wide — sub-microsecond. A sleep-throttled
+        // producer (e.g. one line per 10ms) leaves that window almost
+        // always idle, so attaching "during" it rarely actually lands a
+        // reader-thread cycle inside the gap and would pass even with the
+        // Task 1.3.1a/b fix reverted (confirmed empirically). A tight,
+        // unthrottled flood keeps the reader thread cycling
+        // read+process+broadcast essentially back-to-back, so the gap is
+        // virtually always straddled by an in-flight chunk.
+        const LINE_COUNT: usize = 50_000;
+        let cmd = format!(
+            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; echo DONE-MARKER\n"
+        );
+        pane.write_input(cmd.as_bytes()).unwrap();
+
+        // A short, deliberate head start — NOT a settle delay. The flood
+        // runs for a few hundred ms total; this only guarantees it has
+        // already begun by the time we attach, so attach()'s
+        // subscribe()+snapshot() genuinely races live output instead of
+        // running before the command even starts.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        let snapshot = match first.payload {
+            Some(attach_event::Payload::Snapshot(s)) => s,
+            other => panic!("expected the first AttachEvent to be a Snapshot, got {other:?}"),
+        };
+        let snapshot_text: String = snapshot
+            .grid
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .map(|c| c.text.as_str())
+            .collect();
+
+        // Drain Output events, concatenating their raw bytes, until
+        // DONE-MARKER shows up — proof the loop (still running when we
+        // attached) has now fully streamed past us.
+        let mut streamed = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "attach stream did not deliver DONE-MARKER in time"
+            );
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("attach stream stalled")
+                .unwrap();
+            match event {
+                Some(AttachEvent {
+                    payload: Some(attach_event::Payload::Output(bytes)),
+                }) => {
+                    streamed.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&streamed).contains("DONE-MARKER") {
+                        break;
+                    }
+                }
+                // A gap just means some frames were skipped (a known,
+                // unrelated behavior for a slow-enough consumer under a
+                // deliberately extreme flood) — it doesn't itself produce
+                // a duplicate, so it's not a failure for this test.
+                Some(_) => continue,
+                None => panic!("attach stream closed before DONE-MARKER arrived"),
+            }
+        }
+
+        // The core assertion: the union of Snapshot content + every
+        // subsequent Output chunk must contain each marker at most once.
+        // A marker appearing twice is exactly the double-render bug —
+        // already baked into the snapshot's grid state *and* separately
+        // replayed from the broadcast channel on top of it.
+        let full_text = format!("{snapshot_text}{}", String::from_utf8_lossy(&streamed));
+        let mut duplicated = Vec::new();
+        for i in 0..LINE_COUNT {
+            let marker = format!("L{i:07}E");
+            let occurrences = full_text.matches(&marker).count();
+            if occurrences > 1 {
+                duplicated.push((marker, occurrences));
+            }
+        }
+        assert!(
+            duplicated.is_empty(),
+            "markers rendered more than once (double-render): {duplicated:?}"
+        );
     }
 
     /// End-to-end regression test for the Ctrl-d hang bug fixed earlier:

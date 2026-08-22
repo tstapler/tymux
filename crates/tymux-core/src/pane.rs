@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -100,7 +100,15 @@ pub struct Pane {
     /// This pane's granted share of `GLOBAL_SCROLLBACK_BUDGET_LINES` —
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
-    output_tx: broadcast::Sender<Vec<u8>>,
+    output_tx: broadcast::Sender<(u64, Vec<u8>)>,
+    /// Monotonic count of pty-read chunks fed into `parser` so far (Task
+    /// 1.3.1a / ADR-003 Amendment). Incremented in the reader thread in
+    /// the same critical section as `parser.process(..)`, so a value read
+    /// under `parser`'s lock (see [`Self::snapshot_at_offset_with_seq`])
+    /// can never disagree with the grid state it was read alongside —
+    /// this is what lets `attach()` tell which broadcast chunks are
+    /// already reflected in a given snapshot and must not be replayed.
+    output_seq: AtomicU64,
     exited: AtomicBool,
     exit_notify: Notify,
     /// The child's numeric exit code, captured by the reader thread's
@@ -212,6 +220,7 @@ impl Pane {
             cols: AtomicU32::new(cols as u32),
             scrollback_lines,
             output_tx: output_tx.clone(),
+            output_seq: AtomicU64::new(0),
             exited: AtomicBool::new(false),
             exit_notify: Notify::new(),
             exit_code: Mutex::new(None),
@@ -228,12 +237,22 @@ impl Pane {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        parser.lock().unwrap().process(&buf[..n]);
+                        // Task 1.3.1a: the sequence bump happens inside the
+                        // same `parser` lock guard as `process(..)`, so the
+                        // counter and the grid state it now reflects can
+                        // never be observed out of sync by a concurrent
+                        // `snapshot_at_offset_with_seq` reader (ADR-003
+                        // Amendment).
+                        let seq = {
+                            let mut parser = parser.lock().unwrap();
+                            parser.process(&buf[..n]);
+                            pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst) + 1
+                        };
                         // Fails only when nobody is currently attached (no
                         // receivers) — expected and benign (e.g. shell
                         // startup output before the first Attach), not an
                         // error worth logging.
-                        let _ = output_tx.send(buf[..n].to_vec());
+                        let _ = output_tx.send((seq, buf[..n].to_vec()));
                     }
                 }
             }
@@ -329,7 +348,13 @@ impl Pane {
         Ok(())
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
+    /// Each received item is `(seq, bytes)` — `seq` is this chunk's
+    /// [`Self::output_seq`] value at the moment it was fed to the parser
+    /// (Task 1.3.1a), letting a caller that also holds a snapshot's
+    /// sequence number (from [`Self::snapshot_with_seq`]) tell which
+    /// already-subscribed chunks predate that snapshot and must not be
+    /// replayed on top of it (ADR-003 Amendment).
+    pub fn subscribe(&self) -> broadcast::Receiver<(u64, Vec<u8>)> {
         self.output_tx.subscribe()
     }
 
@@ -354,6 +379,21 @@ impl Pane {
     /// increasing values scroll further back) — Story 5.4's `CapturePane`
     /// `scrollback_offset` param, copy-mode's navigation primitive.
     pub fn snapshot_at_offset(&self, offset: usize) -> PaneSnapshot {
+        self.snapshot_at_offset_with_seq(offset).0
+    }
+
+    /// Like [`Self::snapshot`], but also returns the [`Self::output_seq`]
+    /// value the grid reflects, read under the same `parser` lock as the
+    /// grid itself (Task 1.3.1a) — so the pair can never disagree.
+    /// `attach()` uses this to send a priming `Snapshot` `AttachEvent`
+    /// whose sequence number lets it drop any already-subscribed `Output`
+    /// chunk that predates it, closing the double-render window ADR-003's
+    /// Amendment describes.
+    pub fn snapshot_with_seq(&self) -> (PaneSnapshot, u64) {
+        self.snapshot_at_offset_with_seq(0)
+    }
+
+    fn snapshot_at_offset_with_seq(&self, offset: usize) -> (PaneSnapshot, u64) {
         let mut parser = self.parser.lock().unwrap();
         parser.screen_mut().set_scrollback(offset);
         let screen = parser.screen();
@@ -388,13 +428,21 @@ impl Pane {
         // parser scrolled would corrupt normal (offset-0) reads from any
         // other concurrent caller.
         parser.screen_mut().set_scrollback(0);
-        PaneSnapshot {
-            rows: rows as u32,
-            cols: cols as u32,
-            grid,
-            cursor_row: cursor_row as u32,
-            cursor_col: cursor_col as u32,
-        }
+        // Read while still holding `parser`'s lock — the same lock the
+        // reader thread holds while bumping `output_seq` alongside
+        // `process(..)` (Task 1.3.1a) — so this value and the grid just
+        // built above can never disagree about which bytes are reflected.
+        let seq = self.output_seq.load(Ordering::SeqCst);
+        (
+            PaneSnapshot {
+                rows: rows as u32,
+                cols: cols as u32,
+                grid,
+                cursor_row: cursor_row as u32,
+                cursor_col: cursor_col as u32,
+            },
+            seq,
+        )
     }
 
     /// Forward-only, next-match search through scrollback for `pattern`
@@ -592,6 +640,74 @@ mod tests {
             .map(|c| c.text.as_str())
             .collect();
         assert_eq!(live_text, live_again);
+    }
+
+    /// Task 1.3.1a: `snapshot_with_seq`'s returned sequence must exactly
+    /// match the last broadcast chunk observed once the broadcast channel
+    /// has fully settled — proving the counter and the grid state it
+    /// reflects are read together under one lock, never torn relative to
+    /// each other (ADR-003 Amendment's whole premise for how `attach()`
+    /// can safely drop already-reflected `Output` chunks).
+    #[test]
+    fn snapshot_with_seq_should_return_grid_and_sequence_matching_the_last_broadcast_chunk_under_the_same_lock(
+    ) {
+        let pane = Pane::spawn("/bin/sh", 5, 40).unwrap();
+        let mut rx = pane.subscribe();
+        pane.write_input(b"echo marker-text\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Poll until the broadcast channel has fully drained (Empty) at a
+        // moment where its accumulated bytes contain the marker, recording
+        // the sequence number of the chunk that completed it. Re-checked
+        // (rather than asserted once) because more bytes — e.g. the
+        // shell's next prompt — can keep trickling in for a few
+        // iterations after the marker itself appears.
+        let mut buffered = Vec::new();
+        let mut last_chunk_seq = 0u64;
+        let (snapshot, seq) = loop {
+            match rx.try_recv() {
+                Ok((chunk_seq, bytes)) => {
+                    last_chunk_seq = chunk_seq;
+                    buffered.extend_from_slice(&bytes);
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    if String::from_utf8_lossy(&buffered).contains("marker-text") {
+                        let result = pane.snapshot_with_seq();
+                        // Re-check the channel is *still* empty after
+                        // taking the snapshot — broadcast channels queue
+                        // messages until received, so if anything arrived
+                        // during the snapshot call this will observe it
+                        // (Ok, not Empty) and we retry rather than compare
+                        // against a now-stale pairing.
+                        if matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)) {
+                            break result;
+                        }
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "pane output around the marker never settled"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("unexpected broadcast recv error: {e:?}"),
+            }
+        };
+
+        assert_eq!(
+            seq, last_chunk_seq,
+            "snapshot_with_seq's sequence must exactly match the last broadcast chunk \
+             observed once the channel has settled"
+        );
+        let text: String = snapshot
+            .grid
+            .iter()
+            .flatten()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert!(
+            text.contains("marker-text"),
+            "snapshot grid must reflect the same bytes as the last broadcast chunk (seq {seq})"
+        );
     }
 
     #[test]
