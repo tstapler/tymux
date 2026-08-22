@@ -326,6 +326,7 @@ impl TymuxService for TymuxDaemon {
         &self,
         request: Request<CreateSessionRequest>,
     ) -> Result<Response<ProtoSession>, Status> {
+        let started = Instant::now();
         let req = request.into_inner();
         let command = if req.command.is_empty() {
             None
@@ -336,13 +337,17 @@ impl TymuxService for TymuxDaemon {
             .engine
             .create_session(req.name, command)
             .map_err(|e| Status::internal(e.to_string()))?;
+        // O(1) lookup, not list_sessions().find() — the latter rebuilds a
+        // full snapshot of every session under both locks just to find the
+        // one this call just created (the confirmed scale-feasibility
+        // bottleneck: CreateSession latency climbing 5ms→20ms as session
+        // count went 100→900).
         let info = self
             .engine
-            .list_sessions()
-            .into_iter()
-            .find(|s| s.id == id)
+            .session_snapshot(id)
             .ok_or_else(|| Status::internal("session vanished after create"))?;
-        tracing::info!(session_id = %info.id, name = %info.name, "session created");
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(session_id = %info.id, name = %info.name, duration_ms, "session created");
         Ok(Response::new(session_to_proto(&info)))
     }
 

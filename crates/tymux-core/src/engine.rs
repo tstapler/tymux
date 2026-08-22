@@ -898,6 +898,21 @@ impl Engine {
             })
     }
 
+    /// True O(1) lookup for a single session: a direct `HashMap::get`,
+    /// unlike `list_sessions().into_iter().find(...)`, which rebuilds a
+    /// full snapshot of every session under both locks just to discard all
+    /// but one. This was the confirmed scale-feasibility bottleneck behind
+    /// `create_session`'s handler — measured `CreateSession` latency
+    /// climbing 5ms→20ms as session count went 100→900 (see
+    /// `project_plans/stapler-squad-integration/research/scale-feasibility.md`).
+    pub fn session_snapshot(&self, session_id: Uuid) -> Option<SessionSnapshot> {
+        let sessions = self.sessions.lock().unwrap();
+        let panes = self.panes.lock().unwrap();
+        sessions
+            .get(&session_id)
+            .map(|session| session_to_snapshot(session, &panes))
+    }
+
     /// How many clients are currently attached to a pane within this
     /// window — Story 6.1's `StatusBarModel` field, already tracked by
     /// ADR-004's viewport tracker (one entry per attached client), so no
@@ -1184,6 +1199,38 @@ mod tests {
 
         let pane_ids: Vec<Uuid> = sessions.iter().map(sole_pane_id).collect();
         assert_ne!(pane_ids[0], pane_ids[1], "each session gets its own pane");
+    }
+
+    #[test]
+    fn session_snapshot_should_return_matching_session_when_id_exists_among_many_sessions() {
+        let engine = Engine::new();
+        let id1 = engine.create_session("one".to_string(), sh()).unwrap();
+        let id2 = engine.create_session("two".to_string(), sh()).unwrap();
+        let id3 = engine.create_session("three".to_string(), sh()).unwrap();
+
+        let snapshot = engine
+            .session_snapshot(id2)
+            .expect("id2 was just created and must be found");
+        assert_eq!(snapshot.id, id2);
+        assert_eq!(snapshot.name, "two");
+        assert!(snapshot.live);
+
+        // Sanity: the other two ids are still present via list_sessions,
+        // confirming session_snapshot(id2) didn't accidentally return the
+        // wrong session or wipe out the others.
+        let all_ids: Vec<Uuid> = engine.list_sessions().iter().map(|s| s.id).collect();
+        assert!(all_ids.contains(&id1));
+        assert!(all_ids.contains(&id3));
+    }
+
+    #[test]
+    fn session_snapshot_should_return_none_when_session_id_is_unknown() {
+        let engine = Engine::new();
+        engine.create_session("one".to_string(), sh()).unwrap();
+        engine.create_session("two".to_string(), sh()).unwrap();
+        engine.create_session("three".to_string(), sh()).unwrap();
+
+        assert!(engine.session_snapshot(Uuid::new_v4()).is_none());
     }
 
     #[test]
