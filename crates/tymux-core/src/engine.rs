@@ -627,6 +627,25 @@ impl Engine {
     /// ratios) — each pane's original command re-run in its persisted
     /// `cwd`. Never triggered automatically; only an explicit `tymux
     /// revive` call reaches this (ADR-002).
+    ///
+    /// **Orphan-on-restart trade-off (Story 1.1.4)**: this always spawns a
+    /// *new* OS process. It never reattaches to whatever process a prior
+    /// `tymuxd` instance's pane became — `tymuxd` persists no OS PID for a
+    /// live pane (Story 2.5.3), so there is nothing to reattach to even in
+    /// principle. If a pane was still alive when `tymuxd` restarted (crash,
+    /// deploy, `setsid()`/session loss, etc.), that old process is
+    /// orphaned: not reaped, not signaled, not tracked — it keeps running
+    /// under its original parent (now gone) until it exits on its own or
+    /// is found and killed manually. This is an accepted, deliberate
+    /// trade-off, not an oversight: real reap-on-restart would require
+    /// persisting actual OS PIDs and safely distinguishing "our old
+    /// orphan" from "an unrelated process that reused this PID since
+    /// restart," which is disproportionate to this project's current
+    /// appetite. See Story 1.1.4 (`project_plans/stapler-squad-integration/
+    /// implementation/plan.md`) for the full reasoning, `tymuxd`'s startup
+    /// `tymux_orphaned_process_count` log line for the runtime visibility
+    /// into this leak's size, and `docs/runbooks/orphaned-processes.md` for
+    /// how to find and safely clean one up.
     pub fn revive_session(&self, session_id: Uuid) -> Result<ReviveOutcome, EngineError> {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions

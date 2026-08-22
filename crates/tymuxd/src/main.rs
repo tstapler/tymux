@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
@@ -8,7 +10,8 @@ use uuid::Uuid;
 
 use tymux_core::{
     Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneLookup,
-    PersistenceBackend, SessionSnapshot, WindowSnapshot, RECOMMENDED_SPLIT_MIN_ROWS,
+    PersistedLayoutNode, PersistenceBackend, SessionSnapshot, WindowSnapshot,
+    RECOMMENDED_SPLIT_MIN_ROWS,
 };
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
@@ -22,8 +25,40 @@ use tymux_proto::v1::{
     WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
 };
 
+/// Default window (Task 1.1.2e / pre-mortem P1 #1) within which a pane
+/// exiting shortly after its last `Attach` stream dropped is treated as a
+/// possible disconnect-survival regression rather than an ordinary exit.
+/// Overridable via `TYMUXD_DISCONNECT_REGRESSION_WINDOW_MS` for testing.
+const DEFAULT_DISCONNECT_REGRESSION_WINDOW: Duration = Duration::from_millis(300);
+
 pub struct TymuxDaemon {
     engine: Arc<Engine>,
+    /// pane_id -> instant its last known `Attach` stream ended without a
+    /// preceding deliberate close/kill (Task 1.1.2e). Consulted when the
+    /// pane's own exit is subsequently observed, to emit a
+    /// `possible disconnect-survival regression` warning if the two are
+    /// close enough in time to be suspicious. Best-effort: keyed only by
+    /// `pane_id`, so a pane with multiple concurrently attached clients can
+    /// produce a false positive if one client detaches right before the
+    /// pane legitimately exits while another client is still watching —
+    /// an accepted simplification for a first-pass production signal.
+    disconnect_tracker: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    disconnect_regression_window: Duration,
+}
+
+impl TymuxDaemon {
+    fn new(engine: Arc<Engine>) -> Self {
+        let disconnect_regression_window = std::env::var("TYMUXD_DISCONNECT_REGRESSION_WINDOW_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_DISCONNECT_REGRESSION_WINDOW);
+        TymuxDaemon {
+            engine,
+            disconnect_tracker: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_regression_window,
+        }
+    }
 }
 
 fn liveness_of(live: bool) -> Liveness {
@@ -134,6 +169,33 @@ fn parse_uuid(s: &str) -> Result<Uuid, Status> {
 async fn supervise(pane_id: Uuid, task: &'static str, handle: tokio::task::JoinHandle<()>) {
     if let Err(e) = handle.await {
         tracing::error!(pane_id = %pane_id, task, error = %e, "attach task panicked");
+    }
+}
+
+/// Task 1.1.2e / pre-mortem P1 #1: a production-observable canary for the
+/// abrupt-disconnect pane-kill bug Story 1.1.2 fixed. If a pane's process
+/// exits within `window` of its last `Attach` stream having dropped, that's
+/// the exact signature of the bug reappearing (e.g. a future regression
+/// that reintroduces a controlling-terminal dependency) — as opposed to an
+/// ordinary exit, which either happens while a client is still attached and
+/// watching, or has no recent disconnect at all. Removes the tracked
+/// timestamp on the way out so a pane can only ever trigger this once per
+/// disconnect.
+fn warn_if_exit_follows_disconnect(
+    pane_id: Uuid,
+    tracker: &Mutex<HashMap<Uuid, Instant>>,
+    window: Duration,
+) {
+    let Some(disconnected_at) = tracker.lock().unwrap().remove(&pane_id) else {
+        return;
+    };
+    let elapsed = disconnected_at.elapsed();
+    if elapsed <= window {
+        tracing::warn!(
+            pane_id = %pane_id,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "pane exited shortly after its Attach stream dropped — possible disconnect-survival regression"
+        );
     }
 }
 
@@ -477,6 +539,8 @@ impl TymuxService for TymuxDaemon {
 
         let forward_tx = tx.clone();
         let pane_for_exit = pane.clone();
+        let disconnect_tracker_for_exit = self.disconnect_tracker.clone();
+        let disconnect_regression_window = self.disconnect_regression_window;
         let forward_handle = tokio::spawn(async move {
             loop {
                 // `biased` checks output_rx first every iteration, so any
@@ -496,6 +560,11 @@ impl TymuxService for TymuxDaemon {
                     }
                     _ = pane_for_exit.wait_exit() => {
                         tracing::info!(pane_id = %pane_for_exit.id, "pane exited, closing attach stream");
+                        warn_if_exit_follows_disconnect(
+                            pane_for_exit.id,
+                            &disconnect_tracker_for_exit,
+                            disconnect_regression_window,
+                        );
                         let event = AttachEvent {
                             payload: Some(attach_event::Payload::Exited(true)),
                         };
@@ -510,6 +579,7 @@ impl TymuxService for TymuxDaemon {
 
         let pane_for_input = pane.clone();
         let engine_for_input = self.engine.clone();
+        let disconnect_tracker_for_input = self.disconnect_tracker.clone();
         let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
@@ -533,6 +603,15 @@ impl TymuxService for TymuxDaemon {
                     _ => {}
                 }
             }
+            // This Attach stream just ended (client detached, gracefully or
+            // abruptly — there is no separate deliberate-close signal in
+            // this RPC today). Record when, so a pane exit observed shortly
+            // after can be flagged as a possible disconnect-survival
+            // regression (Task 1.1.2e).
+            disconnect_tracker_for_input
+                .lock()
+                .unwrap()
+                .insert(pane_id, Instant::now());
             if let Some(window_id) = window_id {
                 engine_for_input.unregister_viewport(window_id, client_id);
                 engine_for_input.recompute_window_geometry(window_id);
@@ -546,6 +625,97 @@ impl TymuxService for TymuxDaemon {
     }
 }
 
+/// Interprets a raw `setsid()`(2) result. Split out from the actual libc
+/// call (see [`detach_controlling_terminal`]) so unit tests can exercise
+/// both outcomes deterministically — calling the real syscall twice within
+/// one test binary is inherently order-dependent, since only the first
+/// caller in the process can actually succeed.
+fn interpret_setsid_result(sid: i32, errno: i32) -> Result<i32, i32> {
+    if sid == -1 {
+        Err(errno)
+    } else {
+        Ok(sid)
+    }
+}
+
+/// Story 1.1.2 (ADR-002 / Epic 1.1): detaches `tymuxd` from any controlling
+/// terminal it inherited from its parent, matching real tmux's own startup
+/// behavior. Must run before any pty is opened (Task 1.1.2b). Root cause
+/// this addresses: a `tymuxd` process that still holds a controlling
+/// terminal can receive a `SIGHUP` on that terminal's hangup, which (per
+/// this repo's investigation in `disconnect_survival_e2e.rs`) is
+/// indistinguishable at the process-group level from the hangup propagating
+/// to child pane processes — an abrupt client disconnect must never be able
+/// to kill a pane. Calling `setsid()` makes `tymuxd` a session leader with
+/// no controlling terminal at all, closing that path structurally rather
+/// than by handling `SIGHUP` after the fact.
+///
+/// Returns `Ok(new_sid)` on success. `Err(errno)` on failure; `EPERM` is the
+/// *expected* failure when this process is already a session leader (e.g.
+/// started under systemd, which already detaches units from a controlling
+/// terminal) — callers should log that case at `debug`, not `warn`.
+fn detach_controlling_terminal() -> Result<i32, i32> {
+    // SAFETY: setsid(2) takes no arguments and has no preconditions beyond
+    // being a valid libc call; it always returns either the new session id
+    // or -1 with errno set.
+    let sid = unsafe { libc::setsid() };
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+    interpret_setsid_result(sid, errno)
+}
+
+/// Logs `detach_controlling_terminal`'s outcome at the level Task 1.1.2b
+/// specifies: `info` on success, `debug` (not `warn`) for the expected
+/// already-a-session-leader case, `warn` for any other, unexpected errno.
+fn log_detach_controlling_terminal_outcome(result: Result<i32, i32>) {
+    match result {
+        Ok(sid) => tracing::info!(sid, "detached from controlling terminal"),
+        Err(errno) if errno == libc::EPERM => {
+            tracing::debug!(
+                errno,
+                "setsid: already a session leader (expected, e.g. under systemd)"
+            );
+        }
+        Err(errno) => {
+            tracing::warn!(
+                errno,
+                "setsid failed unexpectedly — tymuxd may still hold a controlling terminal"
+            );
+        }
+    }
+}
+
+/// Story 1.1.4 / pre-mortem P1 #3: best-effort upper-bound approximation of
+/// processes orphaned by a prior `tymuxd` instance dying or restarting
+/// while sessions were alive — `Engine::revive_session` always spawns a
+/// *new* process on an explicit `tymux revive`, never reattaching to
+/// whatever the old process became (see that function's doc comment for
+/// the accepted trade-off this metric exists to make visible instead).
+///
+/// `PersistedPaneRecord` carries no explicit liveness flag or exit code
+/// (that's Story 1.2.4's schema addition, not part of this epic):
+/// `PersistedLayoutNode::from_live` only fills in `command`/`cwd`/size for
+/// a pane that was `PaneEntry::Live` at the moment it was last persisted; a
+/// dead pane's record round-trips as empty strings. So a non-empty
+/// `command` at load time is the best proxy this schema can offer for "was
+/// last known to be Live, with no confirmed exit recorded" — a record
+/// counted here may in fact have already exited cleanly before the
+/// restart, so this is an upper bound, not a guarantee.
+fn count_orphan_candidates(records: &[tymux_core::PersistedSessionRecord]) -> usize {
+    fn count_node(node: &PersistedLayoutNode) -> usize {
+        match node {
+            PersistedLayoutNode::Leaf { pane } => usize::from(!pane.command.is_empty()),
+            PersistedLayoutNode::Split { children, .. } => {
+                children.iter().map(|(c, _)| count_node(c)).sum()
+            }
+        }
+    }
+    records
+        .iter()
+        .flat_map(|r| r.windows.iter())
+        .map(|w| count_node(&w.layout))
+        .sum()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -554,6 +724,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    log_detach_controlling_terminal_outcome(detach_controlling_terminal());
 
     let addr = std::env::var("TYMUXD_ADDR").unwrap_or_else(|_| "127.0.0.1:7419".to_string());
     let socket_addr: std::net::SocketAddr = addr.parse()?;
@@ -590,13 +762,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let records = backend.load_all();
     let restored_count = records.len();
+    let orphan_candidate_count = count_orphan_candidates(&records);
     let engine = Arc::new(Engine::with_persistence(Box::new(backend)));
     engine.load_persisted(records);
     if restored_count > 0 {
         tracing::info!(count = restored_count, dir = %sessions_dir.display(), "restored dead-flagged sessions from disk");
     }
+    // Story 1.1.4: visibility for the orphan-on-restart trade-off documented
+    // on `Engine::revive_session` — see `docs/runbooks/orphaned-processes.md`
+    // for how to act on a nonzero count.
+    if orphan_candidate_count > 0 {
+        tracing::warn!(
+            count = orphan_candidate_count,
+            "possible orphaned processes from prior tymuxd instance — see docs/runbooks/orphaned-processes.md"
+        );
+    } else {
+        tracing::info!(
+            count = 0,
+            "no orphaned-process candidates found from prior tymuxd instance"
+        );
+    }
 
-    let daemon = TymuxDaemon { engine };
+    let daemon = TymuxDaemon::new(engine);
 
     tracing::info!(%addr, "tymuxd listening");
     Server::builder()
@@ -650,9 +837,7 @@ mod tests {
     use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 
     fn test_daemon() -> TymuxDaemon {
-        TymuxDaemon {
-            engine: Arc::new(Engine::new()),
-        }
+        TymuxDaemon::new(Arc::new(Engine::new()))
     }
 
     /// Extracts the pane from a freshly created single-pane window's
@@ -1445,5 +1630,140 @@ mod tests {
         assert!(!response.found);
         assert_eq!(response.offset, 0);
         assert!(response.line.is_empty());
+    }
+
+    // --- Story 1.1.2: setsid() detach-from-controlling-terminal ---
+
+    #[test]
+    fn detach_controlling_terminal_should_report_new_sid_when_setsid_succeeds() {
+        assert_eq!(interpret_setsid_result(1234, 0), Ok(1234));
+    }
+
+    #[test]
+    fn detach_controlling_terminal_should_tolerate_eperm_when_already_session_leader_and_log_debug_not_warn(
+    ) {
+        assert_eq!(interpret_setsid_result(-1, libc::EPERM), Err(libc::EPERM));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn detach_controlling_terminal_should_log_info_on_success_debug_on_expected_eperm_warn_on_unexpected_errno(
+    ) {
+        log_detach_controlling_terminal_outcome(Ok(42));
+        assert!(logs_contain("INFO"));
+        assert!(logs_contain("detached from controlling terminal"));
+
+        log_detach_controlling_terminal_outcome(Err(libc::EPERM));
+        assert!(logs_contain("DEBUG"));
+        assert!(logs_contain("already a session leader"));
+        assert!(!logs_contain("WARN"));
+
+        log_detach_controlling_terminal_outcome(Err(libc::EINVAL));
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("setsid failed unexpectedly"));
+    }
+
+    // --- Story 1.1.2e: pane-exit-shortly-after-disconnect regression signal ---
+
+    #[test]
+    fn warn_if_exit_follows_disconnect_should_warn_when_exit_is_within_window() {
+        let tracker: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+        let pane_id = Uuid::new_v4();
+        tracker.lock().unwrap().insert(pane_id, Instant::now());
+
+        // No direct log assertion here (see the tracing_test-based case
+        // below) — this just proves the tracker entry is consumed so a
+        // second call for the same pane_id can't double-fire.
+        warn_if_exit_follows_disconnect(pane_id, &tracker, Duration::from_millis(300));
+        assert!(!tracker.lock().unwrap().contains_key(&pane_id));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn warn_if_exit_follows_disconnect_should_log_warn_when_exit_follows_disconnect_within_window()
+    {
+        let tracker: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+        let pane_id = Uuid::new_v4();
+        tracker.lock().unwrap().insert(pane_id, Instant::now());
+
+        warn_if_exit_follows_disconnect(pane_id, &tracker, Duration::from_millis(300));
+        assert!(logs_contain("possible disconnect-survival regression"));
+    }
+
+    #[test]
+    fn warn_if_exit_follows_disconnect_should_not_warn_when_no_recent_disconnect_recorded() {
+        let tracker: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+        let pane_id = Uuid::new_v4();
+        // No entry recorded for this pane_id at all (ordinary exit while a
+        // client is still attached and watching) — must be a silent no-op.
+        warn_if_exit_follows_disconnect(pane_id, &tracker, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn warn_if_exit_follows_disconnect_should_not_warn_when_disconnect_outside_window() {
+        let tracker: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+        let pane_id = Uuid::new_v4();
+        tracker.lock().unwrap().insert(pane_id, Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+
+        // A 0ms window can never be satisfied by a real elapsed duration —
+        // proves the window bound is actually enforced, not always true.
+        warn_if_exit_follows_disconnect(pane_id, &tracker, Duration::from_millis(0));
+        // Entry is still consumed either way (best-effort, fires at most once).
+        assert!(!tracker.lock().unwrap().contains_key(&pane_id));
+    }
+
+    // --- Story 1.1.4: orphaned-process-count startup metric ---
+
+    #[test]
+    fn count_orphan_candidates_should_return_zero_for_no_records() {
+        assert_eq!(count_orphan_candidates(&[]), 0);
+    }
+
+    #[test]
+    fn count_orphan_candidates_should_count_leaves_with_nonempty_command_as_orphan_candidates() {
+        use tymux_core::{
+            PersistedLayoutNode, PersistedPaneRecord, PersistedSessionRecord,
+            PersistedWindowRecord, CURRENT_SCHEMA_VERSION,
+        };
+
+        let live_leaf = PersistedLayoutNode::Leaf {
+            pane: PersistedPaneRecord {
+                pane_id: Uuid::new_v4(),
+                command: "/bin/sh".to_string(),
+                cwd: "/tmp".to_string(),
+                rows: 24,
+                cols: 80,
+            },
+        };
+        let dead_leaf = PersistedLayoutNode::Leaf {
+            pane: PersistedPaneRecord {
+                pane_id: Uuid::new_v4(),
+                command: String::new(),
+                cwd: String::new(),
+                rows: 0,
+                cols: 0,
+            },
+        };
+        let record = PersistedSessionRecord {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            session_id: Uuid::new_v4(),
+            name: "test".to_string(),
+            windows: vec![
+                PersistedWindowRecord {
+                    id: Uuid::new_v4(),
+                    name: "win-live".to_string(),
+                    layout: live_leaf,
+                },
+                PersistedWindowRecord {
+                    id: Uuid::new_v4(),
+                    name: "win-dead".to_string(),
+                    layout: dead_leaf,
+                },
+            ],
+            active_window_id: Uuid::new_v4(),
+        };
+
+        assert_eq!(count_orphan_candidates(&[record]), 1);
     }
 }
