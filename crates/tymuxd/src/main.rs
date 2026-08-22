@@ -17,12 +17,13 @@ use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
     attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
     Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse, CreateSessionRequest,
-    CreateWindowRequest, KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
-    LayoutChild as ProtoLayoutChild, ListSessionsRequest, ListSessionsResponse, Liveness,
-    Orientation as ProtoOrientation, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
-    ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest,
-    SearchScrollbackResponse, Session as ProtoSession, Split as ProtoSplit, SplitPaneRequest,
-    WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
+    CreateWindowRequest, ExitStatus, KillSessionRequest, KillSessionResponse,
+    Layout as ProtoLayout, LayoutChild as ProtoLayoutChild, ListSessionsRequest,
+    ListSessionsResponse, Liveness, Orientation as ProtoOrientation, Pane as ProtoPane,
+    PaneSnapshot as ProtoSnapshot, ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow,
+    SearchScrollbackRequest, SearchScrollbackResponse, Session as ProtoSession,
+    Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow,
+    WindowLayoutEvent,
 };
 
 /// Default window (Task 1.1.2e / pre-mortem P1 #1) within which a pane
@@ -566,7 +567,9 @@ impl TymuxService for TymuxDaemon {
                             disconnect_regression_window,
                         );
                         let event = AttachEvent {
-                            payload: Some(attach_event::Payload::Exited(true)),
+                            payload: Some(attach_event::Payload::Exited(ExitStatus {
+                                code: pane_for_exit.exit_code(),
+                            })),
                         };
                         let _ = forward_tx.send(Ok(event)).await;
                         return;
@@ -1081,6 +1084,64 @@ mod tests {
         assert_ne!(dead_err.code(), unknown_err.code());
     }
 
+    /// Story 1.2.4: a pane's last-known exit code survives into a
+    /// `PaneEntry::Dead` record across a simulated daemon restart, readable
+    /// with no `Attach` stream ever reopened post-exit — the ADR-001 gap
+    /// `CapturePane`'s own `FailedPrecondition` response (asserted above)
+    /// leaves for a fully dead pane.
+    #[tokio::test]
+    async fn capture_pane_should_surface_persisted_exit_code_when_pane_is_dead_and_no_attach_stream_was_ever_reopened(
+    ) {
+        use tymux_core::FsPersistenceBackend;
+
+        let persist_dir =
+            std::env::temp_dir().join(format!("tymux-exit-code-test-{}", Uuid::new_v4()));
+        let backend = FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let engine = Arc::new(Engine::with_persistence(Box::new(backend)));
+        let daemon = TymuxDaemon::new(engine.clone());
+
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let session_id = parse_uuid(&session.id).unwrap();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"exit 3\n").unwrap();
+        wait_for_pane_exit(&pane).await;
+
+        // No Attach stream is ever opened post-exit. Instead, trigger the
+        // same structural-mutation persist path any other session mutation
+        // would (Task 1.2.4b) — adding a second window re-snapshots the
+        // whole session, capturing the already-exited pane's exit code
+        // into its persisted record.
+        engine
+            .create_window(session_id, Some("/bin/sh".to_string()))
+            .unwrap();
+
+        // Simulate a daemon restart: reload from the persisted records
+        // into a fresh Engine, exactly as `tymuxd`'s startup path does.
+        let backend2 = FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let records = backend2.load_all();
+        let fresh_engine = Engine::with_persistence(Box::new(backend2));
+        fresh_engine.load_persisted(records);
+
+        assert_eq!(
+            fresh_engine.dead_pane_exit_code(pane_id),
+            Some(Some(3)),
+            "a dead pane's last-known exit code must survive a daemon \
+             restart, readable with no Attach stream ever reopened"
+        );
+
+        std::fs::remove_dir_all(&persist_dir).ok();
+    }
+
     #[test]
     fn attach_should_not_emit_output_gap_event_when_consumer_keeps_pace() {
         let pane_id = Uuid::new_v4();
@@ -1194,20 +1255,21 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        let saw_exit = tokio::time::timeout(Duration::from_secs(5), async {
+        let exit_status = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = inbound.message().await.unwrap() {
-                if matches!(event.payload, Some(attach_event::Payload::Exited(_))) {
-                    return true;
+                if let Some(attach_event::Payload::Exited(status)) = event.payload {
+                    return Some(status);
                 }
             }
-            false
+            None
         })
         .await
         .expect("attach stream must close within 5s, not hang");
 
-        assert!(
-            saw_exit,
-            "expected an Exited event before the stream closed"
+        assert_eq!(
+            exit_status.expect("expected an Exited event before the stream closed").code,
+            Some(0),
+            "a plain `exit` should report exit code 0, not an unknown code"
         );
     }
 
@@ -1734,6 +1796,7 @@ mod tests {
                 cwd: "/tmp".to_string(),
                 rows: 24,
                 cols: 80,
+                exit_code: None,
             },
         };
         let dead_leaf = PersistedLayoutNode::Leaf {
@@ -1743,6 +1806,7 @@ mod tests {
                 cwd: String::new(),
                 rows: 0,
                 cols: 0,
+                exit_code: None,
             },
         };
         let record = PersistedSessionRecord {

@@ -419,6 +419,24 @@ impl Engine {
         }
     }
 
+    /// The last-known exit code for a pane that has already exited (Story
+    /// 1.2.4) — the same code an open `Attach` stream would have
+    /// delivered, but readable with no `Attach` stream open at all. Covers
+    /// both dead shapes `pane_lookup` collapses into `PaneLookup::Dead`: a
+    /// still-`PaneEntry::Live` pane whose child has exited, and a
+    /// `PaneEntry::Dead` record reloaded from disk after a restart.
+    ///
+    /// Returns `None` if the pane is still running or unknown; `Some(None)`
+    /// if it exited but no code was ever captured (ADR-001: a real,
+    /// distinct state, not backfilled to a placeholder).
+    pub fn dead_pane_exit_code(&self, pane_id: Uuid) -> Option<Option<i32>> {
+        match self.panes.lock().unwrap().get(&pane_id) {
+            Some(PaneEntry::Dead(record)) => Some(record.exit_code),
+            Some(PaneEntry::Live(pane)) if pane.is_exited() => Some(pane.exit_code()),
+            _ => None,
+        }
+    }
+
     /// Splits the leaf for `pane_id` into a new `Split` node (this pane
     /// plus a freshly spawned one), per Story 3.2's `LayoutNode::split`.
     /// The size floor is checked against the pane's window's current
@@ -1405,6 +1423,7 @@ mod tests {
                     cwd: "/".to_string(),
                     rows: 24,
                     cols: 40,
+                    exit_code: None,
                 }),
             );
         }

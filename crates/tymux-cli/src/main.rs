@@ -551,13 +551,9 @@ async fn attach(
                             stdout.write_all(&bytes)?;
                             stdout.flush()?;
                         }
-                        Some(attach_event::Payload::Exited(_)) => {
+                        Some(ref payload @ attach_event::Payload::Exited(_)) => {
                             drop(_raw);
-                            writeln!(
-                                stdout,
-                                "{}",
-                                chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap()
-                            )?;
+                            writeln!(stdout, "{}", chrome_message_for_event(payload).unwrap())?;
                             stdout.flush()?;
                             break AttachOutcome::Done;
                         }
@@ -917,6 +913,7 @@ fn spawn_resize_watcher() -> tokio::sync::mpsc::Receiver<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tymux_proto::v1::ExitStatus;
     use clap::CommandFactory;
 
     fn parse(args: &[&str]) -> Cli {
@@ -959,7 +956,11 @@ mod tests {
 
     #[test]
     fn attach_event_match_should_render_output_dropped_message_on_output_gap_variant() {
-        let exited_msg = chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap();
+        let exited_msg =
+            chrome_message_for_event(&attach_event::Payload::Exited(ExitStatus {
+                code: None,
+            }))
+            .unwrap();
         let gap_msg = chrome_message_for_event(&attach_event::Payload::OutputGap(true)).unwrap();
         assert!(gap_msg.contains("output dropped"));
         assert_ne!(

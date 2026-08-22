@@ -21,6 +21,13 @@ pub struct PersistedPaneRecord {
     pub cwd: String,
     pub rows: u16,
     pub cols: u16,
+    /// The pane's last-known exit code (Story 1.2.4/ADR-001), captured from
+    /// `Pane::exit_code()` at the next persist after the pane exits. `None`
+    /// for a still-live pane, or an exited one whose code was never
+    /// captured. `#[serde(default)]` so pre-Epic-1.2 on-disk records
+    /// deserialize without a migration.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 /// Mirrors [`LayoutNode`], but leaves hold a full [`PersistedPaneRecord`]
@@ -86,14 +93,27 @@ impl PersistedLayoutNode {
                             cwd: pane.cwd.clone(),
                             rows: rows as u16,
                             cols: cols as u16,
+                            // Story 1.2.4: `None` while still live; once the
+                            // reader thread has reaped the child, this
+                            // captures its code at the next persist after
+                            // exit — the "structural mutation" trigger this
+                            // whole snapshot path already runs on.
+                            exit_code: pane.exit_code(),
                         }
                     }
-                    _ => PersistedPaneRecord {
+                    // Already `Dead` (e.g. a partially-revived session, or a
+                    // re-persist before the next restart) — keep its
+                    // existing record, including any exit_code already
+                    // captured, rather than blanking it via the fallback
+                    // below.
+                    Some(PaneEntry::Dead(record)) => record.clone(),
+                    None => PersistedPaneRecord {
                         pane_id: *pane_id,
                         command: String::new(),
                         cwd: String::new(),
                         rows: 0,
                         cols: 0,
+                        exit_code: None,
                     },
                 };
                 PersistedLayoutNode::Leaf { pane: record }
@@ -356,6 +376,7 @@ mod tests {
                 cwd: "/tmp".to_string(),
                 rows: 24,
                 cols: 80,
+                exit_code: None,
             },
         }
     }

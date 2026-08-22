@@ -71,6 +71,7 @@ fn leaf(command: &str) -> PersistedLayoutNode {
             cwd: "/tmp".to_string(),
             rows: 24,
             cols: 80,
+            exit_code: None,
         },
     }
 }

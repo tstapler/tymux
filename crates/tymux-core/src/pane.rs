@@ -103,6 +103,13 @@ pub struct Pane {
     output_tx: broadcast::Sender<Vec<u8>>,
     exited: AtomicBool,
     exit_notify: Notify,
+    /// The child's numeric exit code, captured by the reader thread's
+    /// `_child.wait()` call right after it observes EOF (Story 1.2.2).
+    /// `None` until the child has exited, and — even once exited — if
+    /// `wait()` itself failed. Set before `exited` flips to `true`, so any
+    /// caller that observes `is_exited() == true` is guaranteed to see the
+    /// final `exit_code()` value too (write-then-flag, no separate race).
+    exit_code: Mutex<Option<i32>>,
     // Held only to keep the child alive; not otherwise touched.
     _child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     // Tracked so the reader thread's lifecycle is at least observable
@@ -207,6 +214,7 @@ impl Pane {
             output_tx: output_tx.clone(),
             exited: AtomicBool::new(false),
             exit_notify: Notify::new(),
+            exit_code: Mutex::new(None),
             _child: Mutex::new(child),
             _reader_handle: Mutex::new(None),
         });
@@ -230,9 +238,21 @@ impl Pane {
                 }
             }
             // Child exited (or the pty read failed, which for a live child
-            // is effectively the same signal). Mark it so any current or
-            // future `wait_exit()` caller — including one that started
-            // waiting after this point — observes it.
+            // is effectively the same signal). Reap it and capture its
+            // exit code (ADR-001/Story 1.2.2) before flipping `exited` —
+            // this is the same single path that already owns exit
+            // detection (pitfalls.md §5 principle 4: no second detection
+            // path), just extended to also record *how* the child exited.
+            let code = match pane_for_reader._child.lock().unwrap().wait() {
+                Ok(status) => Some(status.exit_code() as i32),
+                Err(_) => None,
+            };
+            *pane_for_reader.exit_code.lock().unwrap() = code;
+            // Mark it so any current or future `wait_exit()` caller —
+            // including one that started waiting after this point —
+            // observes it. Stored after `exit_code` above, so any caller
+            // that sees `is_exited() == true` is guaranteed to also see
+            // the final `exit_code()`.
             pane_for_reader.exited.store(true, Ordering::SeqCst);
             pane_for_reader.exit_notify.notify_waiters();
         });
@@ -243,6 +263,14 @@ impl Pane {
 
     pub fn is_exited(&self) -> bool {
         self.exited.load(Ordering::SeqCst)
+    }
+
+    /// The child's numeric exit code, once known. `None` before the child
+    /// has exited; also `None` after exit if the reaping `wait()` call
+    /// itself failed (ADR-001: an absent code is a real, distinct state,
+    /// never backfilled to a placeholder like `0`).
+    pub fn exit_code(&self) -> Option<i32> {
+        *self.exit_code.lock().unwrap()
     }
 
     /// Terminates the child process. Does not itself mark the pane exited
@@ -623,5 +651,40 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), pane.wait_exit())
             .await
             .expect("wait_exit must resolve immediately for an already-exited pane");
+    }
+
+    #[tokio::test]
+    async fn exit_code_should_return_none_when_queried_before_child_has_exited() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        assert!(!pane.is_exited());
+        assert_eq!(
+            pane.exit_code(),
+            None,
+            "exit_code() must not fabricate a value while the pane is still live"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_code_should_return_some_code_when_reader_thread_observes_eof_and_waits_nonzero()
+    {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        pane.write_input(b"exit 42\n").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), pane.wait_exit())
+            .await
+            .expect("wait_exit should resolve once the child process exits");
+        assert!(pane.is_exited());
+        assert_eq!(pane.exit_code(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn exit_code_should_return_some_zero_for_a_plain_exit() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        pane.write_input(b"exit\n").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), pane.wait_exit())
+            .await
+            .expect("wait_exit should resolve once the child process exits");
+        assert_eq!(pane.exit_code(), Some(0));
     }
 }

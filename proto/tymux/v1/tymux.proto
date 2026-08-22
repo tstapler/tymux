@@ -260,11 +260,22 @@ message Resize {
   uint32 cols = 2;
 }
 
+// ADR-001: an absent `code` (proto3 field presence, not a separate
+// `has_code` boolean) is a first-class "exited, but no code known" state —
+// e.g. a process killed by a signal, or a `wait()` call that itself failed
+// — never conflated with "exited with code 0".
+message ExitStatus {
+  optional int32 code = 1;
+}
+
 message AttachEvent {
   oneof payload {
     bytes output = 1; // raw pty output bytes, as they arrive
     PaneSnapshot snapshot = 2;
-    bool exited = 3; // the pane's child process has exited; no more output follows
+    // ADR-001: breaking change (bool -> message) on the same field number,
+    // accepted deliberately — see the ADR for why. The pane's child
+    // process has exited; no more output follows.
+    ExitStatus exited = 3;
     // The server's output broadcast channel dropped frames for this
     // consumer (it fell behind a burst of pty output). Some output
     // between the previous and next Output event was lost; normal
