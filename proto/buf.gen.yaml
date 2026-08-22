@@ -10,9 +10,26 @@ version: v2
 # generates both messages and service client descriptors in one pass — the
 # separate protoc-gen-connect-es plugin was folded in and no longer exists
 # for connect-es v2.
+#
+# Go plugins are resolved from clients/go/bin (also local, not buf.build
+# remote — same offline-generation goal), installed via:
+#   GOBIN=$(pwd)/clients/go/bin go install \
+#     google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+#     connectrpc.com/connect/cmd/protoc-gen-connect-go@latest
 inputs:
   - directory: .
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/tstapler/tymux/clients/go/gen
 plugins:
   - local: ../clients/ts/node_modules/.bin/protoc-gen-es
     out: ../clients/ts/gen
     opt: target=ts
+  - local: ../clients/go/bin/protoc-gen-go
+    out: ../clients/go/gen
+    opt: paths=source_relative
+  - local: ../clients/go/bin/protoc-gen-connect-go
+    out: ../clients/go/gen
+    opt: paths=source_relative
