@@ -96,7 +96,7 @@ jobs:
       - name: buf generate drift check
         working-directory: proto
         run: |
-          buf generate
+          buf generate --template buf.gen.ts.yaml
           git diff --exit-code -- ../clients/ts/gen
       - working-directory: clients/ts
         run: npm run build
@@ -139,7 +139,7 @@ jobs:
       - name: buf generate drift check
         working-directory: proto
         run: |
-          buf generate
+          buf generate --template buf.gen.go.yaml
           git diff --exit-code -- ../clients/go/gen
       - name: go build / go vet / go test
         working-directory: clients/go
