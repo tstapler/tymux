@@ -577,8 +577,13 @@ mod tests {
     /// to finish draining the burst.
     fn spawn_shell_with_numbered_lines(rows: u16, cols: u16, count: usize) -> Arc<Pane> {
         let pane = Pane::spawn("/bin/sh", rows, cols).unwrap();
+        // The marker is emitted by a separate `echo ... | rev` after the
+        // awk script (not printed by awk itself) so the terminal's echo of
+        // this typed command — which contains the literal text
+        // "DONE-MARKER" — can never satisfy the poll below before the awk
+        // script has actually run (a real race observed in CI).
         let cmd = format!(
-            "awk 'BEGIN{{for(i=1;i<={count};i++) print \"line-\" i; print \"DONE-MARKER\"}}'\n"
+            "awk 'BEGIN{{for(i=1;i<={count};i++) print \"line-\" i}}'; echo DONE-MARKER | rev\n"
         );
         pane.write_input(cmd.as_bytes()).unwrap();
 
@@ -591,7 +596,7 @@ mod tests {
                 .flatten()
                 .map(|c| c.text.as_str())
                 .collect();
-            if text.contains("DONE-MARKER") {
+            if text.contains("REKRAM-ENOD") {
                 break;
             }
             assert!(

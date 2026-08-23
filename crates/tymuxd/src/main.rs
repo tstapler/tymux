@@ -1101,7 +1101,12 @@ mod tests {
             PaneLookup::Live(pane) => pane,
             _ => panic!("expected freshly created pane to be Live"),
         };
-        pane.write_input(b"pwd; echo DONE-MARKER\n").unwrap();
+        // The completion marker is piped through `rev` so the terminal's
+        // echo of this typed command (which itself contains the literal
+        // text "DONE-MARKER") can never satisfy the poll below before the
+        // shell has actually executed anything — a real race that once hit
+        // in CI, matching the echoed input line instead of real output.
+        pane.write_input(b"pwd; echo DONE-MARKER | rev\n").unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1112,7 +1117,7 @@ mod tests {
                 .flatten()
                 .map(|c| c.text.clone())
                 .collect();
-            if text.contains("DONE-MARKER") {
+            if text.contains("REKRAM-ENOD") {
                 assert!(
                     text.contains(&cwd),
                     "expected `pwd` output to contain {cwd}, got: {text}"
@@ -1121,7 +1126,7 @@ mod tests {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "expected DONE-MARKER to appear within 5s"
+                "expected the reversed completion marker to appear within 5s"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2283,9 +2288,13 @@ mod tests {
         // Produce deterministic scrollback content to search, polling for a
         // completion marker rather than sleeping a fixed duration — mirrors
         // `spawn_shell_with_numbered_lines` in tymux-core's own
-        // `Pane::search_scrollback` unit tests.
+        // `Pane::search_scrollback` unit tests. The marker is emitted by a
+        // separate `echo ... | rev` after the awk script (not printed by
+        // awk itself) so the terminal's echo of this typed command — which
+        // contains the literal text "DONE-MARKER" — can never satisfy the
+        // poll before the awk script has actually run.
         pane.write_input(
-            b"awk 'BEGIN{for(i=1;i<=50;i++) print \"line-\" i; print \"DONE-MARKER\"}'\n",
+            b"awk 'BEGIN{for(i=1;i<=50;i++) print \"line-\" i}'; echo DONE-MARKER | rev\n",
         )
         .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2297,7 +2306,7 @@ mod tests {
                 .flatten()
                 .map(|c| c.text.clone())
                 .collect();
-            if text.contains("DONE-MARKER") {
+            if text.contains("REKRAM-ENOD") {
                 break;
             }
             assert!(
