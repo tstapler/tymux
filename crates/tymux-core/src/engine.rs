@@ -109,6 +109,11 @@ pub struct PaneInfo {
     pub rows: u32,
     pub cols: u32,
     pub live: bool,
+    /// The pane's working directory at spawn time (Epic 1.5) — empty only
+    /// when the pane itself couldn't be resolved (`PaneEntry`/`PaneHandle`
+    /// `None`/`Missing`, which shouldn't happen for a leaf with a live
+    /// `pane_id`).
+    pub cwd: String,
 }
 
 /// A read-only snapshot of one window's layout tree, with each leaf's
@@ -279,9 +284,14 @@ impl Engine {
         }
     }
 
-    pub fn create_session(&self, name: String, command: Option<String>) -> Result<Uuid> {
+    pub fn create_session(
+        &self,
+        name: String,
+        command: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<Uuid> {
         let shell = command.unwrap_or_else(default_shell);
-        let pane = Pane::spawn(&shell, DEFAULT_ROWS, DEFAULT_COLS)?;
+        let pane = Pane::spawn_with_cwd(&shell, cwd.as_deref(), DEFAULT_ROWS, DEFAULT_COLS)?;
         let pane_id = pane.id;
         let window_id = Uuid::new_v4();
 
@@ -416,6 +426,24 @@ impl Engine {
             Some(PaneEntry::Dead(_)) => PaneLookup::Dead,
             Some(PaneEntry::Live(pane)) if pane.is_exited() => PaneLookup::Dead,
             Some(PaneEntry::Live(pane)) => PaneLookup::Live(pane.clone()),
+        }
+    }
+
+    /// The last-known exit code for a pane that has already exited (Story
+    /// 1.2.4) — the same code an open `Attach` stream would have
+    /// delivered, but readable with no `Attach` stream open at all. Covers
+    /// both dead shapes `pane_lookup` collapses into `PaneLookup::Dead`: a
+    /// still-`PaneEntry::Live` pane whose child has exited, and a
+    /// `PaneEntry::Dead` record reloaded from disk after a restart.
+    ///
+    /// Returns `None` if the pane is still running or unknown; `Some(None)`
+    /// if it exited but no code was ever captured (ADR-001: a real,
+    /// distinct state, not backfilled to a placeholder).
+    pub fn dead_pane_exit_code(&self, pane_id: Uuid) -> Option<Option<i32>> {
+        match self.panes.lock().unwrap().get(&pane_id) {
+            Some(PaneEntry::Dead(record)) => Some(record.exit_code),
+            Some(PaneEntry::Live(pane)) if pane.is_exited() => Some(pane.exit_code()),
+            _ => None,
         }
     }
 
@@ -627,6 +655,25 @@ impl Engine {
     /// ratios) — each pane's original command re-run in its persisted
     /// `cwd`. Never triggered automatically; only an explicit `tymux
     /// revive` call reaches this (ADR-002).
+    ///
+    /// **Orphan-on-restart trade-off (Story 1.1.4)**: this always spawns a
+    /// *new* OS process. It never reattaches to whatever process a prior
+    /// `tymuxd` instance's pane became — `tymuxd` persists no OS PID for a
+    /// live pane (Story 2.5.3), so there is nothing to reattach to even in
+    /// principle. If a pane was still alive when `tymuxd` restarted (crash,
+    /// deploy, `setsid()`/session loss, etc.), that old process is
+    /// orphaned: not reaped, not signaled, not tracked — it keeps running
+    /// under its original parent (now gone) until it exits on its own or
+    /// is found and killed manually. This is an accepted, deliberate
+    /// trade-off, not an oversight: real reap-on-restart would require
+    /// persisting actual OS PIDs and safely distinguishing "our old
+    /// orphan" from "an unrelated process that reused this PID since
+    /// restart," which is disproportionate to this project's current
+    /// appetite. See Story 1.1.4 (`project_plans/stapler-squad-integration/
+    /// implementation/plan.md`) for the full reasoning, `tymuxd`'s startup
+    /// `tymux_orphaned_process_count` log line for the runtime visibility
+    /// into this leak's size, and `docs/runbooks/orphaned-processes.md` for
+    /// how to find and safely clean one up.
     pub fn revive_session(&self, session_id: Uuid) -> Result<ReviveOutcome, EngineError> {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions
@@ -861,6 +908,21 @@ impl Engine {
             })
     }
 
+    /// True O(1) lookup for a single session: a direct `HashMap::get`,
+    /// unlike `list_sessions().into_iter().find(...)`, which rebuilds a
+    /// full snapshot of every session under both locks just to discard all
+    /// but one. This was the confirmed scale-feasibility bottleneck behind
+    /// `create_session`'s handler — measured `CreateSession` latency
+    /// climbing 5ms→20ms as session count went 100→900 (see
+    /// `project_plans/stapler-squad-integration/research/scale-feasibility.md`).
+    pub fn session_snapshot(&self, session_id: Uuid) -> Option<SessionSnapshot> {
+        let sessions = self.sessions.lock().unwrap();
+        let panes = self.panes.lock().unwrap();
+        sessions
+            .get(&session_id)
+            .map(|session| session_to_snapshot(session, &panes))
+    }
+
     /// How many clients are currently attached to a pane within this
     /// window — Story 6.1's `StatusBarModel` field, already tracked by
     /// ADR-004's viewport tracker (one entry per attached client), so no
@@ -909,19 +971,25 @@ fn window_has_live_pane(layout: &LayoutSnapshot) -> bool {
 fn layout_to_snapshot(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> LayoutSnapshot {
     match node {
         LayoutNode::Leaf { pane_id } => {
-            let (rows, cols, live) = match panes.get(pane_id) {
+            let (rows, cols, live, cwd) = match panes.get(pane_id) {
                 Some(PaneEntry::Live(pane)) => {
                     let (rows, cols) = pane.size();
-                    (rows, cols, !pane.is_exited())
+                    (rows, cols, !pane.is_exited(), pane.cwd.clone())
                 }
-                Some(PaneEntry::Dead(record)) => (record.rows as u32, record.cols as u32, false),
-                None => (0, 0, false),
+                Some(PaneEntry::Dead(record)) => (
+                    record.rows as u32,
+                    record.cols as u32,
+                    false,
+                    record.cwd.clone(),
+                ),
+                None => (0, 0, false, String::new()),
             };
             LayoutSnapshot::Leaf(PaneInfo {
                 id: *pane_id,
                 rows,
                 cols,
                 live,
+                cwd,
             })
         }
         LayoutNode::Split {
@@ -1017,19 +1085,25 @@ fn layout_to_handle(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> Layo
 fn handle_to_layout_snapshot(handle: &LayoutHandle) -> LayoutSnapshot {
     match handle {
         LayoutHandle::Leaf { pane_id, handle } => {
-            let (rows, cols, live) = match handle {
+            let (rows, cols, live, cwd) = match handle {
                 PaneHandle::Live(pane) => {
                     let (rows, cols) = pane.size();
-                    (rows, cols, !pane.is_exited())
+                    (rows, cols, !pane.is_exited(), pane.cwd.clone())
                 }
-                PaneHandle::Dead(record) => (record.rows as u32, record.cols as u32, false),
-                PaneHandle::Missing => (0, 0, false),
+                PaneHandle::Dead(record) => (
+                    record.rows as u32,
+                    record.cols as u32,
+                    false,
+                    record.cwd.clone(),
+                ),
+                PaneHandle::Missing => (0, 0, false, String::new()),
             };
             LayoutSnapshot::Leaf(PaneInfo {
                 id: *pane_id,
                 rows,
                 cols,
                 live,
+                cwd,
             })
         }
         LayoutHandle::Split {
@@ -1093,7 +1167,9 @@ mod tests {
     #[test]
     fn report_viewport_and_recompute_should_clamp_degenerate_zero_size_to_minimum_floor() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let sessions = engine.list_sessions();
         let window_id = sessions.iter().find(|s| s.id == id).unwrap().windows[0].id;
         let pane_id = sole_pane_id(sessions.iter().find(|s| s.id == id).unwrap());
@@ -1123,7 +1199,9 @@ mod tests {
     #[test]
     fn create_and_list_session() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
 
         let sessions = engine.list_sessions();
         assert_eq!(sessions.len(), 1);
@@ -1135,8 +1213,12 @@ mod tests {
     #[test]
     fn multiple_sessions_are_independent() {
         let engine = Engine::new();
-        let id1 = engine.create_session("one".to_string(), sh()).unwrap();
-        let id2 = engine.create_session("two".to_string(), sh()).unwrap();
+        let id1 = engine
+            .create_session("one".to_string(), sh(), None)
+            .unwrap();
+        let id2 = engine
+            .create_session("two".to_string(), sh(), None)
+            .unwrap();
 
         let sessions = engine.list_sessions();
         assert_eq!(sessions.len(), 2);
@@ -1150,9 +1232,55 @@ mod tests {
     }
 
     #[test]
+    fn session_snapshot_should_return_matching_session_when_id_exists_among_many_sessions() {
+        let engine = Engine::new();
+        let id1 = engine
+            .create_session("one".to_string(), sh(), None)
+            .unwrap();
+        let id2 = engine
+            .create_session("two".to_string(), sh(), None)
+            .unwrap();
+        let id3 = engine
+            .create_session("three".to_string(), sh(), None)
+            .unwrap();
+
+        let snapshot = engine
+            .session_snapshot(id2)
+            .expect("id2 was just created and must be found");
+        assert_eq!(snapshot.id, id2);
+        assert_eq!(snapshot.name, "two");
+        assert!(snapshot.live);
+
+        // Sanity: the other two ids are still present via list_sessions,
+        // confirming session_snapshot(id2) didn't accidentally return the
+        // wrong session or wipe out the others.
+        let all_ids: Vec<Uuid> = engine.list_sessions().iter().map(|s| s.id).collect();
+        assert!(all_ids.contains(&id1));
+        assert!(all_ids.contains(&id3));
+    }
+
+    #[test]
+    fn session_snapshot_should_return_none_when_session_id_is_unknown() {
+        let engine = Engine::new();
+        engine
+            .create_session("one".to_string(), sh(), None)
+            .unwrap();
+        engine
+            .create_session("two".to_string(), sh(), None)
+            .unwrap();
+        engine
+            .create_session("three".to_string(), sh(), None)
+            .unwrap();
+
+        assert!(engine.session_snapshot(Uuid::new_v4()).is_none());
+    }
+
+    #[test]
     fn kill_session_removes_it() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         assert_eq!(engine.list_sessions().len(), 1);
 
         engine.kill_session(id).unwrap();
@@ -1169,7 +1297,9 @@ mod tests {
     #[test]
     fn pane_lookup_should_return_live_when_pane_process_still_running() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1193,7 +1323,9 @@ mod tests {
     #[test]
     fn pane_lookup_should_return_dead_when_pane_process_exited_but_record_exists() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1219,7 +1351,9 @@ mod tests {
     #[test]
     fn split_pane_should_produce_two_leaf_window() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1249,7 +1383,9 @@ mod tests {
     #[test]
     fn close_pane_should_collapse_split_when_sibling_closes() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_a = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1278,7 +1414,9 @@ mod tests {
     #[test]
     fn close_pane_should_close_session_when_last_pane_in_last_window() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1297,7 +1435,9 @@ mod tests {
     #[test]
     fn create_window_adds_a_second_window() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let snapshot = engine.create_window(id, sh()).unwrap();
         assert_eq!(snapshot.windows.len(), 2);
         assert_eq!(snapshot.windows[1].name, "1");
@@ -1306,7 +1446,9 @@ mod tests {
     #[test]
     fn report_viewport_should_apply_dimension_wise_minimum_across_two_clients() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let window_id = engine
             .list_sessions()
             .into_iter()
@@ -1342,7 +1484,9 @@ mod tests {
     fn recompute_window_geometry_should_match_live_pane_by_id_not_position_when_window_has_dead_and_live_panes(
     ) {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_a = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1386,6 +1530,7 @@ mod tests {
                     cwd: "/".to_string(),
                     rows: 24,
                     cols: 40,
+                    exit_code: None,
                 }),
             );
         }
@@ -1451,7 +1596,7 @@ mod tests {
         let engine_for_save = engine.clone();
         let save_thread = std::thread::spawn(move || {
             engine_for_save
-                .create_session("slow".to_string(), sh())
+                .create_session("slow".to_string(), sh(), None)
                 .unwrap();
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1468,7 +1613,7 @@ mod tests {
         // While the slow save is in flight, an unrelated operation must
         // complete quickly, not block on the save.
         let unrelated_id = engine
-            .create_session("unrelated".to_string(), sh())
+            .create_session("unrelated".to_string(), sh(), None)
             .unwrap();
         let start = std::time::Instant::now();
         let sessions = engine.list_sessions();
@@ -1509,7 +1654,7 @@ mod tests {
         // Build a 4-real-pane window on the session whose resize will be
         // slow.
         let resize_session_id = engine
-            .create_session("resize-target".to_string(), sh())
+            .create_session("resize-target".to_string(), sh(), None)
             .unwrap();
         let resize_session_snapshot = |engine: &Engine| {
             engine
@@ -1547,7 +1692,7 @@ mod tests {
         // An unrelated session whose ListSessions visibility must not be
         // affected by the resize below.
         let other_session_id = engine
-            .create_session("unrelated".to_string(), sh())
+            .create_session("unrelated".to_string(), sh(), None)
             .unwrap();
 
         // Trigger the real, genuinely-slow window resize on a background
@@ -1614,7 +1759,9 @@ mod tests {
             std::env::temp_dir().join(format!("tymux-revive-test-{}", Uuid::new_v4()));
         let backend = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
         let engine = Engine::with_persistence(Box::new(backend));
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1677,7 +1824,9 @@ mod tests {
             std::env::temp_dir().join(format!("tymux-revive-test-{}", Uuid::new_v4()));
         let backend = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
         let engine = Engine::with_persistence(Box::new(backend));
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
 
         for _ in 0..2 {
             let backend =
@@ -1702,7 +1851,9 @@ mod tests {
     #[test]
     fn revive_session_on_already_live_session_returns_already_live_outcome() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh()).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let outcome = engine.revive_session(id).unwrap();
         assert_eq!(outcome, ReviveOutcome::AlreadyLive);
     }

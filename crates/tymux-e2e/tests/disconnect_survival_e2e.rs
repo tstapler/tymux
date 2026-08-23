@@ -17,6 +17,7 @@ async fn pane_survives_graceful_detach() {
         .create_session(CreateSessionRequest {
             name: "survive-graceful".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap()
@@ -131,11 +132,54 @@ async fn pane_survives_graceful_detach() {
 /// real shell (no `ptrace_scope` restriction to work around), or `ltrace`/
 /// `perf trace` around the exact hangup window.
 ///
-/// This is `#[ignore]`d (not deleted) so it stays a live, runnable
-/// regression check for whenever this gets fixed — un-ignore it once
-/// `pane_survives_abrupt_disconnect` below passes.
+/// **2026-08-21 re-investigation (Story 1.1.1)** — still not real hardware;
+/// this session runs inside the same kind of sandboxed dev container as
+/// the 2026-07-17 pass above. Re-ran the repro capturing
+/// `ps -o pid,ppid,pgid,sid,tty` for `tymuxd` and the pane's child process
+/// at the disconnect instant. Findings:
+///
+/// - `tymuxd` itself: `TT=?`, `SID=PGID=PID` — already its own session
+///   leader with **no controlling terminal at all**, before any code
+///   change. Confirmed this is a property of the sandbox, not of
+///   `tymuxd`: an ordinary interactive shell spawned fresh in this same
+///   session shows the identical `SID=PGID=PID`, `TT=?` signature.
+/// - The pane's child shell: `TT` goes from a real pty device (`pts/N`)
+///   while attached to `?` and `<defunct>` (exited, awaiting reap) within
+///   ~200ms of the abrupt disconnect — it genuinely exits, exactly as the
+///   2026-07-17 investigation found.
+/// - **The Story 1.1.2 `setsid()` fix (ADR-002) was compiled into
+///   `tymuxd` for this re-test and did not stop the pane from dying** —
+///   `pane_survives_abrupt_disconnect` still fails in this sandbox with
+///   the fix applied. Because this sandbox's `tymuxd` already had no
+///   controlling terminal *before* the fix — the exact `SID=PGID=PID`,
+///   `TT=?` state `setsid()` itself would produce — the fix is a
+///   structural no-op here: this environment can never exercise the
+///   "`tymuxd` has a controlling terminal a hangup propagates through"
+///   precondition the fix targets, with or without the code change. That
+///   makes this sandbox's result **non-diagnostic** for the hypothesis —
+///   it neither confirms nor refutes the real-hardware mechanism ADR-002
+///   targets, it just can't see it either way.
+/// - `ptrace_scope=1` is still in force here too, so the same `strace`
+///   limitation noted in the 2026-07-17 pass applies; no further syscall
+///   forensics were attempted this pass for the same reason it was
+///   abandoned then.
+///
+/// **Conclusion**: the `setsid()` fix (Story 1.1.2 / ADR-002) is
+/// implemented and kept — it's safe, low-risk, and matches real tmux's own
+/// daemon design — but it remains **unverified against the actual bug**.
+/// No real, non-sandboxed hardware and no systemd-managed host were
+/// available in this session, so Story 1.1.2's pre-mortem P1 #1
+/// second-environment requirement is **not met**, and this test is
+/// deliberately left `#[ignore]`d rather than un-ignored on sandbox
+/// evidence that can't actually distinguish "fixed" from "environment
+/// can't reproduce the precondition." A human with access to real
+/// hardware (and ideally a systemd-managed host, to exercise the
+/// `EPERM`-already-session-leader tolerance path from Task 1.1.2b for
+/// real) needs to re-run this exact repro — capturing the same `ps`
+/// columns — before this test can be un-ignored and Epic 1.1 considered
+/// fully done per Story 1.1.3.
 #[tokio::test]
-#[ignore = "known bug: abrupt client disconnect currently kills the pane — see doc comment"]
+#[ignore = "known bug: abrupt client disconnect currently kills the pane — setsid() fix (ADR-002) implemented but unverified on real hardware, see doc comment"]
 async fn pane_survives_abrupt_disconnect() {
     let tymuxd_bin = workspace_bin("tymuxd");
     let tymux_bin = workspace_bin("tymux");
@@ -145,6 +189,7 @@ async fn pane_survives_abrupt_disconnect() {
         .create_session(CreateSessionRequest {
             name: "survive-abrupt".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap()

@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
@@ -8,22 +11,83 @@ use uuid::Uuid;
 
 use tymux_core::{
     Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneLookup,
-    PersistenceBackend, SessionSnapshot, WindowSnapshot, RECOMMENDED_SPLIT_MIN_ROWS,
+    PersistedLayoutNode, PersistenceBackend, SessionSnapshot, WindowSnapshot,
+    RECOMMENDED_SPLIT_MIN_ROWS,
 };
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
     attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
     Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse, CreateSessionRequest,
-    CreateWindowRequest, KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
-    LayoutChild as ProtoLayoutChild, ListSessionsRequest, ListSessionsResponse, Liveness,
-    Orientation as ProtoOrientation, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
-    ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest,
-    SearchScrollbackResponse, Session as ProtoSession, Split as ProtoSplit, SplitPaneRequest,
-    WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
+    CreateWindowRequest, ExitStatus, KillSessionRequest, KillSessionResponse,
+    Layout as ProtoLayout, LayoutChild as ProtoLayoutChild, ListSessionsRequest,
+    ListSessionsResponse, Liveness, Orientation as ProtoOrientation, Pane as ProtoPane,
+    PaneSnapshot as ProtoSnapshot, ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow,
+    SearchScrollbackRequest, SearchScrollbackResponse, Session as ProtoSession,
+    Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow,
+    WindowLayoutEvent,
 };
+
+/// Default window (Task 1.1.2e / pre-mortem P1 #1) within which a pane
+/// exiting shortly after its last `Attach` stream dropped is treated as a
+/// possible disconnect-survival regression rather than an ordinary exit.
+/// Overridable via `TYMUXD_DISCONNECT_REGRESSION_WINDOW_MS` for testing.
+const DEFAULT_DISCONNECT_REGRESSION_WINDOW: Duration = Duration::from_millis(300);
 
 pub struct TymuxDaemon {
     engine: Arc<Engine>,
+    /// pane_id -> instant its last known `Attach` stream ended without a
+    /// preceding deliberate close/kill (Task 1.1.2e). Consulted when the
+    /// pane's own exit is subsequently observed, to emit a
+    /// `possible disconnect-survival regression` warning if the two are
+    /// close enough in time to be suspicious. Best-effort: keyed only by
+    /// `pane_id`, so a pane with multiple concurrently attached clients can
+    /// produce a false positive if one client detaches right before the
+    /// pane legitimately exits while another client is still watching —
+    /// an accepted simplification for a first-pass production signal.
+    disconnect_tracker: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    disconnect_regression_window: Duration,
+    /// Task 1.3.1d: count of currently-open `Attach` streams. Incremented
+    /// once the pane resolves at the top of `attach()`, decremented once
+    /// (via [`AttachedGaugeGuard`]) when `forward_handle` ends for any
+    /// reason — normal `Exited`, an internal error, or the client
+    /// cancelling/disconnecting. Exposed via a `tracing::info!` line on
+    /// every change rather than a metrics crate (requirements.md's
+    /// security classification: internal/local, no on-call rotation).
+    attached_sessions_gauge: Arc<AtomicI64>,
+}
+
+impl TymuxDaemon {
+    fn new(engine: Arc<Engine>) -> Self {
+        let disconnect_regression_window = std::env::var("TYMUXD_DISCONNECT_REGRESSION_WINDOW_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_DISCONNECT_REGRESSION_WINDOW);
+        TymuxDaemon {
+            engine,
+            disconnect_tracker: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_regression_window,
+            attached_sessions_gauge: Arc::new(AtomicI64::new(0)),
+        }
+    }
+}
+
+/// RAII guard (Task 1.3.1d) that decrements `TymuxDaemon`'s
+/// `attached_sessions_gauge` and logs the new value when dropped —
+/// guaranteed to fire once `forward_handle`'s async block ends, via
+/// whichever of its several `return` points is taken, or if the task
+/// itself is aborted/cancelled, since all of those drop the block's
+/// locals the same way.
+struct AttachedGaugeGuard {
+    gauge: Arc<AtomicI64>,
+    pane_id: Uuid,
+}
+
+impl Drop for AttachedGaugeGuard {
+    fn drop(&mut self) {
+        let new_count = self.gauge.fetch_sub(1, Ordering::SeqCst) - 1;
+        tracing::info!(pane_id = %self.pane_id, tymux_attached_sessions_gauge = new_count, "attach: gauge decremented");
+    }
 }
 
 fn liveness_of(live: bool) -> Liveness {
@@ -52,6 +116,33 @@ fn orientation_from_proto(o: i32) -> Result<CoreOrientation, Status> {
     }
 }
 
+/// Collects every leaf pane id in a layout (Task 1.1.2e follow-up: needed
+/// so `kill_session` can purge `disconnect_tracker` entries for every pane
+/// the session is about to take with it — see `purge_disconnect_tracker`).
+fn collect_leaf_pane_ids(layout: &CoreLayout, out: &mut Vec<Uuid>) {
+    match layout {
+        CoreLayout::Leaf(info) => out.push(info.id),
+        CoreLayout::Split { children, .. } => {
+            for (child, _ratio) in children {
+                collect_leaf_pane_ids(child, out);
+            }
+        }
+    }
+}
+
+/// Removes `pane_id`'s entry from `disconnect_tracker`, if any (Task
+/// 1.1.2e follow-up / Phase 6 idiom review fix). Without this, a pane that
+/// is detached from and then deliberately closed/killed — rather than
+/// exiting on its own, which is the only other path that clears the entry
+/// via `warn_if_exit_follows_disconnect` — leaves a permanent entry behind:
+/// `Uuid`s are never reused, so every such pane leaks one `(Uuid, Instant)`
+/// for the life of the daemon. Called from both `close_pane` and
+/// `kill_session` so a deliberate removal always clears the bookkeeping
+/// regardless of which path took the pane down.
+fn purge_disconnect_tracker(tracker: &Mutex<HashMap<Uuid, Instant>>, pane_id: Uuid) {
+    tracker.lock().unwrap().remove(&pane_id);
+}
+
 fn layout_snapshot_to_proto(layout: &CoreLayout) -> ProtoLayout {
     use tymux_proto::v1::layout::Node;
     let node = match layout {
@@ -60,6 +151,7 @@ fn layout_snapshot_to_proto(layout: &CoreLayout) -> ProtoLayout {
             rows: info.rows,
             cols: info.cols,
             liveness: liveness_of(info.live) as i32,
+            cwd: info.cwd.clone(),
         }),
         CoreLayout::Split {
             orientation,
@@ -137,6 +229,33 @@ async fn supervise(pane_id: Uuid, task: &'static str, handle: tokio::task::JoinH
     }
 }
 
+/// Task 1.1.2e / pre-mortem P1 #1: a production-observable canary for the
+/// abrupt-disconnect pane-kill bug Story 1.1.2 fixed. If a pane's process
+/// exits within `window` of its last `Attach` stream having dropped, that's
+/// the exact signature of the bug reappearing (e.g. a future regression
+/// that reintroduces a controlling-terminal dependency) — as opposed to an
+/// ordinary exit, which either happens while a client is still attached and
+/// watching, or has no recent disconnect at all. Removes the tracked
+/// timestamp on the way out so a pane can only ever trigger this once per
+/// disconnect.
+fn warn_if_exit_follows_disconnect(
+    pane_id: Uuid,
+    tracker: &Mutex<HashMap<Uuid, Instant>>,
+    window: Duration,
+) {
+    let Some(disconnected_at) = tracker.lock().unwrap().remove(&pane_id) else {
+        return;
+    };
+    let elapsed = disconnected_at.elapsed();
+    if elapsed <= window {
+        tracing::warn!(
+            pane_id = %pane_id,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "pane exited shortly after its Attach stream dropped — possible disconnect-survival regression"
+        );
+    }
+}
+
 fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
     match e {
         tymux_core::EngineError::PaneNotFound(id) => {
@@ -178,27 +297,54 @@ fn resolve_live_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::P
     }
 }
 
-/// Maps one `output_rx.recv()` result from the attach forwarding loop to
-/// the `AttachEvent` (if any) it produces — pulled out of the loop so the
-/// Lagged-becomes-`output_gap` transformation is unit-testable without a
-/// live pty/broadcast channel. `None` means the stream should end (the
-/// channel was permanently closed).
-fn attach_event_for_output_result(
-    result: Result<Vec<u8>, tokio::sync::broadcast::error::RecvError>,
+/// What one `output_rx.recv()` result means for the attach forwarding
+/// loop — pulled out of the loop so the Lagged-becomes-`OutputGap` and
+/// (Task 1.3.1b) seq-filtering transformations are unit-testable without
+/// a live pty/broadcast channel.
+#[derive(Debug, PartialEq)]
+enum ForwardStep {
+    /// Forward this event to the client.
+    Emit(AttachEvent),
+    /// Don't forward anything, but the stream continues normally — used
+    /// for output chunks already reflected in the priming snapshot.
+    Skip,
+    /// The stream should end (the broadcast channel was permanently
+    /// closed).
+    End,
+}
+
+/// Maps one `output_rx.recv()` result to a [`ForwardStep`], given the
+/// priming snapshot's sequence number (`snapshot_seq`, from
+/// `pane.snapshot_with_seq()`). Task 1.3.1b / ADR-003 Amendment: an
+/// output chunk whose sequence is `<= snapshot_seq` was already reflected
+/// in the just-sent `Snapshot` event's grid state — forwarding it again
+/// would double-render it, so it's dropped (`Skip`) without ending the
+/// stream. Everything else behaves exactly as before Task 1.3.1: a
+/// normal chunk becomes an `Output` event, a `Lagged` receive becomes
+/// `OutputGap`, and a closed channel ends the stream.
+fn forward_step_for_output_result(
+    result: Result<(u64, Vec<u8>), tokio::sync::broadcast::error::RecvError>,
     pane_id: Uuid,
-) -> Option<AttachEvent> {
+    snapshot_seq: u64,
+) -> ForwardStep {
     use tokio::sync::broadcast::error::RecvError;
     match result {
-        Ok(bytes) => Some(AttachEvent {
-            payload: Some(attach_event::Payload::Output(bytes)),
-        }),
+        Ok((seq, bytes)) => {
+            if seq <= snapshot_seq {
+                ForwardStep::Skip
+            } else {
+                ForwardStep::Emit(AttachEvent {
+                    payload: Some(attach_event::Payload::Output(bytes)),
+                })
+            }
+        }
         Err(RecvError::Lagged(n)) => {
             tracing::warn!(pane_id = %pane_id, skipped = n, "attach consumer lagged, output_gap signaled");
-            Some(AttachEvent {
+            ForwardStep::Emit(AttachEvent {
                 payload: Some(attach_event::Payload::OutputGap(true)),
             })
         }
-        Err(RecvError::Closed) => None,
+        Err(RecvError::Closed) => ForwardStep::End,
     }
 }
 
@@ -208,23 +354,33 @@ impl TymuxService for TymuxDaemon {
         &self,
         request: Request<CreateSessionRequest>,
     ) -> Result<Response<ProtoSession>, Status> {
+        let started = Instant::now();
         let req = request.into_inner();
         let command = if req.command.is_empty() {
             None
         } else {
             Some(req.command)
         };
+        let cwd = if req.cwd.is_empty() {
+            None
+        } else {
+            Some(req.cwd)
+        };
         let id = self
             .engine
-            .create_session(req.name, command)
+            .create_session(req.name, command, cwd)
             .map_err(|e| Status::internal(e.to_string()))?;
+        // O(1) lookup, not list_sessions().find() — the latter rebuilds a
+        // full snapshot of every session under both locks just to find the
+        // one this call just created (the confirmed scale-feasibility
+        // bottleneck: CreateSession latency climbing 5ms→20ms as session
+        // count went 100→900).
         let info = self
             .engine
-            .list_sessions()
-            .into_iter()
-            .find(|s| s.id == id)
+            .session_snapshot(id)
             .ok_or_else(|| Status::internal("session vanished after create"))?;
-        tracing::info!(session_id = %info.id, name = %info.name, "session created");
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(session_id = %info.id, name = %info.name, duration_ms, "session created");
         Ok(Response::new(session_to_proto(&info)))
     }
 
@@ -246,10 +402,23 @@ impl TymuxService for TymuxDaemon {
         request: Request<KillSessionRequest>,
     ) -> Result<Response<KillSessionResponse>, Status> {
         let id = parse_uuid(&request.into_inner().session_id)?;
+        // Gathered before kill_session removes the session from the
+        // engine's active state — this is the only chance to learn which
+        // panes are going away, so disconnect_tracker's per-pane entries
+        // can be purged too (see purge_disconnect_tracker).
+        let mut pane_ids = Vec::new();
+        if let Some(snapshot) = self.engine.session_snapshot(id) {
+            for window in &snapshot.windows {
+                collect_leaf_pane_ids(&window.layout, &mut pane_ids);
+            }
+        }
         self.engine.kill_session(id).map_err(|e| {
             tracing::warn!(session_id = %id, error = %e, "kill_session: no such session");
             Status::not_found(e.to_string())
         })?;
+        for pane_id in pane_ids {
+            purge_disconnect_tracker(&self.disconnect_tracker, pane_id);
+        }
         tracing::info!(session_id = %id, "session killed");
         Ok(Response::new(KillSessionResponse {}))
     }
@@ -348,6 +517,7 @@ impl TymuxService for TymuxDaemon {
             .engine
             .close_pane(pane_id)
             .map_err(engine_error_to_status)?;
+        purge_disconnect_tracker(&self.disconnect_tracker, pane_id);
         tracing::info!(pane_id = %pane_id, window_closed = outcome.window_closed.is_some(), session_closed = outcome.session_closed.is_some(), "pane closed");
         Ok(Response::new(ClosePaneResponse {
             window_closed_id: outcome
@@ -465,6 +635,13 @@ impl TymuxService for TymuxDaemon {
         })?;
         tracing::info!(pane_id = %pane_id, "attach started");
 
+        // Task 1.3.1d: count this as one more open Attach stream. The
+        // matching decrement happens via AttachedGaugeGuard, dropped when
+        // forward_handle ends for any reason.
+        let new_gauge_count = self.attached_sessions_gauge.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::info!(pane_id = %pane_id, tymux_attached_sessions_gauge = new_gauge_count, "attach: gauge incremented");
+        let attached_sessions_gauge = self.attached_sessions_gauge.clone();
+
         // Resize is window-scoped (ADR-004): track this client's reported
         // viewport against the pane's window and apply the dimension-wise
         // minimum across every attached client, rather than sizing this
@@ -472,12 +649,38 @@ impl TymuxService for TymuxDaemon {
         let window_id = self.engine.window_id_for_pane(pane_id);
         let client_id = self.engine.new_client_id();
 
+        // ADR-003 / Task 1.3.1b: subscribe *before* snapshotting, so no
+        // output produced between the two is lost — then send the
+        // snapshot as the very first AttachEvent, before any live Output.
+        // Its sequence number (read atomically with the grid under the
+        // same lock, Task 1.3.1a) is threaded into forward_handle so it
+        // can drop any already-subscribed chunk that predates the
+        // snapshot and would otherwise double-render it.
         let mut output_rx = pane.subscribe();
+        let (pane_snapshot, snapshot_seq) = pane.snapshot_with_seq();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let priming_event = AttachEvent {
+            payload: Some(attach_event::Payload::Snapshot(snapshot_to_proto(
+                &pane_id_str,
+                pane_snapshot,
+                true,
+            ))),
+        };
+        // Practically infallible this early (the receiver was just
+        // created), but a client that cancelled instantly could already
+        // be gone — benign either way, forward_handle's own sends will
+        // fail and end the stream the same way any other disconnect does.
+        let _ = tx.send(Ok(priming_event)).await;
 
         let forward_tx = tx.clone();
         let pane_for_exit = pane.clone();
+        let disconnect_tracker_for_exit = self.disconnect_tracker.clone();
+        let disconnect_regression_window = self.disconnect_regression_window;
         let forward_handle = tokio::spawn(async move {
+            let _gauge_guard = AttachedGaugeGuard {
+                gauge: attached_sessions_gauge,
+                pane_id,
+            };
             loop {
                 // `biased` checks output_rx first every iteration, so any
                 // output already sent before the child exited (the reader
@@ -486,18 +689,27 @@ impl TymuxService for TymuxDaemon {
                 tokio::select! {
                     biased;
                     result = output_rx.recv() => {
-                        if let Some(event) = attach_event_for_output_result(result, pane_for_exit.id) {
-                            if forward_tx.send(Ok(event)).await.is_err() {
-                                return;
+                        match forward_step_for_output_result(result, pane_for_exit.id, snapshot_seq) {
+                            ForwardStep::Emit(event) => {
+                                if forward_tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
                             }
-                        } else {
-                            return;
+                            ForwardStep::Skip => continue,
+                            ForwardStep::End => return,
                         }
                     }
                     _ = pane_for_exit.wait_exit() => {
                         tracing::info!(pane_id = %pane_for_exit.id, "pane exited, closing attach stream");
+                        warn_if_exit_follows_disconnect(
+                            pane_for_exit.id,
+                            &disconnect_tracker_for_exit,
+                            disconnect_regression_window,
+                        );
                         let event = AttachEvent {
-                            payload: Some(attach_event::Payload::Exited(true)),
+                            payload: Some(attach_event::Payload::Exited(ExitStatus {
+                                code: pane_for_exit.exit_code(),
+                            })),
                         };
                         let _ = forward_tx.send(Ok(event)).await;
                         return;
@@ -510,6 +722,7 @@ impl TymuxService for TymuxDaemon {
 
         let pane_for_input = pane.clone();
         let engine_for_input = self.engine.clone();
+        let disconnect_tracker_for_input = self.disconnect_tracker.clone();
         let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
@@ -533,6 +746,25 @@ impl TymuxService for TymuxDaemon {
                     _ => {}
                 }
             }
+            // This Attach stream just ended (client detached, gracefully or
+            // abruptly — there is no separate deliberate-close signal in
+            // this RPC today). Record when, so a pane exit observed shortly
+            // after can be flagged as a possible disconnect-survival
+            // regression (Task 1.1.2e).
+            //
+            // Only a genuine mid-session disconnect (pane still running) is
+            // worth tracking — if the pane already exited, no future
+            // wait_exit() will ever fire to consume this entry, so inserting
+            // anyway would leak it for the life of the daemon. A narrow
+            // TOCTOU race remains if the pane exits between this check and
+            // the insert; that's acceptable and matches the tracker's
+            // already-documented best-effort design.
+            if !pane_for_input.is_exited() {
+                disconnect_tracker_for_input
+                    .lock()
+                    .unwrap()
+                    .insert(pane_id, Instant::now());
+            }
             if let Some(window_id) = window_id {
                 engine_for_input.unregister_viewport(window_id, client_id);
                 engine_for_input.recompute_window_geometry(window_id);
@@ -546,6 +778,102 @@ impl TymuxService for TymuxDaemon {
     }
 }
 
+/// Interprets a raw `setsid()`(2) result. Split out from the actual libc
+/// call (see [`detach_controlling_terminal`]) so unit tests can exercise
+/// both outcomes deterministically — calling the real syscall twice within
+/// one test binary is inherently order-dependent, since only the first
+/// caller in the process can actually succeed.
+fn interpret_setsid_result(sid: i32, errno: i32) -> Result<i32, i32> {
+    if sid == -1 {
+        Err(errno)
+    } else {
+        Ok(sid)
+    }
+}
+
+/// Story 1.1.2 (ADR-002 / Epic 1.1): detaches `tymuxd` from any controlling
+/// terminal it inherited from its parent, matching real tmux's own startup
+/// behavior. Must run before any pty is opened (Task 1.1.2b). Root cause
+/// this addresses: a `tymuxd` process that still holds a controlling
+/// terminal can receive a `SIGHUP` on that terminal's hangup, which (per
+/// this repo's investigation in `disconnect_survival_e2e.rs`) is
+/// indistinguishable at the process-group level from the hangup propagating
+/// to child pane processes — an abrupt client disconnect must never be able
+/// to kill a pane. Calling `setsid()` makes `tymuxd` a session leader with
+/// no controlling terminal at all, closing that path structurally rather
+/// than by handling `SIGHUP` after the fact.
+///
+/// Returns `Ok(new_sid)` on success. `Err(errno)` on failure; `EPERM` is the
+/// *expected* failure when this process is already a session leader (e.g.
+/// started under systemd, which already detaches units from a controlling
+/// terminal) — callers should log that case at `debug`, not `warn`.
+fn detach_controlling_terminal() -> Result<i32, i32> {
+    // SAFETY: setsid(2) takes no arguments and has no preconditions beyond
+    // being a valid libc call; it always returns either the new session id
+    // or -1 with errno set.
+    let sid = unsafe { libc::setsid() };
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+    interpret_setsid_result(sid, errno)
+}
+
+/// Logs `detach_controlling_terminal`'s outcome at the level Task 1.1.2b
+/// specifies: `info` on success, `debug` (not `warn`) for the expected
+/// already-a-session-leader case, `warn` for any other, unexpected errno.
+fn log_detach_controlling_terminal_outcome(result: Result<i32, i32>) {
+    match result {
+        Ok(sid) => tracing::info!(sid, "detached from controlling terminal"),
+        Err(errno) if errno == libc::EPERM => {
+            tracing::debug!(
+                errno,
+                "setsid: already a session leader (expected, e.g. under systemd)"
+            );
+        }
+        Err(errno) => {
+            tracing::warn!(
+                errno,
+                "setsid failed unexpectedly — tymuxd may still hold a controlling terminal"
+            );
+        }
+    }
+}
+
+/// Story 1.1.4 / pre-mortem P1 #3: best-effort upper-bound approximation of
+/// processes orphaned by a prior `tymuxd` instance dying or restarting
+/// while sessions were alive — `Engine::revive_session` always spawns a
+/// *new* process on an explicit `tymux revive`, never reattaching to
+/// whatever the old process became (see that function's doc comment for
+/// the accepted trade-off this metric exists to make visible instead).
+///
+/// `PersistedPaneRecord` carries no explicit liveness flag: `PersistedLayoutNode::from_live`
+/// only fills in `command`/`cwd`/size for a pane that was `PaneEntry::Live` at the moment it
+/// was last persisted; a dead pane's record round-trips as empty strings. So a non-empty
+/// `command` at load time is the best proxy this schema can offer for "was last known to be
+/// Live". Story 1.2.4 added `exit_code`, which is populated at the same persist that would
+/// otherwise make this look like an orphan once the pane has actually exited — a leaf with a
+/// recorded `exit_code` (`Some(_)`) has a confirmed fate and must NOT be counted, even though
+/// its `command` is still non-empty (the record isn't blanked on exit, only on the
+/// `Live -> Dead` transition). Only `command` non-empty AND `exit_code: None` means "last known
+/// to be Live, with no confirmed exit recorded" — a record counted here may in fact have
+/// already exited cleanly before the restart without that exit ever being captured, so this
+/// is an upper bound, not a guarantee.
+fn count_orphan_candidates(records: &[tymux_core::PersistedSessionRecord]) -> usize {
+    fn count_node(node: &PersistedLayoutNode) -> usize {
+        match node {
+            PersistedLayoutNode::Leaf { pane } => {
+                usize::from(!pane.command.is_empty() && pane.exit_code.is_none())
+            }
+            PersistedLayoutNode::Split { children, .. } => {
+                children.iter().map(|(c, _)| count_node(c)).sum()
+            }
+        }
+    }
+    records
+        .iter()
+        .flat_map(|r| r.windows.iter())
+        .map(|w| count_node(&w.layout))
+        .sum()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -554,6 +882,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    log_detach_controlling_terminal_outcome(detach_controlling_terminal());
 
     let addr = std::env::var("TYMUXD_ADDR").unwrap_or_else(|_| "127.0.0.1:7419".to_string());
     let socket_addr: std::net::SocketAddr = addr.parse()?;
@@ -590,13 +920,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let records = backend.load_all();
     let restored_count = records.len();
+    let orphan_candidate_count = count_orphan_candidates(&records);
     let engine = Arc::new(Engine::with_persistence(Box::new(backend)));
     engine.load_persisted(records);
     if restored_count > 0 {
         tracing::info!(count = restored_count, dir = %sessions_dir.display(), "restored dead-flagged sessions from disk");
     }
+    // Story 1.1.4: visibility for the orphan-on-restart trade-off documented
+    // on `Engine::revive_session` — see `docs/runbooks/orphaned-processes.md`
+    // for how to act on a nonzero count.
+    if orphan_candidate_count > 0 {
+        tracing::warn!(
+            count = orphan_candidate_count,
+            "possible orphaned processes from prior tymuxd instance — see docs/runbooks/orphaned-processes.md"
+        );
+    } else {
+        tracing::info!(
+            count = 0,
+            "no orphaned-process candidates found from prior tymuxd instance"
+        );
+    }
 
-    let daemon = TymuxDaemon { engine };
+    let daemon = TymuxDaemon::new(engine);
 
     tracing::info!(%addr, "tymuxd listening");
     Server::builder()
@@ -650,9 +995,7 @@ mod tests {
     use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 
     fn test_daemon() -> TymuxDaemon {
-        TymuxDaemon {
-            engine: Arc::new(Engine::new()),
-        }
+        TymuxDaemon::new(Arc::new(Engine::new()))
     }
 
     /// Extracts the pane from a freshly created single-pane window's
@@ -671,6 +1014,7 @@ mod tests {
         CreateSessionRequest {
             name: name.to_string(),
             command: "/bin/sh".to_string(),
+            cwd: String::new(),
         }
     }
 
@@ -723,6 +1067,88 @@ mod tests {
         assert_eq!(sole_pane(&list.sessions[0].windows[0]).id, pane_id);
         assert_eq!(sole_pane(&list.sessions[0].windows[0]).rows, 24);
         assert_eq!(sole_pane(&list.sessions[0].windows[0]).cols, 80);
+    }
+
+    /// REQ-8 (Epic 1.5) happy path — a nonempty `CreateSessionRequest.cwd`
+    /// both (a) reaches the spawned shell's actual working directory (not
+    /// just the returned field, which could otherwise be a no-op relabel)
+    /// and (b) is reflected back on the returned `Pane.cwd` field.
+    #[tokio::test]
+    async fn create_session_should_spawn_pane_in_requested_cwd_and_return_it_on_pane_cwd_field() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+
+        let tmp_dir = std::env::temp_dir().join(format!("tymux-cwd-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        // Canonicalize so a symlinked temp dir (e.g. macOS's /tmp ->
+        // /private/tmp) can't make the shell's real `pwd` output disagree
+        // with the path we asked for.
+        let tmp_dir = tmp_dir.canonicalize().unwrap();
+        let cwd = tmp_dir.display().to_string();
+
+        let mut req = create_req("test");
+        req.cwd = cwd.clone();
+        let session = daemon
+            .create_session(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(sole_pane(&session.windows[0]).cwd, cwd);
+
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        // The completion marker is piped through `rev` so the terminal's
+        // echo of this typed command (which itself contains the literal
+        // text "DONE-MARKER") can never satisfy the poll below before the
+        // shell has actually executed anything — a real race that once hit
+        // in CI, matching the echoed input line instead of real output.
+        pane.write_input(b"pwd; echo DONE-MARKER | rev\n").unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let text: String = pane
+                .snapshot()
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.clone())
+                .collect();
+            if text.contains("REKRAM-ENOD") {
+                assert!(
+                    text.contains(&cwd),
+                    "expected `pwd` output to contain {cwd}, got: {text}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected the reversed completion marker to appear within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    /// REQ-8 (Epic 1.5) edge path — empty string means "the daemon's own
+    /// cwd," matching `command`'s existing empty-means-default convention.
+    /// Must not regress: this is today's implicit behavior for every
+    /// existing caller that never set `cwd`.
+    #[tokio::test]
+    async fn create_session_should_use_daemon_own_cwd_when_cwd_field_is_empty_string() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let daemon_cwd = std::env::current_dir().unwrap().display().to_string();
+        assert_eq!(sole_pane(&session.windows[0]).cwd, daemon_cwd);
     }
 
     #[tokio::test]
@@ -896,59 +1322,170 @@ mod tests {
         assert_ne!(dead_err.code(), unknown_err.code());
     }
 
+    /// Story 1.2.4: a pane's last-known exit code survives into a
+    /// `PaneEntry::Dead` record across a simulated daemon restart, readable
+    /// with no `Attach` stream ever reopened post-exit — the ADR-001 gap
+    /// `CapturePane`'s own `FailedPrecondition` response (asserted above)
+    /// leaves for a fully dead pane.
+    #[tokio::test]
+    async fn capture_pane_should_surface_persisted_exit_code_when_pane_is_dead_and_no_attach_stream_was_ever_reopened(
+    ) {
+        use tymux_core::FsPersistenceBackend;
+
+        let persist_dir =
+            std::env::temp_dir().join(format!("tymux-exit-code-test-{}", Uuid::new_v4()));
+        let backend = FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let engine = Arc::new(Engine::with_persistence(Box::new(backend)));
+        let daemon = TymuxDaemon::new(engine.clone());
+
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let session_id = parse_uuid(&session.id).unwrap();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"exit 3\n").unwrap();
+        wait_for_pane_exit(&pane).await;
+
+        // No Attach stream is ever opened post-exit. Instead, trigger the
+        // same structural-mutation persist path any other session mutation
+        // would (Task 1.2.4b) — adding a second window re-snapshots the
+        // whole session, capturing the already-exited pane's exit code
+        // into its persisted record.
+        engine
+            .create_window(session_id, Some("/bin/sh".to_string()))
+            .unwrap();
+
+        // Simulate a daemon restart: reload from the persisted records
+        // into a fresh Engine, exactly as `tymuxd`'s startup path does.
+        let backend2 = FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let records = backend2.load_all();
+        let fresh_engine = Engine::with_persistence(Box::new(backend2));
+        fresh_engine.load_persisted(records);
+
+        assert_eq!(
+            fresh_engine.dead_pane_exit_code(pane_id),
+            Some(Some(3)),
+            "a dead pane's last-known exit code must survive a daemon \
+             restart, readable with no Attach stream ever reopened"
+        );
+
+        std::fs::remove_dir_all(&persist_dir).ok();
+    }
+
     #[test]
     fn attach_should_not_emit_output_gap_event_when_consumer_keeps_pace() {
         let pane_id = Uuid::new_v4();
-        let event = attach_event_for_output_result(Ok(b"hello".to_vec()), pane_id).unwrap();
+        let step = forward_step_for_output_result(Ok((1, b"hello".to_vec())), pane_id, 0);
         assert!(matches!(
-            event.payload,
-            Some(attach_event::Payload::Output(_))
+            step,
+            ForwardStep::Emit(AttachEvent {
+                payload: Some(attach_event::Payload::Output(_))
+            })
         ));
     }
 
     #[test]
     fn attach_should_emit_output_gap_event_when_consumer_lags_behind_broadcast_channel() {
         let pane_id = Uuid::new_v4();
-        let event = attach_event_for_output_result(
+        let step = forward_step_for_output_result(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(5)),
             pane_id,
-        )
-        .unwrap();
+            0,
+        );
         assert!(matches!(
-            event.payload,
-            Some(attach_event::Payload::OutputGap(true))
+            step,
+            ForwardStep::Emit(AttachEvent {
+                payload: Some(attach_event::Payload::OutputGap(true))
+            })
         ));
     }
 
     #[test]
     fn attach_event_for_output_result_ends_stream_on_closed_channel() {
         let pane_id = Uuid::new_v4();
-        assert!(attach_event_for_output_result(
-            Err(tokio::sync::broadcast::error::RecvError::Closed),
-            pane_id
-        )
-        .is_none());
+        assert_eq!(
+            forward_step_for_output_result(
+                Err(tokio::sync::broadcast::error::RecvError::Closed),
+                pane_id,
+                0,
+            ),
+            ForwardStep::End
+        );
+    }
+
+    /// Task 1.3.1b / REQ-5: the exact double-render window
+    /// adversarial-review.md flagged as a Blocker — an output chunk whose
+    /// sequence number is `<=` the priming snapshot's must not be
+    /// forwarded (it's already reflected in that snapshot's grid state),
+    /// but the stream must *not* end either; it's a `Skip`, not `End`.
+    /// Chunks strictly newer than the snapshot forward normally.
+    #[test]
+    fn forward_handle_should_drop_output_chunks_with_sequence_less_than_or_equal_to_snapshot_sequence(
+    ) {
+        let pane_id = Uuid::new_v4();
+        let snapshot_seq = 10u64;
+
+        assert_eq!(
+            forward_step_for_output_result(
+                Ok((10, b"already-in-snapshot".to_vec())),
+                pane_id,
+                snapshot_seq
+            ),
+            ForwardStep::Skip,
+            "a chunk at exactly the snapshot's sequence must be dropped, not forwarded"
+        );
+        assert_eq!(
+            forward_step_for_output_result(
+                Ok((3, b"predates-snapshot".to_vec())),
+                pane_id,
+                snapshot_seq
+            ),
+            ForwardStep::Skip,
+            "a chunk older than the snapshot's sequence must be dropped, not forwarded"
+        );
+        assert!(
+            matches!(
+                forward_step_for_output_result(Ok((11, b"new-output".to_vec())), pane_id, snapshot_seq),
+                ForwardStep::Emit(AttachEvent {
+                    payload: Some(attach_event::Payload::Output(bytes))
+                }) if bytes == b"new-output"
+            ),
+            "a chunk newer than the snapshot's sequence must forward normally"
+        );
     }
 
     /// Integration-style proof (real `tokio::sync::broadcast` channel, tiny
     /// capacity, burst sender) that a lagged consumer observes an
     /// `OutputGap` event before normal `Output` events resume — exercising
-    /// `attach_event_for_output_result` against tokio's actual `Lagged`
+    /// `forward_step_for_output_result` against tokio's actual `Lagged`
     /// semantics rather than a hand-constructed `RecvError`.
     #[tokio::test]
     async fn attach_stream_should_observe_output_gap_before_output_resumes_when_consumer_lags() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel::<Vec<u8>>(2);
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<(u64, Vec<u8>)>(2);
         let pane_id = Uuid::new_v4();
 
         // Burst past the channel's capacity before the consumer ever reads,
         // guaranteeing the next recv() observes Lagged.
         for i in 0..5u8 {
-            let _ = tx.send(vec![i]);
+            let _ = tx.send((i as u64, vec![i]));
         }
 
-        let first = attach_event_for_output_result(rx.recv().await, pane_id).unwrap();
+        let first = forward_step_for_output_result(rx.recv().await, pane_id, 0);
         assert!(
-            matches!(first.payload, Some(attach_event::Payload::OutputGap(true))),
+            matches!(
+                first,
+                ForwardStep::Emit(AttachEvent {
+                    payload: Some(attach_event::Payload::OutputGap(true))
+                })
+            ),
             "first observed event after a burst past capacity must be OutputGap"
         );
 
@@ -956,11 +1493,156 @@ mod tests {
         // its last `capacity` (2) buffered items (3, 4) — the next recv()
         // must yield one of them as an ordinary Output event, not another
         // Lagged/OutputGap.
-        let second = attach_event_for_output_result(rx.recv().await, pane_id).unwrap();
+        let second = forward_step_for_output_result(rx.recv().await, pane_id, 0);
         assert!(matches!(
-            second.payload,
-            Some(attach_event::Payload::Output(_))
+            second,
+            ForwardStep::Emit(AttachEvent {
+                payload: Some(attach_event::Payload::Output(_))
+            })
         ));
+    }
+
+    /// Task 1.3.1c / REQ-5: the regression test the previous ("wait for it
+    /// to settle, then attach") version of this test explicitly avoided —
+    /// adversarial-review.md's Blocker. Starts a pane emitting distinct
+    /// markers on a ~10ms-spaced loop, then calls `attach()` while that
+    /// loop is still actively running (only a short, deliberately-short
+    /// head start, not a settle), and asserts every marker observed
+    /// across the priming `Snapshot` plus every subsequent `Output` event
+    /// appears at most once — the exact double-render signature ADR-003's
+    /// Amendment (Tasks 1.3.1a/b) fixes: bytes that land in the window
+    /// between `pane.subscribe()` and `pane.snapshot()` must not be both
+    /// baked into the snapshot's grid *and* replayed as a queued `Output`
+    /// chunk on top of it.
+    #[tokio::test]
+    async fn attach_should_emit_snapshot_first_with_no_duplicated_bytes_when_output_streams_concurrently_not_after_settling(
+    ) {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // Fixed-width markers ("L00007E") so no marker is ever a substring
+        // of another (unlike "LINE-7" inside "LINE-70"), which lets the
+        // no-duplication check below use a plain substring count. Written
+        // directly to the pane (bypassing Attach, which isn't open yet)
+        // so the loop is already running before we ever call attach().
+        //
+        // Deliberately *no* sleep between lines: the actual race window
+        // this test must hit (bytes fed to the vt100 parser strictly
+        // between `pane.subscribe()` and `pane.snapshot_with_seq()`
+        // acquiring the parser lock, inside `attach()`) is only a few
+        // Rust statements wide — sub-microsecond. A sleep-throttled
+        // producer (e.g. one line per 10ms) leaves that window almost
+        // always idle, so attaching "during" it rarely actually lands a
+        // reader-thread cycle inside the gap and would pass even with the
+        // Task 1.3.1a/b fix reverted (confirmed empirically). A tight,
+        // unthrottled flood keeps the reader thread cycling
+        // read+process+broadcast essentially back-to-back, so the gap is
+        // virtually always straddled by an in-flight chunk.
+        const LINE_COUNT: usize = 50_000;
+        let cmd = format!(
+            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; echo DONE-MARKER\n"
+        );
+        pane.write_input(cmd.as_bytes()).unwrap();
+
+        // A short, deliberate head start — NOT a settle delay. The flood
+        // runs for a few hundred ms total; this only guarantees it has
+        // already begun by the time we attach, so attach()'s
+        // subscribe()+snapshot() genuinely races live output instead of
+        // running before the command even starts.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        let snapshot = match first.payload {
+            Some(attach_event::Payload::Snapshot(s)) => s,
+            other => panic!("expected the first AttachEvent to be a Snapshot, got {other:?}"),
+        };
+        let snapshot_text: String = snapshot
+            .grid
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .map(|c| c.text.as_str())
+            .collect();
+
+        // Drain Output events, concatenating their raw bytes, until
+        // DONE-MARKER shows up — proof the loop (still running when we
+        // attached) has now fully streamed past us.
+        let mut streamed = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "attach stream did not deliver DONE-MARKER in time"
+            );
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("attach stream stalled")
+                .unwrap();
+            match event {
+                Some(AttachEvent {
+                    payload: Some(attach_event::Payload::Output(bytes)),
+                }) => {
+                    streamed.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&streamed).contains("DONE-MARKER") {
+                        break;
+                    }
+                }
+                // A gap just means some frames were skipped (a known,
+                // unrelated behavior for a slow-enough consumer under a
+                // deliberately extreme flood) — it doesn't itself produce
+                // a duplicate, so it's not a failure for this test.
+                Some(_) => continue,
+                None => panic!("attach stream closed before DONE-MARKER arrived"),
+            }
+        }
+
+        // The core assertion: the union of Snapshot content + every
+        // subsequent Output chunk must contain each marker at most once.
+        // A marker appearing twice is exactly the double-render bug —
+        // already baked into the snapshot's grid state *and* separately
+        // replayed from the broadcast channel on top of it.
+        let full_text = format!("{snapshot_text}{}", String::from_utf8_lossy(&streamed));
+        let mut duplicated = Vec::new();
+        for i in 0..LINE_COUNT {
+            let marker = format!("L{i:07}E");
+            let occurrences = full_text.matches(&marker).count();
+            if occurrences > 1 {
+                duplicated.push((marker, occurrences));
+            }
+        }
+        assert!(
+            duplicated.is_empty(),
+            "markers rendered more than once (double-render): {duplicated:?}"
+        );
     }
 
     /// End-to-end regression test for the Ctrl-d hang bug fixed earlier:
@@ -1009,6 +1691,133 @@ mod tests {
             .unwrap()
             .into_inner();
 
+        let exit_status = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = inbound.message().await.unwrap() {
+                if let Some(attach_event::Payload::Exited(status)) = event.payload {
+                    return Some(status);
+                }
+            }
+            None
+        })
+        .await
+        .expect("attach stream must close within 5s, not hang");
+
+        assert_eq!(
+            exit_status
+                .expect("expected an Exited event before the stream closed")
+                .code,
+            Some(0),
+            "a plain `exit` should report exit code 0, not an unknown code"
+        );
+    }
+
+    /// ADR-001 regression test: the live `Attach` path (unlike the
+    /// persisted/`CapturePane` path, already covered by
+    /// `capture_pane_should_surface_persisted_exit_code_when_pane_is_dead_and_no_attach_stream_was_ever_reopened`)
+    /// had no test proving a real *nonzero* exit code survives the
+    /// `ExitStatus { code: pane.exit_code() }` send site intact — a
+    /// `.unwrap_or(0)`-style regression there would silently backfill any
+    /// code to `Some(0)`, which is exactly what
+    /// `attach_streams_output_and_signals_exit` above cannot catch, since
+    /// `exit` alone already produces code 0.
+    #[tokio::test]
+    async fn attach_streams_a_nonzero_exit_code_without_backfilling_to_zero() {
+        let daemon = test_daemon();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+        })
+        .await
+        .unwrap();
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Input(b"exit 7\n".to_vec())),
+        })
+        .await
+        .unwrap();
+
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let exit_status = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = inbound.message().await.unwrap() {
+                if let Some(attach_event::Payload::Exited(status)) = event.payload {
+                    return Some(status);
+                }
+            }
+            None
+        })
+        .await
+        .expect("attach stream must close within 5s, not hang");
+
+        assert_eq!(
+            exit_status
+                .expect("expected an Exited event before the stream closed")
+                .code,
+            Some(7),
+            "a real nonzero exit code must round-trip through the live Attach path, not be \
+             backfilled to 0 or lost"
+        );
+    }
+
+    /// Companion regression test for the fix described on
+    /// `close_pane_should_purge_disconnect_tracker_entry_it_left_behind`
+    /// below: that test covers the *explicit close/kill* purge path, but
+    /// the dominant real-world exit path is a pane exiting normally while a
+    /// client is still attached (e.g. this test's plain `exit`), with no
+    /// explicit `ClosePane`/`KillSession` call ever following. Before the
+    /// fix, `attach()`'s `input_handle` task unconditionally inserted a
+    /// `disconnect_tracker` entry when the request stream ended — even
+    /// though the pane had, by then, already exited and can never exit
+    /// again to trigger the one path (`warn_if_exit_follows_disconnect`)
+    /// that would have removed it. That leaked one entry per such pane for
+    /// the life of the daemon. Drives a real live `Attach` stream through a
+    /// normal exit (not an abrupt client disconnect) and asserts no
+    /// `disconnect_tracker` entry survives.
+    #[tokio::test]
+    async fn attach_should_not_leak_disconnect_tracker_entry_when_pane_exits_normally_while_attached(
+    ) {
+        let daemon = test_daemon();
+        let disconnect_tracker = daemon.disconnect_tracker.clone();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let pane_uuid = parse_uuid(&pane_id).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+        })
+        .await
+        .unwrap();
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
+        })
+        .await
+        .unwrap();
+
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
         let saw_exit = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = inbound.message().await.unwrap() {
                 if matches!(event.payload, Some(attach_event::Payload::Exited(_))) {
@@ -1019,10 +1828,22 @@ mod tests {
         })
         .await
         .expect("attach stream must close within 5s, not hang");
-
         assert!(
             saw_exit,
             "expected an Exited event before the stream closed"
+        );
+
+        // Ends the request stream, so `input_handle`'s reader loop returns
+        // and runs its (now-guarded) disconnect_tracker insert. Give the
+        // background task a moment to actually run before asserting.
+        drop(tx);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !disconnect_tracker.lock().unwrap().contains_key(&pane_uuid),
+            "a pane that already exited before its Attach stream closed must not leave a \
+             disconnect_tracker entry behind — no future pane exit will ever occur to purge it, \
+             so it would leak for the life of the daemon"
         );
     }
 
@@ -1132,6 +1953,88 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// Phase 6 idiom review fix: before this, `disconnect_tracker`'s only
+    /// removal path was `warn_if_exit_follows_disconnect`, reached only
+    /// from the *same* `Attach` call's `forward_handle` task observing
+    /// `pane.wait_exit()`. If that task had already ended (e.g. the
+    /// client's whole connection dropped, failing an in-flight
+    /// `forward_tx.send()`) before the pane was deliberately closed, no
+    /// task was left to ever call it again — a permanent leak, since
+    /// `Uuid`s are never reused. Simulates the detach directly (an insert
+    /// identical in shape to the one `attach()`'s `input_handle` task
+    /// performs) so the test is deterministic rather than racing a real
+    /// subprocess exit against a dropped gRPC stream.
+    #[tokio::test]
+    async fn close_pane_should_purge_disconnect_tracker_entry_it_left_behind() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+
+        daemon
+            .disconnect_tracker
+            .lock()
+            .unwrap()
+            .insert(pane_id, Instant::now());
+
+        daemon
+            .close_pane(Request::new(ClosePaneRequest {
+                pane_id: pane_id.to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !daemon
+                .disconnect_tracker
+                .lock()
+                .unwrap()
+                .contains_key(&pane_id),
+            "close_pane must purge the disconnect_tracker entry for the pane it closed, or it \
+             leaks for the life of the daemon (Uuids are never reused)"
+        );
+    }
+
+    /// Same leak as above, via the other deliberate-removal path:
+    /// `kill_session` takes every pane in the session with it, so it must
+    /// purge a `disconnect_tracker` entry for each one, not just the pane
+    /// a caller happens to name directly.
+    #[tokio::test]
+    async fn kill_session_should_purge_disconnect_tracker_entries_it_left_behind() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let session_id = session.id.clone();
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+
+        daemon
+            .disconnect_tracker
+            .lock()
+            .unwrap()
+            .insert(pane_id, Instant::now());
+
+        daemon
+            .kill_session(Request::new(KillSessionRequest { session_id }))
+            .await
+            .unwrap();
+
+        assert!(
+            !daemon
+                .disconnect_tracker
+                .lock()
+                .unwrap()
+                .contains_key(&pane_id),
+            "kill_session must purge disconnect_tracker entries for every pane it kills, or \
+             they leak for the life of the daemon"
+        );
     }
 
     #[tokio::test]
@@ -1385,9 +2288,13 @@ mod tests {
         // Produce deterministic scrollback content to search, polling for a
         // completion marker rather than sleeping a fixed duration — mirrors
         // `spawn_shell_with_numbered_lines` in tymux-core's own
-        // `Pane::search_scrollback` unit tests.
+        // `Pane::search_scrollback` unit tests. The marker is emitted by a
+        // separate `echo ... | rev` after the awk script (not printed by
+        // awk itself) so the terminal's echo of this typed command — which
+        // contains the literal text "DONE-MARKER" — can never satisfy the
+        // poll before the awk script has actually run.
         pane.write_input(
-            b"awk 'BEGIN{for(i=1;i<=50;i++) print \"line-\" i; print \"DONE-MARKER\"}'\n",
+            b"awk 'BEGIN{for(i=1;i<=50;i++) print \"line-\" i}'; echo DONE-MARKER | rev\n",
         )
         .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1399,7 +2306,7 @@ mod tests {
                 .flatten()
                 .map(|c| c.text.clone())
                 .collect();
-            if text.contains("DONE-MARKER") {
+            if text.contains("REKRAM-ENOD") {
                 break;
             }
             assert!(
@@ -1445,5 +2352,181 @@ mod tests {
         assert!(!response.found);
         assert_eq!(response.offset, 0);
         assert!(response.line.is_empty());
+    }
+
+    // --- Story 1.1.2: setsid() detach-from-controlling-terminal ---
+
+    #[test]
+    fn detach_controlling_terminal_should_report_new_sid_when_setsid_succeeds() {
+        assert_eq!(interpret_setsid_result(1234, 0), Ok(1234));
+    }
+
+    #[test]
+    fn detach_controlling_terminal_should_tolerate_eperm_when_already_session_leader_and_log_debug_not_warn(
+    ) {
+        assert_eq!(interpret_setsid_result(-1, libc::EPERM), Err(libc::EPERM));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn detach_controlling_terminal_should_log_info_on_success_debug_on_expected_eperm_warn_on_unexpected_errno(
+    ) {
+        log_detach_controlling_terminal_outcome(Ok(42));
+        assert!(logs_contain("INFO"));
+        assert!(logs_contain("detached from controlling terminal"));
+
+        log_detach_controlling_terminal_outcome(Err(libc::EPERM));
+        assert!(logs_contain("DEBUG"));
+        assert!(logs_contain("already a session leader"));
+        assert!(!logs_contain("WARN"));
+
+        log_detach_controlling_terminal_outcome(Err(libc::EINVAL));
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("setsid failed unexpectedly"));
+    }
+
+    // --- Story 1.1.2e: pane-exit-shortly-after-disconnect regression signal ---
+
+    #[test]
+    fn warn_if_exit_follows_disconnect_should_warn_when_exit_is_within_window() {
+        let tracker: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+        let pane_id = Uuid::new_v4();
+        tracker.lock().unwrap().insert(pane_id, Instant::now());
+
+        // No direct log assertion here (see the tracing_test-based case
+        // below) — this just proves the tracker entry is consumed so a
+        // second call for the same pane_id can't double-fire.
+        warn_if_exit_follows_disconnect(pane_id, &tracker, Duration::from_millis(300));
+        assert!(!tracker.lock().unwrap().contains_key(&pane_id));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn warn_if_exit_follows_disconnect_should_log_warn_when_exit_follows_disconnect_within_window()
+    {
+        let tracker: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+        let pane_id = Uuid::new_v4();
+        tracker.lock().unwrap().insert(pane_id, Instant::now());
+
+        warn_if_exit_follows_disconnect(pane_id, &tracker, Duration::from_millis(300));
+        assert!(logs_contain("possible disconnect-survival regression"));
+    }
+
+    #[test]
+    fn warn_if_exit_follows_disconnect_should_not_warn_when_no_recent_disconnect_recorded() {
+        let tracker: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+        let pane_id = Uuid::new_v4();
+        // No entry recorded for this pane_id at all (ordinary exit while a
+        // client is still attached and watching) — must be a silent no-op.
+        warn_if_exit_follows_disconnect(pane_id, &tracker, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn warn_if_exit_follows_disconnect_should_not_warn_when_disconnect_outside_window() {
+        let tracker: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+        let pane_id = Uuid::new_v4();
+        tracker.lock().unwrap().insert(pane_id, Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+
+        // A 0ms window can never be satisfied by a real elapsed duration —
+        // proves the window bound is actually enforced, not always true.
+        warn_if_exit_follows_disconnect(pane_id, &tracker, Duration::from_millis(0));
+        // Entry is still consumed either way (best-effort, fires at most once).
+        assert!(!tracker.lock().unwrap().contains_key(&pane_id));
+    }
+
+    // --- Story 1.1.4: orphaned-process-count startup metric ---
+
+    #[test]
+    fn count_orphan_candidates_should_return_zero_for_no_records() {
+        assert_eq!(count_orphan_candidates(&[]), 0);
+    }
+
+    #[test]
+    fn count_orphan_candidates_should_count_leaves_with_nonempty_command_as_orphan_candidates() {
+        use tymux_core::{
+            PersistedLayoutNode, PersistedPaneRecord, PersistedSessionRecord,
+            PersistedWindowRecord, CURRENT_SCHEMA_VERSION,
+        };
+
+        let live_leaf = PersistedLayoutNode::Leaf {
+            pane: PersistedPaneRecord {
+                pane_id: Uuid::new_v4(),
+                command: "/bin/sh".to_string(),
+                cwd: "/tmp".to_string(),
+                rows: 24,
+                cols: 80,
+                exit_code: None,
+            },
+        };
+        let dead_leaf = PersistedLayoutNode::Leaf {
+            pane: PersistedPaneRecord {
+                pane_id: Uuid::new_v4(),
+                command: String::new(),
+                cwd: String::new(),
+                rows: 0,
+                cols: 0,
+                exit_code: None,
+            },
+        };
+        let record = PersistedSessionRecord {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            session_id: Uuid::new_v4(),
+            name: "test".to_string(),
+            windows: vec![
+                PersistedWindowRecord {
+                    id: Uuid::new_v4(),
+                    name: "win-live".to_string(),
+                    layout: live_leaf,
+                },
+                PersistedWindowRecord {
+                    id: Uuid::new_v4(),
+                    name: "win-dead".to_string(),
+                    layout: dead_leaf,
+                },
+            ],
+            active_window_id: Uuid::new_v4(),
+        };
+
+        assert_eq!(count_orphan_candidates(&[record]), 1);
+    }
+
+    #[test]
+    fn count_orphan_candidates_should_not_count_leaves_with_a_recorded_exit_code() {
+        use tymux_core::{
+            PersistedLayoutNode, PersistedPaneRecord, PersistedSessionRecord,
+            PersistedWindowRecord, CURRENT_SCHEMA_VERSION,
+        };
+
+        // Story 1.2.4b persists `exit_code` on a still-`Live`-in-name pane the
+        // moment its process is observed to have exited, before the entry
+        // fully transitions to `PaneEntry::Dead`. Such a leaf still has a
+        // nonempty `command` (it isn't blanked until the Live -> Dead
+        // transition) but its fate IS known — it must not be counted as an
+        // orphan candidate, unlike the true-unknown-fate case covered by
+        // `count_orphan_candidates_should_count_leaves_with_nonempty_command_as_orphan_candidates`.
+        let exited_leaf = PersistedLayoutNode::Leaf {
+            pane: PersistedPaneRecord {
+                pane_id: Uuid::new_v4(),
+                command: "/bin/sh".to_string(),
+                cwd: "/tmp".to_string(),
+                rows: 24,
+                cols: 80,
+                exit_code: Some(0),
+            },
+        };
+        let record = PersistedSessionRecord {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            session_id: Uuid::new_v4(),
+            name: "test".to_string(),
+            windows: vec![PersistedWindowRecord {
+                id: Uuid::new_v4(),
+                name: "win-exited".to_string(),
+                layout: exited_leaf,
+            }],
+            active_window_id: Uuid::new_v4(),
+        };
+
+        assert_eq!(count_orphan_candidates(&[record]), 0);
     }
 }

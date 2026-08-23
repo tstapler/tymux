@@ -5,7 +5,7 @@
   "type": "module",
   "description": "TypeScript client + examples proving tymuxd's gRPC API is usable cross-language (ADR-003).",
   "scripts": {
-    "generate": "buf generate ../../proto",
+    "generate": "buf generate --template ../../proto/buf.gen.ts.yaml ../../proto",
     "build": "tsc -p tsconfig.json",
     "list-sessions": "tsx examples/list-sessions.ts",
     "attach": "tsx examples/attach.ts",

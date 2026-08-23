@@ -279,6 +279,7 @@ async fn run() -> Result<()> {
                 .create_session(CreateSessionRequest {
                     name: name.clone(),
                     command: command.unwrap_or_default(),
+                    cwd: String::new(),
                 })
                 .await?
                 .into_inner();
@@ -551,13 +552,9 @@ async fn attach(
                             stdout.write_all(&bytes)?;
                             stdout.flush()?;
                         }
-                        Some(attach_event::Payload::Exited(_)) => {
+                        Some(ref payload @ attach_event::Payload::Exited(_)) => {
                             drop(_raw);
-                            writeln!(
-                                stdout,
-                                "{}",
-                                chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap()
-                            )?;
+                            writeln!(stdout, "{}", chrome_message_for_event(payload).unwrap())?;
                             stdout.flush()?;
                             break AttachOutcome::Done;
                         }
@@ -918,6 +915,7 @@ fn spawn_resize_watcher() -> tokio::sync::mpsc::Receiver<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use tymux_proto::v1::ExitStatus;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("tymux").chain(args.iter().copied())).unwrap()
@@ -959,7 +957,9 @@ mod tests {
 
     #[test]
     fn attach_event_match_should_render_output_dropped_message_on_output_gap_variant() {
-        let exited_msg = chrome_message_for_event(&attach_event::Payload::Exited(true)).unwrap();
+        let exited_msg =
+            chrome_message_for_event(&attach_event::Payload::Exited(ExitStatus { code: None }))
+                .unwrap();
         let gap_msg = chrome_message_for_event(&attach_event::Payload::OutputGap(true)).unwrap();
         assert!(gap_msg.contains("output dropped"));
         assert_ne!(
@@ -1129,6 +1129,7 @@ mod tests {
             rows: 24,
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Live as i32,
+            cwd: String::new(),
         }
     }
 
@@ -1241,6 +1242,7 @@ mod tests {
             rows: 24,
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Dead as i32,
+            cwd: String::new(),
         };
         let err = check_attach_liveness(&pane, "myproject").unwrap_err();
         let msg = err.to_string();
@@ -1261,6 +1263,7 @@ mod tests {
             rows: 24,
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Live as i32,
+            cwd: String::new(),
         };
         assert!(check_attach_liveness(&pane, "myproject").is_ok());
     }

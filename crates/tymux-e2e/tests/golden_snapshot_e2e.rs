@@ -29,6 +29,7 @@ async fn attach_screen_after_deterministic_output_matches_golden_snapshot() {
         .create_session(CreateSessionRequest {
             name: "golden-e2e".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap();

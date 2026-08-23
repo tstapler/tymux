@@ -26,6 +26,7 @@ async fn split_panes_should_render_and_accept_input_independently() {
         .create_session(CreateSessionRequest {
             name: "splits-e2e".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap()

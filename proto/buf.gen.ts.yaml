@@ -1,8 +1,13 @@
 version: v2
 # Rust codegen does NOT go through here — crates/tymux-proto/build.rs calls
 # tonic-build directly against this proto tree, which is the idiomatic path
-# for a Rust service. This file is for *other* language clients (TS, Python,
-# Go, ...) as they show up.
+# for a Rust service. This file is the TypeScript-scoped template; see
+# buf.gen.go.yaml for the Go-scoped template.
+#
+# Split from a single combined buf.gen.yaml (see git history) because `buf
+# generate` fails atomically if any plugin in the template is unresolvable —
+# a bare `buf generate` against a template listing both TS and Go plugins
+# fails in any CI job that only installs one client's toolchain.
 #
 # TS plugin is resolved from clients/ts/node_modules/.bin (local, not a
 # buf.build remote plugin) so generation works offline/in CI without a
@@ -12,6 +17,11 @@ version: v2
 # for connect-es v2.
 inputs:
   - directory: .
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/tstapler/tymux/clients/go/gen
 plugins:
   - local: ../clients/ts/node_modules/.bin/protoc-gen-es
     out: ../clients/ts/gen

@@ -19,6 +19,7 @@ async fn per_action_keybinding_with_different_leader_should_fire() {
         .create_session(CreateSessionRequest {
             name: "keybind-e2e".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap();
@@ -70,6 +71,7 @@ async fn same_second_key_different_leader_should_not_fire() {
         .create_session(CreateSessionRequest {
             name: "keybind-control-e2e".into(),
             command: "/bin/sh".into(),
+            cwd: String::new(),
         })
         .await
         .unwrap();

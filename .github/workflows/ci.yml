@@ -96,12 +96,57 @@ jobs:
       - name: buf generate drift check
         working-directory: proto
         run: |
-          buf generate
+          buf generate --template buf.gen.ts.yaml
           git diff --exit-code -- ../clients/ts/gen
       - working-directory: clients/ts
         run: npm run build
       - working-directory: clients/ts
         run: npm test
+        env:
+          TYMUXD_BIN: ${{ github.workspace }}/target/debug/tymuxd
+
+  go-client:
+    # Phase 5 spec-compliance sweep, Gap 1: clients/go (Epic 1.6) had no CI
+    # coverage at all — the exact class of gap that already bit the TS
+    # client once during Epic 1.6 (a proto change without a regenerated
+    # client, caught only by hand). Mirrors ts-client's buf generate drift
+    # check and its live-daemon integration test (Story 7.2 AC1 pattern),
+    # so this job fails if the generated Go client can't actually talk to a
+    # real tymuxd, not just if it fails to compile.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: bufbuild/buf-setup-action@v1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/go.mod
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: go-client
+      - run: cargo build --bin tymuxd
+      - name: install protoc-gen-go / protoc-gen-connect-go
+        # Pinned to the exact versions already required by clients/go/go.mod
+        # (google.golang.org/protobuf, connectrpc.com/connect) rather than
+        # @latest, so a compromised release of either tool can't be pulled
+        # into a job that carries an ambient GITHUB_TOKEN.
+        run: |
+          GOBIN=${{ github.workspace }}/clients/go/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+          GOBIN=${{ github.workspace }}/clients/go/bin go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.20.0
+      - name: buf generate drift check
+        working-directory: proto
+        run: |
+          buf generate --template buf.gen.go.yaml
+          git diff --exit-code -- ../clients/go/gen
+      - name: go build / go vet / go test
+        working-directory: clients/go
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
         env:
           TYMUXD_BIN: ${{ github.workspace }}/target/debug/tymuxd
 
