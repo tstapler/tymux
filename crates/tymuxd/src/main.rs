@@ -751,10 +751,20 @@ impl TymuxService for TymuxDaemon {
             // this RPC today). Record when, so a pane exit observed shortly
             // after can be flagged as a possible disconnect-survival
             // regression (Task 1.1.2e).
-            disconnect_tracker_for_input
-                .lock()
-                .unwrap()
-                .insert(pane_id, Instant::now());
+            //
+            // Only a genuine mid-session disconnect (pane still running) is
+            // worth tracking — if the pane already exited, no future
+            // wait_exit() will ever fire to consume this entry, so inserting
+            // anyway would leak it for the life of the daemon. A narrow
+            // TOCTOU race remains if the pane exits between this check and
+            // the insert; that's acceptable and matches the tracker's
+            // already-documented best-effort design.
+            if !pane_for_input.is_exited() {
+                disconnect_tracker_for_input
+                    .lock()
+                    .unwrap()
+                    .insert(pane_id, Instant::now());
+            }
             if let Some(window_id) = window_id {
                 engine_for_input.unregister_viewport(window_id, client_id);
                 engine_for_input.recompute_window_geometry(window_id);
@@ -1684,6 +1694,137 @@ mod tests {
             exit_status.expect("expected an Exited event before the stream closed").code,
             Some(0),
             "a plain `exit` should report exit code 0, not an unknown code"
+        );
+    }
+
+    /// ADR-001 regression test: the live `Attach` path (unlike the
+    /// persisted/`CapturePane` path, already covered by
+    /// `capture_pane_should_surface_persisted_exit_code_when_pane_is_dead_and_no_attach_stream_was_ever_reopened`)
+    /// had no test proving a real *nonzero* exit code survives the
+    /// `ExitStatus { code: pane.exit_code() }` send site intact — a
+    /// `.unwrap_or(0)`-style regression there would silently backfill any
+    /// code to `Some(0)`, which is exactly what
+    /// `attach_streams_output_and_signals_exit` above cannot catch, since
+    /// `exit` alone already produces code 0.
+    #[tokio::test]
+    async fn attach_streams_a_nonzero_exit_code_without_backfilling_to_zero() {
+        let daemon = test_daemon();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+        })
+        .await
+        .unwrap();
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Input(b"exit 7\n".to_vec())),
+        })
+        .await
+        .unwrap();
+
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let exit_status = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = inbound.message().await.unwrap() {
+                if let Some(attach_event::Payload::Exited(status)) = event.payload {
+                    return Some(status);
+                }
+            }
+            None
+        })
+        .await
+        .expect("attach stream must close within 5s, not hang");
+
+        assert_eq!(
+            exit_status.expect("expected an Exited event before the stream closed").code,
+            Some(7),
+            "a real nonzero exit code must round-trip through the live Attach path, not be \
+             backfilled to 0 or lost"
+        );
+    }
+
+    /// Companion regression test for the fix described on
+    /// `close_pane_should_purge_disconnect_tracker_entry_it_left_behind`
+    /// below: that test covers the *explicit close/kill* purge path, but
+    /// the dominant real-world exit path is a pane exiting normally while a
+    /// client is still attached (e.g. this test's plain `exit`), with no
+    /// explicit `ClosePane`/`KillSession` call ever following. Before the
+    /// fix, `attach()`'s `input_handle` task unconditionally inserted a
+    /// `disconnect_tracker` entry when the request stream ended — even
+    /// though the pane had, by then, already exited and can never exit
+    /// again to trigger the one path (`warn_if_exit_follows_disconnect`)
+    /// that would have removed it. That leaked one entry per such pane for
+    /// the life of the daemon. Drives a real live `Attach` stream through a
+    /// normal exit (not an abrupt client disconnect) and asserts no
+    /// `disconnect_tracker` entry survives.
+    #[tokio::test]
+    async fn attach_should_not_leak_disconnect_tracker_entry_when_pane_exits_normally_while_attached()
+     {
+        let daemon = test_daemon();
+        let disconnect_tracker = daemon.disconnect_tracker.clone();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let pane_uuid = parse_uuid(&pane_id).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+        })
+        .await
+        .unwrap();
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
+        })
+        .await
+        .unwrap();
+
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let saw_exit = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = inbound.message().await.unwrap() {
+                if matches!(event.payload, Some(attach_event::Payload::Exited(_))) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("attach stream must close within 5s, not hang");
+        assert!(saw_exit, "expected an Exited event before the stream closed");
+
+        // Ends the request stream, so `input_handle`'s reader loop returns
+        // and runs its (now-guarded) disconnect_tracker insert. Give the
+        // background task a moment to actually run before asserting.
+        drop(tx);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !disconnect_tracker.lock().unwrap().contains_key(&pane_uuid),
+            "a pane that already exited before its Attach stream closed must not leave a \
+             disconnect_tracker entry behind — no future pane exit will ever occur to purge it, \
+             so it would leak for the life of the daemon"
         );
     }
 
