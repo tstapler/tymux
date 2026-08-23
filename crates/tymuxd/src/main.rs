@@ -116,6 +116,33 @@ fn orientation_from_proto(o: i32) -> Result<CoreOrientation, Status> {
     }
 }
 
+/// Collects every leaf pane id in a layout (Task 1.1.2e follow-up: needed
+/// so `kill_session` can purge `disconnect_tracker` entries for every pane
+/// the session is about to take with it — see `purge_disconnect_tracker`).
+fn collect_leaf_pane_ids(layout: &CoreLayout, out: &mut Vec<Uuid>) {
+    match layout {
+        CoreLayout::Leaf(info) => out.push(info.id),
+        CoreLayout::Split { children, .. } => {
+            for (child, _ratio) in children {
+                collect_leaf_pane_ids(child, out);
+            }
+        }
+    }
+}
+
+/// Removes `pane_id`'s entry from `disconnect_tracker`, if any (Task
+/// 1.1.2e follow-up / Phase 6 idiom review fix). Without this, a pane that
+/// is detached from and then deliberately closed/killed — rather than
+/// exiting on its own, which is the only other path that clears the entry
+/// via `warn_if_exit_follows_disconnect` — leaves a permanent entry behind:
+/// `Uuid`s are never reused, so every such pane leaks one `(Uuid, Instant)`
+/// for the life of the daemon. Called from both `close_pane` and
+/// `kill_session` so a deliberate removal always clears the bookkeeping
+/// regardless of which path took the pane down.
+fn purge_disconnect_tracker(tracker: &Mutex<HashMap<Uuid, Instant>>, pane_id: Uuid) {
+    tracker.lock().unwrap().remove(&pane_id);
+}
+
 fn layout_snapshot_to_proto(layout: &CoreLayout) -> ProtoLayout {
     use tymux_proto::v1::layout::Node;
     let node = match layout {
@@ -375,10 +402,23 @@ impl TymuxService for TymuxDaemon {
         request: Request<KillSessionRequest>,
     ) -> Result<Response<KillSessionResponse>, Status> {
         let id = parse_uuid(&request.into_inner().session_id)?;
+        // Gathered before kill_session removes the session from the
+        // engine's active state — this is the only chance to learn which
+        // panes are going away, so disconnect_tracker's per-pane entries
+        // can be purged too (see purge_disconnect_tracker).
+        let mut pane_ids = Vec::new();
+        if let Some(snapshot) = self.engine.session_snapshot(id) {
+            for window in &snapshot.windows {
+                collect_leaf_pane_ids(&window.layout, &mut pane_ids);
+            }
+        }
         self.engine.kill_session(id).map_err(|e| {
             tracing::warn!(session_id = %id, error = %e, "kill_session: no such session");
             Status::not_found(e.to_string())
         })?;
+        for pane_id in pane_ids {
+            purge_disconnect_tracker(&self.disconnect_tracker, pane_id);
+        }
         tracing::info!(session_id = %id, "session killed");
         Ok(Response::new(KillSessionResponse {}))
     }
@@ -477,6 +517,7 @@ impl TymuxService for TymuxDaemon {
             .engine
             .close_pane(pane_id)
             .map_err(engine_error_to_status)?;
+        purge_disconnect_tracker(&self.disconnect_tracker, pane_id);
         tracing::info!(pane_id = %pane_id, window_closed = outcome.window_closed.is_some(), session_closed = outcome.session_closed.is_some(), "pane closed");
         Ok(Response::new(ClosePaneResponse {
             window_closed_id: outcome
@@ -1752,6 +1793,88 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// Phase 6 idiom review fix: before this, `disconnect_tracker`'s only
+    /// removal path was `warn_if_exit_follows_disconnect`, reached only
+    /// from the *same* `Attach` call's `forward_handle` task observing
+    /// `pane.wait_exit()`. If that task had already ended (e.g. the
+    /// client's whole connection dropped, failing an in-flight
+    /// `forward_tx.send()`) before the pane was deliberately closed, no
+    /// task was left to ever call it again — a permanent leak, since
+    /// `Uuid`s are never reused. Simulates the detach directly (an insert
+    /// identical in shape to the one `attach()`'s `input_handle` task
+    /// performs) so the test is deterministic rather than racing a real
+    /// subprocess exit against a dropped gRPC stream.
+    #[tokio::test]
+    async fn close_pane_should_purge_disconnect_tracker_entry_it_left_behind() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+
+        daemon
+            .disconnect_tracker
+            .lock()
+            .unwrap()
+            .insert(pane_id, Instant::now());
+
+        daemon
+            .close_pane(Request::new(ClosePaneRequest {
+                pane_id: pane_id.to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !daemon
+                .disconnect_tracker
+                .lock()
+                .unwrap()
+                .contains_key(&pane_id),
+            "close_pane must purge the disconnect_tracker entry for the pane it closed, or it \
+             leaks for the life of the daemon (Uuids are never reused)"
+        );
+    }
+
+    /// Same leak as above, via the other deliberate-removal path:
+    /// `kill_session` takes every pane in the session with it, so it must
+    /// purge a `disconnect_tracker` entry for each one, not just the pane
+    /// a caller happens to name directly.
+    #[tokio::test]
+    async fn kill_session_should_purge_disconnect_tracker_entries_it_left_behind() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let session_id = session.id.clone();
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+
+        daemon
+            .disconnect_tracker
+            .lock()
+            .unwrap()
+            .insert(pane_id, Instant::now());
+
+        daemon
+            .kill_session(Request::new(KillSessionRequest { session_id }))
+            .await
+            .unwrap();
+
+        assert!(
+            !daemon
+                .disconnect_tracker
+                .lock()
+                .unwrap()
+                .contains_key(&pane_id),
+            "kill_session must purge disconnect_tracker entries for every pane it kills, or \
+             they leak for the life of the daemon"
+        );
     }
 
     #[tokio::test]
