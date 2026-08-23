@@ -105,6 +105,40 @@ jobs:
         env:
           TYMUXD_BIN: ${{ github.workspace }}/target/debug/tymuxd
 
+  go-client:
+    # Phase 5 spec-compliance sweep, Gap 1: clients/go (Epic 1.6) had no CI
+    # coverage at all — the exact class of gap that already bit the TS
+    # client once during Epic 1.6 (a proto change without a regenerated
+    # client, caught only by hand). Mirrors ts-client's buf generate drift
+    # check, plus a build/vet step so the module itself is compiled on
+    # every PR.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: bufbuild/buf-setup-action@v1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/go.mod
+      - name: install protoc-gen-go / protoc-gen-connect-go
+        run: |
+          GOBIN=${{ github.workspace }}/clients/go/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          GOBIN=${{ github.workspace }}/clients/go/bin go install connectrpc.com/connect/cmd/protoc-gen-connect-go@latest
+      - name: buf generate drift check
+        working-directory: proto
+        run: |
+          buf generate
+          git diff --exit-code -- ../clients/go/gen
+      - name: go build / go vet / go test
+        working-directory: clients/go
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
   tag-version-check:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
