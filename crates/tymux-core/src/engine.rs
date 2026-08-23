@@ -1167,7 +1167,9 @@ mod tests {
     #[test]
     fn report_viewport_and_recompute_should_clamp_degenerate_zero_size_to_minimum_floor() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let sessions = engine.list_sessions();
         let window_id = sessions.iter().find(|s| s.id == id).unwrap().windows[0].id;
         let pane_id = sole_pane_id(sessions.iter().find(|s| s.id == id).unwrap());
@@ -1197,7 +1199,9 @@ mod tests {
     #[test]
     fn create_and_list_session() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
 
         let sessions = engine.list_sessions();
         assert_eq!(sessions.len(), 1);
@@ -1209,8 +1213,12 @@ mod tests {
     #[test]
     fn multiple_sessions_are_independent() {
         let engine = Engine::new();
-        let id1 = engine.create_session("one".to_string(), sh(), None).unwrap();
-        let id2 = engine.create_session("two".to_string(), sh(), None).unwrap();
+        let id1 = engine
+            .create_session("one".to_string(), sh(), None)
+            .unwrap();
+        let id2 = engine
+            .create_session("two".to_string(), sh(), None)
+            .unwrap();
 
         let sessions = engine.list_sessions();
         assert_eq!(sessions.len(), 2);
@@ -1226,9 +1234,15 @@ mod tests {
     #[test]
     fn session_snapshot_should_return_matching_session_when_id_exists_among_many_sessions() {
         let engine = Engine::new();
-        let id1 = engine.create_session("one".to_string(), sh(), None).unwrap();
-        let id2 = engine.create_session("two".to_string(), sh(), None).unwrap();
-        let id3 = engine.create_session("three".to_string(), sh(), None).unwrap();
+        let id1 = engine
+            .create_session("one".to_string(), sh(), None)
+            .unwrap();
+        let id2 = engine
+            .create_session("two".to_string(), sh(), None)
+            .unwrap();
+        let id3 = engine
+            .create_session("three".to_string(), sh(), None)
+            .unwrap();
 
         let snapshot = engine
             .session_snapshot(id2)
@@ -1248,9 +1262,15 @@ mod tests {
     #[test]
     fn session_snapshot_should_return_none_when_session_id_is_unknown() {
         let engine = Engine::new();
-        engine.create_session("one".to_string(), sh(), None).unwrap();
-        engine.create_session("two".to_string(), sh(), None).unwrap();
-        engine.create_session("three".to_string(), sh(), None).unwrap();
+        engine
+            .create_session("one".to_string(), sh(), None)
+            .unwrap();
+        engine
+            .create_session("two".to_string(), sh(), None)
+            .unwrap();
+        engine
+            .create_session("three".to_string(), sh(), None)
+            .unwrap();
 
         assert!(engine.session_snapshot(Uuid::new_v4()).is_none());
     }
@@ -1258,7 +1278,9 @@ mod tests {
     #[test]
     fn kill_session_removes_it() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         assert_eq!(engine.list_sessions().len(), 1);
 
         engine.kill_session(id).unwrap();
@@ -1275,7 +1297,9 @@ mod tests {
     #[test]
     fn pane_lookup_should_return_live_when_pane_process_still_running() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1299,7 +1323,9 @@ mod tests {
     #[test]
     fn pane_lookup_should_return_dead_when_pane_process_exited_but_record_exists() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1325,7 +1351,9 @@ mod tests {
     #[test]
     fn split_pane_should_produce_two_leaf_window() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1355,7 +1383,9 @@ mod tests {
     #[test]
     fn close_pane_should_collapse_split_when_sibling_closes() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_a = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1384,7 +1414,9 @@ mod tests {
     #[test]
     fn close_pane_should_close_session_when_last_pane_in_last_window() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1403,7 +1435,9 @@ mod tests {
     #[test]
     fn create_window_adds_a_second_window() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let snapshot = engine.create_window(id, sh()).unwrap();
         assert_eq!(snapshot.windows.len(), 2);
         assert_eq!(snapshot.windows[1].name, "1");
@@ -1412,7 +1446,9 @@ mod tests {
     #[test]
     fn report_viewport_should_apply_dimension_wise_minimum_across_two_clients() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let window_id = engine
             .list_sessions()
             .into_iter()
@@ -1448,7 +1484,9 @@ mod tests {
     fn recompute_window_geometry_should_match_live_pane_by_id_not_position_when_window_has_dead_and_live_panes(
     ) {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_a = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1721,7 +1759,9 @@ mod tests {
             std::env::temp_dir().join(format!("tymux-revive-test-{}", Uuid::new_v4()));
         let backend = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
         let engine = Engine::with_persistence(Box::new(backend));
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let pane_id = sole_pane_id(
             &engine
                 .list_sessions()
@@ -1784,7 +1824,9 @@ mod tests {
             std::env::temp_dir().join(format!("tymux-revive-test-{}", Uuid::new_v4()));
         let backend = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
         let engine = Engine::with_persistence(Box::new(backend));
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
 
         for _ in 0..2 {
             let backend =
@@ -1809,7 +1851,9 @@ mod tests {
     #[test]
     fn revive_session_on_already_live_session_returns_already_live_outcome() {
         let engine = Engine::new();
-        let id = engine.create_session("test".to_string(), sh(), None).unwrap();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
         let outcome = engine.revive_session(id).unwrap();
         assert_eq!(outcome, ReviveOutcome::AlreadyLive);
     }

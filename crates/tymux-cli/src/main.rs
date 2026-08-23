@@ -914,8 +914,8 @@ fn spawn_resize_watcher() -> tokio::sync::mpsc::Receiver<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tymux_proto::v1::ExitStatus;
     use clap::CommandFactory;
+    use tymux_proto::v1::ExitStatus;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("tymux").chain(args.iter().copied())).unwrap()
@@ -958,10 +958,8 @@ mod tests {
     #[test]
     fn attach_event_match_should_render_output_dropped_message_on_output_gap_variant() {
         let exited_msg =
-            chrome_message_for_event(&attach_event::Payload::Exited(ExitStatus {
-                code: None,
-            }))
-            .unwrap();
+            chrome_message_for_event(&attach_event::Payload::Exited(ExitStatus { code: None }))
+                .unwrap();
         let gap_msg = chrome_message_for_event(&attach_event::Payload::OutputGap(true)).unwrap();
         assert!(gap_msg.contains("output dropped"));
         assert_ne!(

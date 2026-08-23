@@ -1078,8 +1078,7 @@ mod tests {
         let daemon = test_daemon();
         let engine = daemon.engine.clone();
 
-        let tmp_dir =
-            std::env::temp_dir().join(format!("tymux-cwd-test-{}", Uuid::new_v4()));
+        let tmp_dir = std::env::temp_dir().join(format!("tymux-cwd-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         // Canonicalize so a symlinked temp dir (e.g. macOS's /tmp ->
         // /private/tmp) can't make the shell's real `pwd` output disagree
@@ -1430,12 +1429,20 @@ mod tests {
         let snapshot_seq = 10u64;
 
         assert_eq!(
-            forward_step_for_output_result(Ok((10, b"already-in-snapshot".to_vec())), pane_id, snapshot_seq),
+            forward_step_for_output_result(
+                Ok((10, b"already-in-snapshot".to_vec())),
+                pane_id,
+                snapshot_seq
+            ),
             ForwardStep::Skip,
             "a chunk at exactly the snapshot's sequence must be dropped, not forwarded"
         );
         assert_eq!(
-            forward_step_for_output_result(Ok((3, b"predates-snapshot".to_vec())), pane_id, snapshot_seq),
+            forward_step_for_output_result(
+                Ok((3, b"predates-snapshot".to_vec())),
+                pane_id,
+                snapshot_seq
+            ),
             ForwardStep::Skip,
             "a chunk older than the snapshot's sequence must be dropped, not forwarded"
         );
@@ -1691,7 +1698,9 @@ mod tests {
         .expect("attach stream must close within 5s, not hang");
 
         assert_eq!(
-            exit_status.expect("expected an Exited event before the stream closed").code,
+            exit_status
+                .expect("expected an Exited event before the stream closed")
+                .code,
             Some(0),
             "a plain `exit` should report exit code 0, not an unknown code"
         );
@@ -1748,7 +1757,9 @@ mod tests {
         .expect("attach stream must close within 5s, not hang");
 
         assert_eq!(
-            exit_status.expect("expected an Exited event before the stream closed").code,
+            exit_status
+                .expect("expected an Exited event before the stream closed")
+                .code,
             Some(7),
             "a real nonzero exit code must round-trip through the live Attach path, not be \
              backfilled to 0 or lost"
@@ -1770,8 +1781,8 @@ mod tests {
     /// normal exit (not an abrupt client disconnect) and asserts no
     /// `disconnect_tracker` entry survives.
     #[tokio::test]
-    async fn attach_should_not_leak_disconnect_tracker_entry_when_pane_exits_normally_while_attached()
-     {
+    async fn attach_should_not_leak_disconnect_tracker_entry_when_pane_exits_normally_while_attached(
+    ) {
         let daemon = test_daemon();
         let disconnect_tracker = daemon.disconnect_tracker.clone();
         let mut client = spawn_test_server(daemon).await;
@@ -1812,7 +1823,10 @@ mod tests {
         })
         .await
         .expect("attach stream must close within 5s, not hang");
-        assert!(saw_exit, "expected an Exited event before the stream closed");
+        assert!(
+            saw_exit,
+            "expected an Exited event before the stream closed"
+        );
 
         // Ends the request stream, so `input_handle`'s reader loop returns
         // and runs its (now-guarded) disconnect_tracker insert. Give the

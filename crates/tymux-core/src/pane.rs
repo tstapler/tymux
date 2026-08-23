@@ -781,8 +781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_code_should_return_some_code_when_reader_thread_observes_eof_and_waits_nonzero()
-    {
+    async fn exit_code_should_return_some_code_when_reader_thread_observes_eof_and_waits_nonzero() {
         let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
         pane.write_input(b"exit 42\n").unwrap();
 
