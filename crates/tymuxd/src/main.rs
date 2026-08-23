@@ -793,19 +793,24 @@ fn log_detach_controlling_terminal_outcome(result: Result<i32, i32>) {
 /// whatever the old process became (see that function's doc comment for
 /// the accepted trade-off this metric exists to make visible instead).
 ///
-/// `PersistedPaneRecord` carries no explicit liveness flag or exit code
-/// (that's Story 1.2.4's schema addition, not part of this epic):
-/// `PersistedLayoutNode::from_live` only fills in `command`/`cwd`/size for
-/// a pane that was `PaneEntry::Live` at the moment it was last persisted; a
-/// dead pane's record round-trips as empty strings. So a non-empty
-/// `command` at load time is the best proxy this schema can offer for "was
-/// last known to be Live, with no confirmed exit recorded" — a record
-/// counted here may in fact have already exited cleanly before the
-/// restart, so this is an upper bound, not a guarantee.
+/// `PersistedPaneRecord` carries no explicit liveness flag: `PersistedLayoutNode::from_live`
+/// only fills in `command`/`cwd`/size for a pane that was `PaneEntry::Live` at the moment it
+/// was last persisted; a dead pane's record round-trips as empty strings. So a non-empty
+/// `command` at load time is the best proxy this schema can offer for "was last known to be
+/// Live". Story 1.2.4 added `exit_code`, which is populated at the same persist that would
+/// otherwise make this look like an orphan once the pane has actually exited — a leaf with a
+/// recorded `exit_code` (`Some(_)`) has a confirmed fate and must NOT be counted, even though
+/// its `command` is still non-empty (the record isn't blanked on exit, only on the
+/// `Live -> Dead` transition). Only `command` non-empty AND `exit_code: None` means "last known
+/// to be Live, with no confirmed exit recorded" — a record counted here may in fact have
+/// already exited cleanly before the restart without that exit ever being captured, so this
+/// is an upper bound, not a guarantee.
 fn count_orphan_candidates(records: &[tymux_core::PersistedSessionRecord]) -> usize {
     fn count_node(node: &PersistedLayoutNode) -> usize {
         match node {
-            PersistedLayoutNode::Leaf { pane } => usize::from(!pane.command.is_empty()),
+            PersistedLayoutNode::Leaf { pane } => {
+                usize::from(!pane.command.is_empty() && pane.exit_code.is_none())
+            }
             PersistedLayoutNode::Split { children, .. } => {
                 children.iter().map(|(c, _)| count_node(c)).sum()
             }
@@ -2197,5 +2202,44 @@ mod tests {
         };
 
         assert_eq!(count_orphan_candidates(&[record]), 1);
+    }
+
+    #[test]
+    fn count_orphan_candidates_should_not_count_leaves_with_a_recorded_exit_code() {
+        use tymux_core::{
+            PersistedLayoutNode, PersistedPaneRecord, PersistedSessionRecord,
+            PersistedWindowRecord, CURRENT_SCHEMA_VERSION,
+        };
+
+        // Story 1.2.4b persists `exit_code` on a still-`Live`-in-name pane the
+        // moment its process is observed to have exited, before the entry
+        // fully transitions to `PaneEntry::Dead`. Such a leaf still has a
+        // nonempty `command` (it isn't blanked until the Live -> Dead
+        // transition) but its fate IS known — it must not be counted as an
+        // orphan candidate, unlike the true-unknown-fate case covered by
+        // `count_orphan_candidates_should_count_leaves_with_nonempty_command_as_orphan_candidates`.
+        let exited_leaf = PersistedLayoutNode::Leaf {
+            pane: PersistedPaneRecord {
+                pane_id: Uuid::new_v4(),
+                command: "/bin/sh".to_string(),
+                cwd: "/tmp".to_string(),
+                rows: 24,
+                cols: 80,
+                exit_code: Some(0),
+            },
+        };
+        let record = PersistedSessionRecord {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            session_id: Uuid::new_v4(),
+            name: "test".to_string(),
+            windows: vec![PersistedWindowRecord {
+                id: Uuid::new_v4(),
+                name: "win-exited".to_string(),
+                layout: exited_leaf,
+            }],
+            active_window_id: Uuid::new_v4(),
+        };
+
+        assert_eq!(count_orphan_candidates(&[record]), 0);
     }
 }
