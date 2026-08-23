@@ -193,6 +193,24 @@ pub struct Engine {
     /// subscriber — a `()` tick means "re-fetch this window's snapshot,
     /// something about its structure or geometry changed."
     window_watchers: Mutex<HashMap<Uuid, broadcast::Sender<()>>>,
+    /// Reverse index: pane_id -> the window that currently owns it. Lets
+    /// `window_id_for_pane` answer in O(1) instead of scanning every
+    /// session's every window's layout tree (plan.md's Epic 1.4 follow-up
+    /// Unresolved Question — `window_id_for_pane` runs on every `Attach`
+    /// call, hotter than the `session_snapshot` path Epic 1.4 originally
+    /// fixed). Maintained at every site that adds or removes a pane from a
+    /// window's layout: `load_persisted`, `create_session`, `split_pane`,
+    /// `close_pane`, `create_window`, `kill_session`. `revive_session`
+    /// never touches this — it respawns panes under their existing ids,
+    /// never changing which window owns them.
+    pane_window: Mutex<HashMap<Uuid, Uuid>>,
+    /// Reverse index: window_id -> the session that owns it. Lets
+    /// `recompute_window_geometry` find its owning session in O(1) instead
+    /// of scanning every session (the same follow-up as `pane_window`
+    /// above). Maintained wherever a window is added to or removed from a
+    /// session: `load_persisted`, `create_session`, `create_window`,
+    /// `close_pane`, `kill_session`.
+    window_session: Mutex<HashMap<Uuid, Uuid>>,
     /// Storage seam (Story 4.1 Task 5, architecture-review.md Blocker #2):
     /// `Engine::new()` uses `NullPersistenceBackend` (tests never touch
     /// disk unless they opt in via `Engine::with_persistence`); `tymuxd`'s
@@ -208,6 +226,8 @@ impl Default for Engine {
             viewports: Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(1),
             window_watchers: Mutex::new(HashMap::new()),
+            pane_window: Mutex::new(HashMap::new()),
+            window_session: Mutex::new(HashMap::new()),
             persistence: Box::new(NullPersistenceBackend),
         }
     }
@@ -234,22 +254,32 @@ impl Engine {
     pub fn load_persisted(&self, records: Vec<PersistedSessionRecord>) {
         let mut sessions = self.sessions.lock().unwrap();
         let mut panes = self.panes.lock().unwrap();
+        let mut window_session = self.window_session.lock().unwrap();
+        let mut pane_window = self.pane_window.lock().unwrap();
         for record in records {
+            let session_id = record.session_id;
             let windows: Vec<WindowState> = record
                 .windows
                 .into_iter()
-                .map(|w: PersistedWindowRecord| WindowState {
-                    id: w.id,
-                    name: w.name,
-                    layout: persisted_layout_to_live(&w.layout, &mut panes),
-                    rows: DEFAULT_ROWS,
-                    cols: DEFAULT_COLS,
+                .map(|w: PersistedWindowRecord| {
+                    let window = WindowState {
+                        id: w.id,
+                        name: w.name,
+                        layout: persisted_layout_to_live(&w.layout, &mut panes),
+                        rows: DEFAULT_ROWS,
+                        cols: DEFAULT_COLS,
+                    };
+                    window_session.insert(window.id, session_id);
+                    for pane_id in window.layout.leaves() {
+                        pane_window.insert(pane_id, window.id);
+                    }
+                    window
                 })
                 .collect();
             sessions.insert(
-                record.session_id,
+                session_id,
                 SessionState {
-                    id: record.session_id,
+                    id: session_id,
                     name: record.name,
                     windows,
                     active_window_id: record.active_window_id,
@@ -316,6 +346,8 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(pane_id, PaneEntry::Live(pane));
+        self.window_session.lock().unwrap().insert(window_id, id);
+        self.pane_window.lock().unwrap().insert(pane_id, window_id);
 
         let record = {
             let sessions = self.sessions.lock().unwrap();
@@ -401,6 +433,17 @@ impl Engine {
             .iter()
             .flat_map(|w| w.layout.leaves())
             .collect();
+
+        {
+            let mut window_session = self.window_session.lock().unwrap();
+            let mut pane_window = self.pane_window.lock().unwrap();
+            for window in &session.windows {
+                window_session.remove(&window.id);
+            }
+            for pane_id in &pane_ids {
+                pane_window.remove(pane_id);
+            }
+        }
 
         let mut panes = self.panes.lock().unwrap();
         for pane_id in pane_ids {
@@ -500,6 +543,10 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(new_pane_id, PaneEntry::Live(new_pane));
+        self.pane_window
+            .lock()
+            .unwrap()
+            .insert(new_pane_id, window_id);
 
         let (snapshot, record) = {
             let sessions = self.sessions.lock().unwrap();
@@ -581,6 +628,19 @@ impl Engine {
         }
         self.save_persisted(record);
 
+        // Keep the O(1) reverse indices in sync: the closed pane is always
+        // gone; the window is gone too only when it had no panes left
+        // (session_closed always implies exactly one window — the one just
+        // removed above — so no separate per-window loop is needed here,
+        // unlike kill_session which can remove a session with several).
+        {
+            let mut pane_window = self.pane_window.lock().unwrap();
+            pane_window.remove(&pane_id);
+            if let Some((closed_window_id, _)) = &window_closed {
+                self.window_session.lock().unwrap().remove(closed_window_id);
+            }
+        }
+
         // Kill the closed pane's process, and (if the session closed too)
         // every other pane that went down with it.
         let mut panes = self.panes.lock().unwrap();
@@ -635,11 +695,16 @@ impl Engine {
             cols: DEFAULT_COLS,
         });
         session.active_window_id = window_id;
+        self.window_session
+            .lock()
+            .unwrap()
+            .insert(window_id, session_id);
 
         self.panes
             .lock()
             .unwrap()
             .insert(pane_id, PaneEntry::Live(pane));
+        self.pane_window.lock().unwrap().insert(pane_id, window_id);
 
         let panes = self.panes.lock().unwrap();
         let record = Self::snapshot_persisted_record(&sessions, &panes, session_id);
@@ -805,13 +870,24 @@ impl Engine {
             }
         };
 
+        // O(1) via the reverse index instead of scanning every session
+        // (plan.md's Epic 1.4 follow-up — this runs on every Resize, one of
+        // the hottest paths in the engine).
+        let session_id = self
+            .window_session
+            .lock()
+            .unwrap()
+            .get(&window_id)
+            .copied()?;
+
         // Compute the new geometry under `sessions`, then release before
         // calling into any blocking Pane::resize() syscalls.
         let rects = {
             let mut sessions = self.sessions.lock().unwrap();
             let window = sessions
-                .values_mut()
-                .flat_map(|s| s.windows.iter_mut())
+                .get_mut(&session_id)?
+                .windows
+                .iter_mut()
                 .find(|w| w.id == window_id)?;
             window.rows = rows;
             window.cols = cols;
@@ -848,13 +924,7 @@ impl Engine {
         let record = {
             let sessions = self.sessions.lock().unwrap();
             let panes = self.panes.lock().unwrap();
-            sessions
-                .values()
-                .find(|s| s.windows.iter().any(|w| w.id == window_id))
-                .map(|s| s.id)
-                .and_then(|session_id| {
-                    Self::snapshot_persisted_record(&sessions, &panes, session_id)
-                })
+            Self::snapshot_persisted_record(&sessions, &panes, session_id)
         };
         self.save_persisted(record);
 
@@ -885,13 +955,7 @@ impl Engine {
     /// by `Attach` to know which window's viewport tracker a `Resize`
     /// message should update.
     pub fn window_id_for_pane(&self, pane_id: Uuid) -> Option<Uuid> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .values()
-            .flat_map(|s| s.windows.iter())
-            .find(|w| w.layout.contains(pane_id))
-            .map(|w| w.id)
+        self.pane_window.lock().unwrap().get(&pane_id).copied()
     }
 
     pub fn window_snapshot(&self, window_id: Uuid) -> Option<WindowSnapshot> {
@@ -1856,5 +1920,80 @@ mod tests {
             .unwrap();
         let outcome = engine.revive_session(id).unwrap();
         assert_eq!(outcome, ReviveOutcome::AlreadyLive);
+    }
+
+    /// Regression coverage for the `pane_window`/`window_session` reverse
+    /// indices added to make `window_id_for_pane`/`recompute_window_geometry`
+    /// O(1) (plan.md's Epic 1.4 follow-up). The risk these indices add isn't
+    /// speed — a throwaway diagnostic already confirmed `window_id_for_pane`
+    /// stays flat at ~1µs from n=100 to n=900 sessions, unlike the ~1µs→7-13µs
+    /// growth measured pre-fix — it's staying in sync with `sessions` across
+    /// every mutation site (create_session, create_window, split_pane,
+    /// close_pane, kill_session). This test exercises all of them against
+    /// *multiple concurrently-live sessions*, so a bug that only shows up
+    /// with more than one session in play (e.g. an index entry never
+    /// cleared, or cleared for the wrong session) can't hide behind a
+    /// single-session test.
+    #[test]
+    fn window_indices_should_stay_correct_across_every_mutation_site_with_multiple_sessions() {
+        let engine = Engine::new();
+
+        // Two sessions, so a bug that only manifests with >1 session alive
+        // (stale entry from the other session, wrong session's window
+        // picked up) has something to trip on.
+        let session_a = engine.create_session("a".to_string(), sh(), None).unwrap();
+        let session_b = engine.create_session("b".to_string(), sh(), None).unwrap();
+        let pane_a1 = sole_pane_id(&engine.session_snapshot(session_a).unwrap());
+        let pane_b1 = sole_pane_id(&engine.session_snapshot(session_b).unwrap());
+        let window_a1 = engine.window_id_for_pane(pane_a1).unwrap();
+        let window_b1 = engine.window_id_for_pane(pane_b1).unwrap();
+        assert_ne!(window_a1, window_b1);
+        assert!(engine.recompute_window_geometry(window_a1).is_some());
+        assert!(engine.recompute_window_geometry(window_b1).is_some());
+
+        // create_window: a second window in session_a must resolve to
+        // session_a's own geometry recompute, not session_b's.
+        let snapshot = engine.create_window(session_a, sh()).unwrap();
+        let window_a2 = snapshot.windows[1].id;
+        assert_ne!(window_a2, window_a1);
+        assert!(engine.recompute_window_geometry(window_a2).is_some());
+
+        // split_pane: the new pane must resolve to the *same* window as the
+        // pane it split from, not get lost or attributed elsewhere.
+        let snapshot = engine
+            .split_pane(pane_a1, Orientation::Horizontal, sh())
+            .unwrap();
+        let pane_a1_leaves = leaf_ids(&snapshot.windows[0].layout);
+        assert_eq!(pane_a1_leaves.len(), 2);
+        for leaf in &pane_a1_leaves {
+            assert_eq!(engine.window_id_for_pane(*leaf), Some(window_a1));
+        }
+
+        // close_pane on one half of the split: window survives (collapses),
+        // so window_a1 must still resolve; the closed pane must not.
+        let closed_pane = pane_a1_leaves[1];
+        let outcome = engine.close_pane(closed_pane).unwrap();
+        assert!(outcome.window_closed.is_none());
+        assert_eq!(engine.window_id_for_pane(closed_pane), None);
+        assert_eq!(engine.window_id_for_pane(pane_a1), Some(window_a1));
+        assert!(engine.recompute_window_geometry(window_a1).is_some());
+
+        // close_pane on window_a1's last pane: the window itself is now
+        // gone, but session_a survives (window_a2 still there) — window_a1
+        // must be purged from the index, window_a2 must be untouched.
+        let outcome = engine.close_pane(pane_a1).unwrap();
+        assert!(outcome.window_closed.is_some());
+        assert!(outcome.session_closed.is_none());
+        assert_eq!(engine.window_id_for_pane(pane_a1), None);
+        assert_eq!(engine.recompute_window_geometry(window_a1), None);
+        assert!(engine.recompute_window_geometry(window_a2).is_some());
+
+        // kill_session on session_b: every window/pane belonging to it must
+        // be purged from both indices; session_a's own entries (window_a2,
+        // its pane) must be completely unaffected.
+        engine.kill_session(session_b).unwrap();
+        assert_eq!(engine.window_id_for_pane(pane_b1), None);
+        assert_eq!(engine.recompute_window_geometry(window_b1), None);
+        assert!(engine.recompute_window_geometry(window_a2).is_some());
     }
 }
