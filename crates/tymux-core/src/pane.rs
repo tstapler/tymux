@@ -7,6 +7,10 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
 
+use crate::replay_buffer::{
+    allocate_replay_budget, release_replay_budget, ReplayBuffer, ReplayOutcome,
+};
+
 /// Epic 5 Story 5.4: vt100's third `Parser::new` arg (how many
 /// scrolled-off lines it keeps) is now a real per-pane budget, not the
 /// placeholder `0` from before copy-mode/scrollback existed. The exact
@@ -100,6 +104,19 @@ pub struct Pane {
     /// This pane's granted share of `GLOBAL_SCROLLBACK_BUDGET_LINES` —
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
+    /// Epic 2.1: bounded, byte-budgeted log of recent output chunks,
+    /// populated in the reader thread's read loop strictly *after*
+    /// `parser`'s lock is dropped and *before* `output_tx.send` — a
+    /// standalone lock, never nested with `parser` (Pattern Decisions:
+    /// "Replay-buffer locking"), so a resuming reader's buffer-tail read
+    /// can never disagree with what a live subscriber has already
+    /// received.
+    replay: Mutex<ReplayBuffer>,
+    /// This pane's granted share of `GLOBAL_REPLAY_BUFFER_BUDGET_BYTES` —
+    /// released back to the budget on `Drop`. Stored separately from
+    /// `replay` (which only tracks its own ceiling internally) so `Drop`
+    /// can read the granted amount back out without locking `replay`.
+    replay_budget_bytes: usize,
     output_tx: broadcast::Sender<(u64, Vec<u8>)>,
     /// Monotonic count of pty-read chunks fed into `parser` so far (Task
     /// 1.3.1a / ADR-003 Amendment). Incremented in the reader thread in
@@ -203,6 +220,7 @@ impl Pane {
         let scrollback_lines = allocate_scrollback_budget();
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback_lines)));
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
+        let replay_budget_bytes = allocate_replay_budget();
 
         let effective_cwd = cwd.map(str::to_string).unwrap_or_else(|| {
             std::env::current_dir()
@@ -219,6 +237,8 @@ impl Pane {
             rows: AtomicU32::new(rows as u32),
             cols: AtomicU32::new(cols as u32),
             scrollback_lines,
+            replay: Mutex::new(ReplayBuffer::new(replay_budget_bytes)),
+            replay_budget_bytes,
             output_tx: output_tx.clone(),
             output_seq: AtomicU64::new(0),
             exited: AtomicBool::new(false),
@@ -248,6 +268,12 @@ impl Pane {
                             parser.process(&buf[..n]);
                             pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst) + 1
                         };
+                        // Epic 2.1: pushed into the replay buffer strictly
+                        // *before* the broadcast send below, and on a
+                        // standalone lock never nested with `parser`
+                        // (already dropped above) — see the `replay`
+                        // field's doc comment.
+                        pane_for_reader.replay.lock().unwrap().push(seq, &buf[..n]);
                         // Fails only when nobody is currently attached (no
                         // receivers) — expected and benign (e.g. shell
                         // startup output before the first Attach), not an
@@ -356,6 +382,19 @@ impl Pane {
     /// replayed on top of it (ADR-003 Amendment).
     pub fn subscribe(&self) -> broadcast::Receiver<(u64, Vec<u8>)> {
         self.output_tx.subscribe()
+    }
+
+    /// Epic 2.1 Story 2.1.2: returns the output chunks produced since
+    /// `resume_from_seq`, if still retained, or `GapExceeded` if the
+    /// requested seq has already been evicted (or is otherwise out of
+    /// range). Reads `output_seq` directly rather than under `parser`'s
+    /// lock — resume doesn't need the grid, consistent with `size()`'s
+    /// existing precedent of reading atomics without `parser`.
+    pub fn replay_since(&self, resume_from_seq: u64) -> ReplayOutcome {
+        self.replay
+            .lock()
+            .unwrap()
+            .replay_since(resume_from_seq, self.output_seq.load(Ordering::SeqCst))
     }
 
     /// The pane's current (rows, cols) — cheap, unlike [`Self::snapshot`],
@@ -491,6 +530,7 @@ impl Drop for Pane {
             }
         }
         release_scrollback_budget(self.scrollback_lines);
+        release_replay_budget(self.replay_budget_bytes);
     }
 }
 
@@ -712,6 +752,90 @@ mod tests {
         assert!(
             text.contains("marker-text"),
             "snapshot grid must reflect the same bytes as the last broadcast chunk (seq {seq})"
+        );
+    }
+
+    /// Story 2.1.2 AC2 / Task 2.1.2d: `pane.replay_since(resume_from_seq)`'s
+    /// returned chunks must byte-concatenate to exactly what a live
+    /// `subscribe()` delivered over the same window — proving the replay
+    /// buffer, pushed in the reader thread's own critical section, can
+    /// never disagree with what a concurrent live subscriber already
+    /// received. `resume_from_seq` is the real seq of the last chunk from
+    /// an initial settle-and-drain (not the `0` sentinel: a pane's very
+    /// first-ever chunk is always `seq == 1`, so `replay_since(0)` on a
+    /// pane that has already produced output legitimately falls into the
+    /// documented "resume_from_seq one less than oldest retained ->
+    /// GapExceeded" conservative boundary — see
+    /// `replay_buffer_replay_since_should_return_gap_exceeded_when_resume_from_seq_is_one_less_than_oldest_retained`;
+    /// that boundary is exercised there, not here). Mirrors
+    /// `snapshot_with_seq_should_return_grid_and_sequence_matching_the_last_broadcast_chunk...`'s
+    /// settle-and-compare style.
+    #[test]
+    fn pane_replay_since_should_match_bytes_delivered_by_live_subscribe_when_queried_concurrently_with_new_output(
+    ) {
+        let pane = Pane::spawn("/bin/sh", 5, 40).unwrap();
+        let mut rx = pane.subscribe();
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        // Drain and settle on a marker, returning the seq of the last
+        // chunk observed once the given marker text has fully arrived and
+        // the channel is (re-checked) empty — same settle-and-recheck
+        // pattern as the sibling snapshot_with_seq test.
+        let settle_on = |rx: &mut broadcast::Receiver<(u64, Vec<u8>)>,
+                          buffered: &mut Vec<u8>,
+                          marker: &str| {
+            let mut last_seq = 0u64;
+            loop {
+                match rx.try_recv() {
+                    Ok((seq, bytes)) => {
+                        last_seq = seq;
+                        buffered.extend_from_slice(&bytes);
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => {
+                        if String::from_utf8_lossy(buffered).contains(marker)
+                            && matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty))
+                        {
+                            return last_seq;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "pane output around marker {marker:?} never settled"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("unexpected broadcast recv error: {e:?}"),
+                }
+            }
+        };
+
+        // Settle past a first marker to establish a real, already-in-the-
+        // buffer resume point (never the ambiguous `0` sentinel).
+        let mut prefix_bytes = Vec::new();
+        pane.write_input(b"echo marker-one\n").unwrap();
+        let resume_from_seq = settle_on(&mut rx, &mut prefix_bytes, "marker-one");
+
+        // Produce more output (the "new output" this test's name refers
+        // to), collecting exactly what live subscribe() delivers after
+        // resume_from_seq.
+        let mut live_suffix_bytes = Vec::new();
+        pane.write_input(b"echo marker-two\n").unwrap();
+        settle_on(&mut rx, &mut live_suffix_bytes, "marker-two");
+
+        let replayed_bytes: Vec<u8> = match pane.replay_since(resume_from_seq) {
+            ReplayOutcome::InWindow { chunks, .. } => {
+                assert!(
+                    chunks.iter().all(|(seq, _)| *seq > resume_from_seq),
+                    "no chunk in the replay may be at or before resume_from_seq"
+                );
+                chunks.into_iter().flat_map(|(_, data)| data).collect()
+            }
+            other => panic!("expected InWindow, got {other:?}"),
+        };
+
+        assert_eq!(
+            replayed_bytes, live_suffix_bytes,
+            "replay_since(resume_from_seq)'s bytes must exactly match what live subscribe() \
+             delivered over the same window"
         );
     }
 
