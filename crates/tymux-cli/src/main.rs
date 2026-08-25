@@ -492,6 +492,10 @@ async fn attach(
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tx.send(AttachRequest {
         payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
+        // Epic 1.1 / Task 1.1.1b: no resume state to offer yet — building
+        // and sending a real resume token is Epic 6.1's job. `None` here
+        // behaves identically to a pre-feature client's request.
+        resume_from_seq: None,
     })
     .await?;
 
@@ -646,6 +650,9 @@ async fn attach(
                         ReassembledOutput::Forward(fwd) => {
                             tx.send(AttachRequest {
                                 payload: Some(attach_request::Payload::Input(fwd)),
+                                // Epic 1.1 / Task 1.1.1b: resume_from_seq only
+                                // has meaning on the first message; not used here.
+                                resume_from_seq: None,
                             }).await?;
                         }
                         ReassembledOutput::Action(action) => match action {
@@ -844,6 +851,9 @@ async fn send_resize_and_repaint(
             rows: pty_rows as u32,
             cols: cols as u32,
         })),
+        // Epic 1.1 / Task 1.1.1b: resume_from_seq only has meaning on the
+        // first message; not used here.
+        resume_from_seq: None,
     })
     .await?;
 

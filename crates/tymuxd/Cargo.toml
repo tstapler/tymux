@@ -24,3 +24,4 @@ libc = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tracing-test = { workspace = true }
+prost = { workspace = true }

@@ -1421,6 +1421,64 @@ mod tests {
         );
     }
 
+    /// Story 1.1.1 AC1 / REQ-1: `OutputChunk` (field 7) is a NEW sibling of
+    /// the untouched `output` (field 1) — it must round-trip its own `seq`
+    /// and `data` through a real prost encode/decode, not just construct
+    /// cleanly in memory.
+    #[test]
+    fn attach_event_output_should_roundtrip_seq_and_data_when_encoded_and_decoded_as_output_chunk(
+    ) {
+        let event = AttachEvent {
+            payload: Some(attach_event::Payload::OutputChunk(
+                tymux_proto::v1::OutputChunk {
+                    seq: 7,
+                    data: b"hello".to_vec(),
+                },
+            )),
+        };
+
+        let encoded = prost::Message::encode_to_vec(&event);
+        let decoded: AttachEvent = prost::Message::decode(encoded.as_slice()).unwrap();
+
+        match decoded.payload {
+            Some(attach_event::Payload::OutputChunk(chunk)) => {
+                assert_eq!(chunk.seq, 7);
+                assert_eq!(chunk.data, b"hello");
+            }
+            _ => panic!("expected an OutputChunk payload after decode"),
+        }
+    }
+
+    /// Story 1.1.1 AC2 / REQ-1: `resume_from_seq` is `optional` (proto3
+    /// field presence) outside the `oneof`, so an absent field — what a
+    /// pre-feature client always sends, since it doesn't know the field
+    /// exists — must decode as `None`, distinct from an explicit
+    /// `Some(0)`. A plain `Option<u64>` with a non-`optional` field would
+    /// collapse both cases to the same zero value.
+    #[test]
+    fn attach_request_resume_from_seq_should_be_none_when_field_omitted_by_legacy_client() {
+        let pane_id = Uuid::new_v4().to_string();
+
+        // Simulates a pre-feature client: never sets resume_from_seq.
+        let legacy_request = AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
+            resume_from_seq: None,
+        };
+        let encoded = prost::Message::encode_to_vec(&legacy_request);
+        let decoded: AttachRequest = prost::Message::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.resume_from_seq, None);
+
+        // Distinct from an explicit Some(0), which must round-trip as
+        // Some(0), not collapse to the same absent-field None.
+        let resuming_request = AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: Some(0),
+        };
+        let encoded = prost::Message::encode_to_vec(&resuming_request);
+        let decoded: AttachRequest = prost::Message::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.resume_from_seq, Some(0));
+    }
+
     /// Task 1.3.1b / REQ-5: the exact double-render window
     /// adversarial-review.md flagged as a Blocker — an output chunk whose
     /// sequence number is `<=` the priming snapshot's must not be
@@ -1568,6 +1626,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: None,
         })
         .await
         .unwrap();
@@ -1676,11 +1735,13 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
         })
         .await
         .unwrap();
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
+            resume_from_seq: None,
         })
         .await
         .unwrap();
@@ -1735,11 +1796,13 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
         })
         .await
         .unwrap();
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::Input(b"exit 7\n".to_vec())),
+            resume_from_seq: None,
         })
         .await
         .unwrap();
@@ -1803,11 +1866,13 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
         })
         .await
         .unwrap();
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
+            resume_from_seq: None,
         })
         .await
         .unwrap();
@@ -1869,6 +1934,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
         })
         .await
         .unwrap();
@@ -2244,6 +2310,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
         })
         .await
         .unwrap();

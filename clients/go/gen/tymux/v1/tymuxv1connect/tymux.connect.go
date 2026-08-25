@@ -123,6 +123,37 @@ type TymuxServiceClient interface {
 	//     daemon tracks every attached client's reported viewport per window
 	//     and applies the dimension-wise minimum across all of them, rather
 	//     than sizing this one pane to this one client's last report.
+	//
+	// Epic 1.1: shared reconnect-loop specification. This is the one
+	// contract `tymux-cli`, `clients/ts`, and `clients/go` (Epics 5.1, 5.2,
+	// 6.1) must all implement identically — do not reinvent per client.
+	//   - resume_from_seq (AttachRequest, outside the oneof) is bound to the
+	//     pane_id carried by that same first message on the stream; it has
+	//     no meaning attached to any other message. Omitting it (None) is a
+	//     full attach and behaves identically to a pre-feature client: the
+	//     daemon responds with a PaneSnapshot priming event, as it always
+	//     has. Setting it to Some(n) asks the daemon to replay OutputChunk
+	//     events from its per-pane ReplayBuffer starting at seq n+1, skipping
+	//     the PaneSnapshot, PROVIDED seq n+1 is still retained.
+	//   - GapExceeded means the requested resume_from_seq is older than
+	//     anything the ReplayBuffer still retains — the gap cannot be closed
+	//     by replay. A GapExceeded event is always immediately followed by a
+	//     PaneSnapshot event, which the client MUST treat as authoritative:
+	//     discard any locally buffered partial/replayed state and redraw
+	//     from the snapshot, exactly as a fresh (non-resuming) attach would.
+	//   - Heartbeat is an empty keepalive sent on an application-level
+	//     interval during an otherwise-idle stream, so a client can tell
+	//     "connected but quiet" apart from a silently-dead transport without
+	//     relying solely on TCP/HTTP2-level timeouts. It carries no data and
+	//     requires no client response.
+	//   - Reconnect backoff policy (ADR-004, revised): on stream failure, a
+	//     conforming client retries with exponential backoff starting at
+	//     200ms, doubling each attempt (x2 multiplier), capped at 8s per
+	//     attempt, with +/-20% jitter, giving up after 14 attempts (nominal
+	//     cumulative backoff ~68.6s). This ceiling is deliberately chosen to
+	//     be >= the daemon's grace_period_duration (60s), so a client that
+	//     keeps retrying on this schedule has a real chance of reconnecting
+	//     before the daemon gives up on the pane's grace period.
 	Attach(context.Context) *connect.BidiStreamForClient[v1.AttachRequest, v1.AttachEvent]
 }
 
@@ -334,6 +365,37 @@ type TymuxServiceHandler interface {
 	//     daemon tracks every attached client's reported viewport per window
 	//     and applies the dimension-wise minimum across all of them, rather
 	//     than sizing this one pane to this one client's last report.
+	//
+	// Epic 1.1: shared reconnect-loop specification. This is the one
+	// contract `tymux-cli`, `clients/ts`, and `clients/go` (Epics 5.1, 5.2,
+	// 6.1) must all implement identically — do not reinvent per client.
+	//   - resume_from_seq (AttachRequest, outside the oneof) is bound to the
+	//     pane_id carried by that same first message on the stream; it has
+	//     no meaning attached to any other message. Omitting it (None) is a
+	//     full attach and behaves identically to a pre-feature client: the
+	//     daemon responds with a PaneSnapshot priming event, as it always
+	//     has. Setting it to Some(n) asks the daemon to replay OutputChunk
+	//     events from its per-pane ReplayBuffer starting at seq n+1, skipping
+	//     the PaneSnapshot, PROVIDED seq n+1 is still retained.
+	//   - GapExceeded means the requested resume_from_seq is older than
+	//     anything the ReplayBuffer still retains — the gap cannot be closed
+	//     by replay. A GapExceeded event is always immediately followed by a
+	//     PaneSnapshot event, which the client MUST treat as authoritative:
+	//     discard any locally buffered partial/replayed state and redraw
+	//     from the snapshot, exactly as a fresh (non-resuming) attach would.
+	//   - Heartbeat is an empty keepalive sent on an application-level
+	//     interval during an otherwise-idle stream, so a client can tell
+	//     "connected but quiet" apart from a silently-dead transport without
+	//     relying solely on TCP/HTTP2-level timeouts. It carries no data and
+	//     requires no client response.
+	//   - Reconnect backoff policy (ADR-004, revised): on stream failure, a
+	//     conforming client retries with exponential backoff starting at
+	//     200ms, doubling each attempt (x2 multiplier), capped at 8s per
+	//     attempt, with +/-20% jitter, giving up after 14 attempts (nominal
+	//     cumulative backoff ~68.6s). This ceiling is deliberately chosen to
+	//     be >= the daemon's grace_period_duration (60s), so a client that
+	//     keeps retrying on this schedule has a real chance of reconnecting
+	//     before the daemon gives up on the pane's grace period.
 	Attach(context.Context, *connect.BidiStream[v1.AttachRequest, v1.AttachEvent]) error
 }
 

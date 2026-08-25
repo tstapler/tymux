@@ -65,6 +65,37 @@ service TymuxService {
   //    daemon tracks every attached client's reported viewport per window
   //    and applies the dimension-wise minimum across all of them, rather
   //    than sizing this one pane to this one client's last report.
+  //
+  // Epic 1.1: shared reconnect-loop specification. This is the one
+  // contract `tymux-cli`, `clients/ts`, and `clients/go` (Epics 5.1, 5.2,
+  // 6.1) must all implement identically — do not reinvent per client.
+  //  - resume_from_seq (AttachRequest, outside the oneof) is bound to the
+  //    pane_id carried by that same first message on the stream; it has
+  //    no meaning attached to any other message. Omitting it (None) is a
+  //    full attach and behaves identically to a pre-feature client: the
+  //    daemon responds with a PaneSnapshot priming event, as it always
+  //    has. Setting it to Some(n) asks the daemon to replay OutputChunk
+  //    events from its per-pane ReplayBuffer starting at seq n+1, skipping
+  //    the PaneSnapshot, PROVIDED seq n+1 is still retained.
+  //  - GapExceeded means the requested resume_from_seq is older than
+  //    anything the ReplayBuffer still retains — the gap cannot be closed
+  //    by replay. A GapExceeded event is always immediately followed by a
+  //    PaneSnapshot event, which the client MUST treat as authoritative:
+  //    discard any locally buffered partial/replayed state and redraw
+  //    from the snapshot, exactly as a fresh (non-resuming) attach would.
+  //  - Heartbeat is an empty keepalive sent on an application-level
+  //    interval during an otherwise-idle stream, so a client can tell
+  //    "connected but quiet" apart from a silently-dead transport without
+  //    relying solely on TCP/HTTP2-level timeouts. It carries no data and
+  //    requires no client response.
+  //  - Reconnect backoff policy (ADR-004, revised): on stream failure, a
+  //    conforming client retries with exponential backoff starting at
+  //    200ms, doubling each attempt (x2 multiplier), capped at 8s per
+  //    attempt, with +/-20% jitter, giving up after 14 attempts (nominal
+  //    cumulative backoff ~68.6s). This ceiling is deliberately chosen to
+  //    be >= the daemon's grace_period_duration (60s), so a client that
+  //    keeps retrying on this schedule has a real chance of reconnecting
+  //    before the daemon gives up on the pane's grace period.
   rpc Attach(stream AttachRequest) returns (stream AttachEvent);
 }
 
@@ -259,6 +290,16 @@ message AttachRequest {
     bytes input = 2;    // raw keystrokes to forward to the pty
     Resize resize = 3;
   }
+
+  // Epic 1.1 / ADR-004 (revised): the highest OutputChunk.seq this client
+  // already has for the pane named in this same first message. Absent
+  // (None) means "no resume state, full attach" — behaves identically to
+  // a pre-feature client, which never sends this field at all. Present
+  // (Some(n), including Some(0)) asks the daemon to replay from its
+  // ReplayBuffer starting at seq n+1 instead of sending a fresh
+  // PaneSnapshot. See the Attach RPC's doc comment above for the full
+  // reconnect contract.
+  optional uint64 resume_from_seq = 4;
 }
 
 message Resize {
@@ -274,6 +315,32 @@ message ExitStatus {
   optional int32 code = 1;
 }
 
+// Epic 1.1: a single sequenced output chunk. `seq` is the daemon's
+// monotonically-increasing per-pane sequence number for this chunk (the
+// same numbering space as PaneSnapshot's sequence and ReplayBuffer's
+// retention window), letting a client build a `resume_from_seq` resume
+// token from the highest `seq` it has durably received.
+message OutputChunk {
+  uint64 seq = 1;
+  bytes data = 2;
+}
+
+// Epic 1.1: sent instead of a resumed OutputChunk stream when the
+// client's requested `resume_from_seq` is older than anything the
+// daemon's ReplayBuffer still retains. Per the Attach RPC's doc comment,
+// the client MUST treat the PaneSnapshot event that immediately follows
+// as authoritative and discard any locally buffered partial state — the
+// gap cannot be closed by replay.
+message GapExceeded {
+  uint64 oldest_available_seq = 1;
+}
+
+// Epic 1.1: an empty keepalive event sent on an application-level
+// interval during an otherwise-idle attach, so a client can distinguish
+// "still connected, just quiet" from a silently-dead transport without
+// waiting on TCP/HTTP2-level timeouts alone. Carries no data.
+message Heartbeat {}
+
 message AttachEvent {
   oneof payload {
     bytes output = 1; // raw pty output bytes, as they arrive
@@ -287,5 +354,20 @@ message AttachEvent {
     // between the previous and next Output event was lost; normal
     // streaming resumes immediately after this event.
     bool output_gap = 4;
+    // Epic 1.1: replay-buffer-exceeded signal for a resume request whose
+    // `resume_from_seq` is too old. See GapExceeded's own doc comment.
+    GapExceeded gap_exceeded = 5;
+    // Epic 1.1: application-level keepalive. See Heartbeat's own doc
+    // comment.
+    Heartbeat heartbeat = 6;
+    // Epic 1.1 / ADR-001 (revised): a NEW, additive sibling to `output`
+    // above — NOT a promotion/replacement of it. `output` (field 1) stays
+    // byte-for-byte unchanged forever, so any pre-existing client that
+    // only reads field 1 keeps working with zero code change and zero
+    // wire-format difference. A client that wants resume support reads
+    // this field instead: the same raw pty bytes, plus the `seq` needed
+    // to build a `resume_from_seq` token. The daemon populates exactly
+    // one of `output`/`output_chunk` per AttachEvent, not both.
+    OutputChunk output_chunk = 7;
   }
 }
