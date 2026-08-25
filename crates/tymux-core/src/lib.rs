@@ -2,6 +2,7 @@ mod engine;
 mod layout;
 mod pane;
 mod persistence;
+mod replay_buffer;
 
 pub use engine::{
     ClosePaneOutcome, Engine, EngineError, LayoutSnapshot, PaneEntry, PaneInfo, PaneLookup,
@@ -17,3 +18,4 @@ pub use persistence::{
     PersistedPaneRecord, PersistedSessionRecord, PersistedWindowRecord, PersistenceBackend,
     CURRENT_SCHEMA_VERSION,
 };
+pub use replay_buffer::ReplayOutcome;

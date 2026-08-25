@@ -1581,7 +1581,16 @@ type AttachRequest struct {
 	//	*AttachRequest_PaneId
 	//	*AttachRequest_Input
 	//	*AttachRequest_Resize
-	Payload       isAttachRequest_Payload `protobuf_oneof:"payload"`
+	Payload isAttachRequest_Payload `protobuf_oneof:"payload"`
+	// Epic 1.1 / ADR-004 (revised): the highest OutputChunk.seq this client
+	// already has for the pane named in this same first message. Absent
+	// (None) means "no resume state, full attach" — behaves identically to
+	// a pre-feature client, which never sends this field at all. Present
+	// (Some(n), including Some(0)) asks the daemon to replay from its
+	// ReplayBuffer starting at seq n+1 instead of sending a fresh
+	// PaneSnapshot. See the Attach RPC's doc comment above for the full
+	// reconnect contract.
+	ResumeFromSeq *uint64 `protobuf:"varint,4,opt,name=resume_from_seq,json=resumeFromSeq,proto3,oneof" json:"resume_from_seq,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1648,6 +1657,13 @@ func (x *AttachRequest) GetResize() *Resize {
 		}
 	}
 	return nil
+}
+
+func (x *AttachRequest) GetResumeFromSeq() uint64 {
+	if x != nil && x.ResumeFromSeq != nil {
+		return *x.ResumeFromSeq
+	}
+	return 0
 }
 
 type isAttachRequest_Payload interface {
@@ -1772,6 +1788,153 @@ func (x *ExitStatus) GetCode() int32 {
 	return 0
 }
 
+// Epic 1.1: a single sequenced output chunk. `seq` is the daemon's
+// monotonically-increasing per-pane sequence number for this chunk (the
+// same numbering space as PaneSnapshot's sequence and ReplayBuffer's
+// retention window), letting a client build a `resume_from_seq` resume
+// token from the highest `seq` it has durably received.
+type OutputChunk struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Seq           uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	Data          []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OutputChunk) Reset() {
+	*x = OutputChunk{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OutputChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OutputChunk) ProtoMessage() {}
+
+func (x *OutputChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OutputChunk.ProtoReflect.Descriptor instead.
+func (*OutputChunk) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *OutputChunk) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *OutputChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+// Epic 1.1: sent instead of a resumed OutputChunk stream when the
+// client's requested `resume_from_seq` is older than anything the
+// daemon's ReplayBuffer still retains. Per the Attach RPC's doc comment,
+// the client MUST treat the PaneSnapshot event that immediately follows
+// as authoritative and discard any locally buffered partial state — the
+// gap cannot be closed by replay.
+type GapExceeded struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	OldestAvailableSeq uint64                 `protobuf:"varint,1,opt,name=oldest_available_seq,json=oldestAvailableSeq,proto3" json:"oldest_available_seq,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *GapExceeded) Reset() {
+	*x = GapExceeded{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GapExceeded) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GapExceeded) ProtoMessage() {}
+
+func (x *GapExceeded) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GapExceeded.ProtoReflect.Descriptor instead.
+func (*GapExceeded) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *GapExceeded) GetOldestAvailableSeq() uint64 {
+	if x != nil {
+		return x.OldestAvailableSeq
+	}
+	return 0
+}
+
+// Epic 1.1: an empty keepalive event sent on an application-level
+// interval during an otherwise-idle attach, so a client can distinguish
+// "still connected, just quiet" from a silently-dead transport without
+// waiting on TCP/HTTP2-level timeouts alone. Carries no data.
+type Heartbeat struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Heartbeat) Reset() {
+	*x = Heartbeat{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Heartbeat) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Heartbeat) ProtoMessage() {}
+
+func (x *Heartbeat) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Heartbeat.ProtoReflect.Descriptor instead.
+func (*Heartbeat) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{30}
+}
+
 type AttachEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Payload:
@@ -1780,6 +1943,9 @@ type AttachEvent struct {
 	//	*AttachEvent_Snapshot
 	//	*AttachEvent_Exited
 	//	*AttachEvent_OutputGap
+	//	*AttachEvent_GapExceeded
+	//	*AttachEvent_Heartbeat
+	//	*AttachEvent_OutputChunk
 	Payload       isAttachEvent_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1787,7 +1953,7 @@ type AttachEvent struct {
 
 func (x *AttachEvent) Reset() {
 	*x = AttachEvent{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[28]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1799,7 +1965,7 @@ func (x *AttachEvent) String() string {
 func (*AttachEvent) ProtoMessage() {}
 
 func (x *AttachEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[28]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1812,7 +1978,7 @@ func (x *AttachEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachEvent.ProtoReflect.Descriptor instead.
 func (*AttachEvent) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{28}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *AttachEvent) GetPayload() isAttachEvent_Payload {
@@ -1858,6 +2024,33 @@ func (x *AttachEvent) GetOutputGap() bool {
 	return false
 }
 
+func (x *AttachEvent) GetGapExceeded() *GapExceeded {
+	if x != nil {
+		if x, ok := x.Payload.(*AttachEvent_GapExceeded); ok {
+			return x.GapExceeded
+		}
+	}
+	return nil
+}
+
+func (x *AttachEvent) GetHeartbeat() *Heartbeat {
+	if x != nil {
+		if x, ok := x.Payload.(*AttachEvent_Heartbeat); ok {
+			return x.Heartbeat
+		}
+	}
+	return nil
+}
+
+func (x *AttachEvent) GetOutputChunk() *OutputChunk {
+	if x != nil {
+		if x, ok := x.Payload.(*AttachEvent_OutputChunk); ok {
+			return x.OutputChunk
+		}
+	}
+	return nil
+}
+
 type isAttachEvent_Payload interface {
 	isAttachEvent_Payload()
 }
@@ -1885,6 +2078,30 @@ type AttachEvent_OutputGap struct {
 	OutputGap bool `protobuf:"varint,4,opt,name=output_gap,json=outputGap,proto3,oneof"`
 }
 
+type AttachEvent_GapExceeded struct {
+	// Epic 1.1: replay-buffer-exceeded signal for a resume request whose
+	// `resume_from_seq` is too old. See GapExceeded's own doc comment.
+	GapExceeded *GapExceeded `protobuf:"bytes,5,opt,name=gap_exceeded,json=gapExceeded,proto3,oneof"`
+}
+
+type AttachEvent_Heartbeat struct {
+	// Epic 1.1: application-level keepalive. See Heartbeat's own doc
+	// comment.
+	Heartbeat *Heartbeat `protobuf:"bytes,6,opt,name=heartbeat,proto3,oneof"`
+}
+
+type AttachEvent_OutputChunk struct {
+	// Epic 1.1 / ADR-001 (revised): a NEW, additive sibling to `output`
+	// above — NOT a promotion/replacement of it. `output` (field 1) stays
+	// byte-for-byte unchanged forever, so any pre-existing client that
+	// only reads field 1 keeps working with zero code change and zero
+	// wire-format difference. A client that wants resume support reads
+	// this field instead: the same raw pty bytes, plus the `seq` needed
+	// to build a `resume_from_seq` token. The daemon populates exactly
+	// one of `output`/`output_chunk` per AttachEvent, not both.
+	OutputChunk *OutputChunk `protobuf:"bytes,7,opt,name=output_chunk,json=outputChunk,proto3,oneof"`
+}
+
 func (*AttachEvent_Output) isAttachEvent_Payload() {}
 
 func (*AttachEvent_Snapshot) isAttachEvent_Payload() {}
@@ -1892,6 +2109,12 @@ func (*AttachEvent_Snapshot) isAttachEvent_Payload() {}
 func (*AttachEvent_Exited) isAttachEvent_Payload() {}
 
 func (*AttachEvent_OutputGap) isAttachEvent_Payload() {}
+
+func (*AttachEvent_GapExceeded) isAttachEvent_Payload() {}
+
+func (*AttachEvent_Heartbeat) isAttachEvent_Payload() {}
+
+func (*AttachEvent_OutputChunk) isAttachEvent_Payload() {}
 
 var File_tymux_v1_tymux_proto protoreflect.FileDescriptor
 
@@ -1990,25 +2213,36 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x04text\x18\x01 \x01(\tR\x04text\x12\x0e\n" +
 	"\x02fg\x18\x02 \x01(\rR\x02fg\x12\x0e\n" +
 	"\x02bg\x18\x03 \x01(\rR\x02bg\x12\x14\n" +
-	"\x05attrs\x18\x04 \x01(\rR\x05attrs\"y\n" +
+	"\x05attrs\x18\x04 \x01(\rR\x05attrs\"\xba\x01\n" +
 	"\rAttachRequest\x12\x19\n" +
 	"\apane_id\x18\x01 \x01(\tH\x00R\x06paneId\x12\x16\n" +
 	"\x05input\x18\x02 \x01(\fH\x00R\x05input\x12*\n" +
-	"\x06resize\x18\x03 \x01(\v2\x10.tymux.v1.ResizeH\x00R\x06resizeB\t\n" +
-	"\apayload\"0\n" +
+	"\x06resize\x18\x03 \x01(\v2\x10.tymux.v1.ResizeH\x00R\x06resize\x12+\n" +
+	"\x0fresume_from_seq\x18\x04 \x01(\x04H\x01R\rresumeFromSeq\x88\x01\x01B\t\n" +
+	"\apayloadB\x12\n" +
+	"\x10_resume_from_seq\"0\n" +
 	"\x06Resize\x12\x12\n" +
 	"\x04rows\x18\x01 \x01(\rR\x04rows\x12\x12\n" +
 	"\x04cols\x18\x02 \x01(\rR\x04cols\".\n" +
 	"\n" +
 	"ExitStatus\x12\x17\n" +
 	"\x04code\x18\x01 \x01(\x05H\x00R\x04code\x88\x01\x01B\a\n" +
-	"\x05_code\"\xb9\x01\n" +
+	"\x05_code\"3\n" +
+	"\vOutputChunk\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x12\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\"?\n" +
+	"\vGapExceeded\x120\n" +
+	"\x14oldest_available_seq\x18\x01 \x01(\x04R\x12oldestAvailableSeq\"\v\n" +
+	"\tHeartbeat\"\xe6\x02\n" +
 	"\vAttachEvent\x12\x18\n" +
 	"\x06output\x18\x01 \x01(\fH\x00R\x06output\x124\n" +
 	"\bsnapshot\x18\x02 \x01(\v2\x16.tymux.v1.PaneSnapshotH\x00R\bsnapshot\x12.\n" +
 	"\x06exited\x18\x03 \x01(\v2\x14.tymux.v1.ExitStatusH\x00R\x06exited\x12\x1f\n" +
 	"\n" +
-	"output_gap\x18\x04 \x01(\bH\x00R\toutputGapB\t\n" +
+	"output_gap\x18\x04 \x01(\bH\x00R\toutputGap\x12:\n" +
+	"\fgap_exceeded\x18\x05 \x01(\v2\x15.tymux.v1.GapExceededH\x00R\vgapExceeded\x123\n" +
+	"\theartbeat\x18\x06 \x01(\v2\x13.tymux.v1.HeartbeatH\x00R\theartbeat\x12:\n" +
+	"\foutput_chunk\x18\a \x01(\v2\x15.tymux.v1.OutputChunkH\x00R\voutputChunkB\t\n" +
 	"\apayload*J\n" +
 	"\bLiveness\x12\x18\n" +
 	"\x14LIVENESS_UNSPECIFIED\x10\x00\x12\x11\n" +
@@ -2046,7 +2280,7 @@ func file_tymux_v1_tymux_proto_rawDescGZIP() []byte {
 }
 
 var file_tymux_v1_tymux_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_tymux_v1_tymux_proto_goTypes = []any{
 	(Liveness)(0),                    // 0: tymux.v1.Liveness
 	(Orientation)(0),                 // 1: tymux.v1.Orientation
@@ -2078,7 +2312,10 @@ var file_tymux_v1_tymux_proto_goTypes = []any{
 	(*AttachRequest)(nil),            // 27: tymux.v1.AttachRequest
 	(*Resize)(nil),                   // 28: tymux.v1.Resize
 	(*ExitStatus)(nil),               // 29: tymux.v1.ExitStatus
-	(*AttachEvent)(nil),              // 30: tymux.v1.AttachEvent
+	(*OutputChunk)(nil),              // 30: tymux.v1.OutputChunk
+	(*GapExceeded)(nil),              // 31: tymux.v1.GapExceeded
+	(*Heartbeat)(nil),                // 32: tymux.v1.Heartbeat
+	(*AttachEvent)(nil),              // 33: tymux.v1.AttachEvent
 }
 var file_tymux_v1_tymux_proto_depIdxs = []int32{
 	3,  // 0: tymux.v1.Session.windows:type_name -> tymux.v1.Window
@@ -2101,33 +2338,36 @@ var file_tymux_v1_tymux_proto_depIdxs = []int32{
 	28, // 17: tymux.v1.AttachRequest.resize:type_name -> tymux.v1.Resize
 	24, // 18: tymux.v1.AttachEvent.snapshot:type_name -> tymux.v1.PaneSnapshot
 	29, // 19: tymux.v1.AttachEvent.exited:type_name -> tymux.v1.ExitStatus
-	8,  // 20: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
-	9,  // 21: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
-	11, // 22: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
-	13, // 23: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
-	21, // 24: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
-	22, // 25: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
-	15, // 26: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
-	16, // 27: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
-	18, // 28: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
-	19, // 29: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
-	27, // 30: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
-	2,  // 31: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
-	10, // 32: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
-	12, // 33: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
-	14, // 34: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
-	24, // 35: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
-	23, // 36: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
-	2,  // 37: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
-	17, // 38: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
-	2,  // 39: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
-	20, // 40: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
-	30, // 41: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
-	31, // [31:42] is the sub-list for method output_type
-	20, // [20:31] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	31, // 20: tymux.v1.AttachEvent.gap_exceeded:type_name -> tymux.v1.GapExceeded
+	32, // 21: tymux.v1.AttachEvent.heartbeat:type_name -> tymux.v1.Heartbeat
+	30, // 22: tymux.v1.AttachEvent.output_chunk:type_name -> tymux.v1.OutputChunk
+	8,  // 23: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
+	9,  // 24: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
+	11, // 25: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
+	13, // 26: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
+	21, // 27: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
+	22, // 28: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
+	15, // 29: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
+	16, // 30: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
+	18, // 31: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
+	19, // 32: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
+	27, // 33: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
+	2,  // 34: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
+	10, // 35: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
+	12, // 36: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
+	14, // 37: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
+	24, // 38: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
+	23, // 39: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
+	2,  // 40: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
+	17, // 41: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
+	2,  // 42: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
+	20, // 43: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
+	33, // 44: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
+	34, // [34:45] is the sub-list for method output_type
+	23, // [23:34] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_tymux_v1_tymux_proto_init() }
@@ -2145,11 +2385,14 @@ func file_tymux_v1_tymux_proto_init() {
 		(*AttachRequest_Resize)(nil),
 	}
 	file_tymux_v1_tymux_proto_msgTypes[27].OneofWrappers = []any{}
-	file_tymux_v1_tymux_proto_msgTypes[28].OneofWrappers = []any{
+	file_tymux_v1_tymux_proto_msgTypes[31].OneofWrappers = []any{
 		(*AttachEvent_Output)(nil),
 		(*AttachEvent_Snapshot)(nil),
 		(*AttachEvent_Exited)(nil),
 		(*AttachEvent_OutputGap)(nil),
+		(*AttachEvent_GapExceeded)(nil),
+		(*AttachEvent_Heartbeat)(nil),
+		(*AttachEvent_OutputChunk)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -2157,7 +2400,7 @@ func file_tymux_v1_tymux_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tymux_v1_tymux_proto_rawDesc), len(file_tymux_v1_tymux_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   29,
+			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

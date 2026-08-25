@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file tymux/v1/tymux.proto.
  */
 export const file_tymux_v1_tymux: GenFile = /*@__PURE__*/
-  fileDesc("ChR0eW11eC92MS90eW11eC5wcm90bxIIdHltdXgudjEibAoHU2Vzc2lvbhIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiEKB3dpbmRvd3MYAyADKAsyEC50eW11eC52MS5XaW5kb3cSJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcyJECgZXaW5kb3cSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIgCgZsYXlvdXQYAyABKAsyEC50eW11eC52MS5MYXlvdXQiUgoGTGF5b3V0Eh4KBHBhbmUYASABKAsyDi50eW11eC52MS5QYW5lSAASIAoFc3BsaXQYAiABKAsyDy50eW11eC52MS5TcGxpdEgAQgYKBG5vZGUiXAoFU3BsaXQSKgoLb3JpZW50YXRpb24YASABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhInCghjaGlsZHJlbhgCIAMoCzIVLnR5bXV4LnYxLkxheW91dENoaWxkIj4KC0xheW91dENoaWxkEiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBINCgVyYXRpbxgCIAEoAiJhCgRQYW5lEgoKAmlkGAEgASgJEgwKBHJvd3MYAiABKA0SDAoEY29scxgDIAEoDRIkCghsaXZlbmVzcxgEIAEoDjISLnR5bXV4LnYxLkxpdmVuZXNzEgsKA2N3ZBgFIAEoCSJCChRDcmVhdGVTZXNzaW9uUmVxdWVzdBIMCgRuYW1lGAEgASgJEg8KB2NvbW1hbmQYAiABKAkSCwoDY3dkGAMgASgJIhUKE0xpc3RTZXNzaW9uc1JlcXVlc3QiOwoUTGlzdFNlc3Npb25zUmVzcG9uc2USIwoIc2Vzc2lvbnMYASADKAsyES50eW11eC52MS5TZXNzaW9uIigKEktpbGxTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIhUKE0tpbGxTZXNzaW9uUmVzcG9uc2UiKgoUUmV2aXZlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSJlChVSZXZpdmVTZXNzaW9uUmVzcG9uc2USFAoMYWxyZWFkeV9saXZlGAEgASgIEhIKCnBhbmVfY291bnQYAiABKA0SIgoHc2Vzc2lvbhgDIAEoCzIRLnR5bXV4LnYxLlNlc3Npb24iYAoQU3BsaXRQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEioKC29yaWVudGF0aW9uGAIgASgOMhUudHltdXgudjEuT3JpZW50YXRpb24SDwoHY29tbWFuZBgDIAEoCSIjChBDbG9zZVBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkipQEKEUNsb3NlUGFuZVJlc3BvbnNlEhgKEHdpbmRvd19jbG9zZWRfaWQYASABKAkSGgoSd2luZG93X2Nsb3NlZF9uYW1lGAIgASgJEhkKEXNlc3Npb25fY2xvc2VkX2lkGAMgASgJEhsKE3Nlc3Npb25fY2xvc2VkX25hbWUYBCABKAkSIgoHc2Vzc2lvbhgFIAEoCzIRLnR5bXV4LnYxLlNlc3Npb24iOgoTQ3JlYXRlV2luZG93UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEg8KB2NvbW1hbmQYAiABKAkiJwoSV2F0Y2hXaW5kb3dSZXF1ZXN0EhEKCXdpbmRvd19pZBgBIAEoCSJUChFXaW5kb3dMYXlvdXRFdmVudBIgCgZsYXlvdXQYASABKAsyEC50eW11eC52MS5MYXlvdXQSHQoVYXR0YWNoZWRfY2xpZW50X2NvdW50GAIgASgNIkAKEkNhcHR1cmVQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEhkKEXNjcm9sbGJhY2tfb2Zmc2V0GAIgASgNIlEKF1NlYXJjaFNjcm9sbGJhY2tSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSDwoHcGF0dGVybhgCIAEoCRIUCgxzdGFydF9vZmZzZXQYAyABKA0iRwoYU2VhcmNoU2Nyb2xsYmFja1Jlc3BvbnNlEg0KBWZvdW5kGAEgASgIEg4KBm9mZnNldBgCIAEoDRIMCgRsaW5lGAMgASgJIqYBCgxQYW5lU25hcHNob3QSDwoHcGFuZV9pZBgBIAEoCRIMCgRyb3dzGAIgASgNEgwKBGNvbHMYAyABKA0SGwoEZ3JpZBgEIAMoCzINLnR5bXV4LnYxLlJvdxISCgpjdXJzb3Jfcm93GAUgASgNEhIKCmN1cnNvcl9jb2wYBiABKA0SJAoIbGl2ZW5lc3MYByABKA4yEi50eW11eC52MS5MaXZlbmVzcyIkCgNSb3cSHQoFY2VsbHMYASADKAsyDi50eW11eC52MS5DZWxsIjsKBENlbGwSDAoEdGV4dBgBIAEoCRIKCgJmZxgCIAEoDRIKCgJiZxgDIAEoDRINCgVhdHRycxgEIAEoDSJiCg1BdHRhY2hSZXF1ZXN0EhEKB3BhbmVfaWQYASABKAlIABIPCgVpbnB1dBgCIAEoDEgAEiIKBnJlc2l6ZRgDIAEoCzIQLnR5bXV4LnYxLlJlc2l6ZUgAQgkKB3BheWxvYWQiJAoGUmVzaXplEgwKBHJvd3MYASABKA0SDAoEY29scxgCIAEoDSIoCgpFeGl0U3RhdHVzEhEKBGNvZGUYASABKAVIAIgBAUIHCgVfY29kZSKUAQoLQXR0YWNoRXZlbnQSEAoGb3V0cHV0GAEgASgMSAASKgoIc25hcHNob3QYAiABKAsyFi50eW11eC52MS5QYW5lU25hcHNob3RIABImCgZleGl0ZWQYAyABKAsyFC50eW11eC52MS5FeGl0U3RhdHVzSAASFAoKb3V0cHV0X2dhcBgEIAEoCEgAQgkKB3BheWxvYWQqSgoITGl2ZW5lc3MSGAoUTElWRU5FU1NfVU5TUEVDSUZJRUQQABIRCg1MSVZFTkVTU19MSVZFEAESEQoNTElWRU5FU1NfREVBRBACKmAKC09yaWVudGF0aW9uEhsKF09SSUVOVEFUSU9OX1VOU1BFQ0lGSUVEEAASGgoWT1JJRU5UQVRJT05fSE9SSVpPTlRBTBABEhgKFE9SSUVOVEFUSU9OX1ZFUlRJQ0FMEAIyrQYKDFR5bXV4U2VydmljZRJCCg1DcmVhdGVTZXNzaW9uEh4udHltdXgudjEuQ3JlYXRlU2Vzc2lvblJlcXVlc3QaES50eW11eC52MS5TZXNzaW9uEk0KDExpc3RTZXNzaW9ucxIdLnR5bXV4LnYxLkxpc3RTZXNzaW9uc1JlcXVlc3QaHi50eW11eC52MS5MaXN0U2Vzc2lvbnNSZXNwb25zZRJKCgtLaWxsU2Vzc2lvbhIcLnR5bXV4LnYxLktpbGxTZXNzaW9uUmVxdWVzdBodLnR5bXV4LnYxLktpbGxTZXNzaW9uUmVzcG9uc2USUAoNUmV2aXZlU2Vzc2lvbhIeLnR5bXV4LnYxLlJldml2ZVNlc3Npb25SZXF1ZXN0Gh8udHltdXgudjEuUmV2aXZlU2Vzc2lvblJlc3BvbnNlEkMKC0NhcHR1cmVQYW5lEhwudHltdXgudjEuQ2FwdHVyZVBhbmVSZXF1ZXN0GhYudHltdXgudjEuUGFuZVNuYXBzaG90ElkKEFNlYXJjaFNjcm9sbGJhY2sSIS50eW11eC52MS5TZWFyY2hTY3JvbGxiYWNrUmVxdWVzdBoiLnR5bXV4LnYxLlNlYXJjaFNjcm9sbGJhY2tSZXNwb25zZRI6CglTcGxpdFBhbmUSGi50eW11eC52MS5TcGxpdFBhbmVSZXF1ZXN0GhEudHltdXgudjEuU2Vzc2lvbhJECglDbG9zZVBhbmUSGi50eW11eC52MS5DbG9zZVBhbmVSZXF1ZXN0GhsudHltdXgudjEuQ2xvc2VQYW5lUmVzcG9uc2USQAoMQ3JlYXRlV2luZG93Eh0udHltdXgudjEuQ3JlYXRlV2luZG93UmVxdWVzdBoRLnR5bXV4LnYxLlNlc3Npb24SSgoLV2F0Y2hXaW5kb3cSHC50eW11eC52MS5XYXRjaFdpbmRvd1JlcXVlc3QaGy50eW11eC52MS5XaW5kb3dMYXlvdXRFdmVudDABEjwKBkF0dGFjaBIXLnR5bXV4LnYxLkF0dGFjaFJlcXVlc3QaFS50eW11eC52MS5BdHRhY2hFdmVudCgBMAFClgEKDGNvbS50eW11eC52MUIKVHltdXhQcm90b1ABWjlnaXRodWIuY29tL3RzdGFwbGVyL3R5bXV4L2NsaWVudHMvZ28vZ2VuL3R5bXV4L3YxO3R5bXV4djGiAgNUWFiqAghUeW11eC5WMcoCCFR5bXV4XFYx4gIUVHltdXhcVjFcR1BCTWV0YWRhdGHqAglUeW11eDo6VjFiBnByb3RvMw");
+  fileDesc("ChR0eW11eC92MS90eW11eC5wcm90bxIIdHltdXgudjEibAoHU2Vzc2lvbhIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiEKB3dpbmRvd3MYAyADKAsyEC50eW11eC52MS5XaW5kb3cSJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcyJECgZXaW5kb3cSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIgCgZsYXlvdXQYAyABKAsyEC50eW11eC52MS5MYXlvdXQiUgoGTGF5b3V0Eh4KBHBhbmUYASABKAsyDi50eW11eC52MS5QYW5lSAASIAoFc3BsaXQYAiABKAsyDy50eW11eC52MS5TcGxpdEgAQgYKBG5vZGUiXAoFU3BsaXQSKgoLb3JpZW50YXRpb24YASABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhInCghjaGlsZHJlbhgCIAMoCzIVLnR5bXV4LnYxLkxheW91dENoaWxkIj4KC0xheW91dENoaWxkEiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBINCgVyYXRpbxgCIAEoAiJhCgRQYW5lEgoKAmlkGAEgASgJEgwKBHJvd3MYAiABKA0SDAoEY29scxgDIAEoDRIkCghsaXZlbmVzcxgEIAEoDjISLnR5bXV4LnYxLkxpdmVuZXNzEgsKA2N3ZBgFIAEoCSJCChRDcmVhdGVTZXNzaW9uUmVxdWVzdBIMCgRuYW1lGAEgASgJEg8KB2NvbW1hbmQYAiABKAkSCwoDY3dkGAMgASgJIhUKE0xpc3RTZXNzaW9uc1JlcXVlc3QiOwoUTGlzdFNlc3Npb25zUmVzcG9uc2USIwoIc2Vzc2lvbnMYASADKAsyES50eW11eC52MS5TZXNzaW9uIigKEktpbGxTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIhUKE0tpbGxTZXNzaW9uUmVzcG9uc2UiKgoUUmV2aXZlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSJlChVSZXZpdmVTZXNzaW9uUmVzcG9uc2USFAoMYWxyZWFkeV9saXZlGAEgASgIEhIKCnBhbmVfY291bnQYAiABKA0SIgoHc2Vzc2lvbhgDIAEoCzIRLnR5bXV4LnYxLlNlc3Npb24iYAoQU3BsaXRQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEioKC29yaWVudGF0aW9uGAIgASgOMhUudHltdXgudjEuT3JpZW50YXRpb24SDwoHY29tbWFuZBgDIAEoCSIjChBDbG9zZVBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkipQEKEUNsb3NlUGFuZVJlc3BvbnNlEhgKEHdpbmRvd19jbG9zZWRfaWQYASABKAkSGgoSd2luZG93X2Nsb3NlZF9uYW1lGAIgASgJEhkKEXNlc3Npb25fY2xvc2VkX2lkGAMgASgJEhsKE3Nlc3Npb25fY2xvc2VkX25hbWUYBCABKAkSIgoHc2Vzc2lvbhgFIAEoCzIRLnR5bXV4LnYxLlNlc3Npb24iOgoTQ3JlYXRlV2luZG93UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEg8KB2NvbW1hbmQYAiABKAkiJwoSV2F0Y2hXaW5kb3dSZXF1ZXN0EhEKCXdpbmRvd19pZBgBIAEoCSJUChFXaW5kb3dMYXlvdXRFdmVudBIgCgZsYXlvdXQYASABKAsyEC50eW11eC52MS5MYXlvdXQSHQoVYXR0YWNoZWRfY2xpZW50X2NvdW50GAIgASgNIkAKEkNhcHR1cmVQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEhkKEXNjcm9sbGJhY2tfb2Zmc2V0GAIgASgNIlEKF1NlYXJjaFNjcm9sbGJhY2tSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSDwoHcGF0dGVybhgCIAEoCRIUCgxzdGFydF9vZmZzZXQYAyABKA0iRwoYU2VhcmNoU2Nyb2xsYmFja1Jlc3BvbnNlEg0KBWZvdW5kGAEgASgIEg4KBm9mZnNldBgCIAEoDRIMCgRsaW5lGAMgASgJIqYBCgxQYW5lU25hcHNob3QSDwoHcGFuZV9pZBgBIAEoCRIMCgRyb3dzGAIgASgNEgwKBGNvbHMYAyABKA0SGwoEZ3JpZBgEIAMoCzINLnR5bXV4LnYxLlJvdxISCgpjdXJzb3Jfcm93GAUgASgNEhIKCmN1cnNvcl9jb2wYBiABKA0SJAoIbGl2ZW5lc3MYByABKA4yEi50eW11eC52MS5MaXZlbmVzcyIkCgNSb3cSHQoFY2VsbHMYASADKAsyDi50eW11eC52MS5DZWxsIjsKBENlbGwSDAoEdGV4dBgBIAEoCRIKCgJmZxgCIAEoDRIKCgJiZxgDIAEoDRINCgVhdHRycxgEIAEoDSKUAQoNQXR0YWNoUmVxdWVzdBIRCgdwYW5lX2lkGAEgASgJSAASDwoFaW5wdXQYAiABKAxIABIiCgZyZXNpemUYAyABKAsyEC50eW11eC52MS5SZXNpemVIABIcCg9yZXN1bWVfZnJvbV9zZXEYBCABKARIAYgBAUIJCgdwYXlsb2FkQhIKEF9yZXN1bWVfZnJvbV9zZXEiJAoGUmVzaXplEgwKBHJvd3MYASABKA0SDAoEY29scxgCIAEoDSIoCgpFeGl0U3RhdHVzEhEKBGNvZGUYASABKAVIAIgBAUIHCgVfY29kZSIoCgtPdXRwdXRDaHVuaxILCgNzZXEYASABKAQSDAoEZGF0YRgCIAEoDCIrCgtHYXBFeGNlZWRlZBIcChRvbGRlc3RfYXZhaWxhYmxlX3NlcRgBIAEoBCILCglIZWFydGJlYXQinAIKC0F0dGFjaEV2ZW50EhAKBm91dHB1dBgBIAEoDEgAEioKCHNuYXBzaG90GAIgASgLMhYudHltdXgudjEuUGFuZVNuYXBzaG90SAASJgoGZXhpdGVkGAMgASgLMhQudHltdXgudjEuRXhpdFN0YXR1c0gAEhQKCm91dHB1dF9nYXAYBCABKAhIABItCgxnYXBfZXhjZWVkZWQYBSABKAsyFS50eW11eC52MS5HYXBFeGNlZWRlZEgAEigKCWhlYXJ0YmVhdBgGIAEoCzITLnR5bXV4LnYxLkhlYXJ0YmVhdEgAEi0KDG91dHB1dF9jaHVuaxgHIAEoCzIVLnR5bXV4LnYxLk91dHB1dENodW5rSABCCQoHcGF5bG9hZCpKCghMaXZlbmVzcxIYChRMSVZFTkVTU19VTlNQRUNJRklFRBAAEhEKDUxJVkVORVNTX0xJVkUQARIRCg1MSVZFTkVTU19ERUFEEAIqYAoLT3JpZW50YXRpb24SGwoXT1JJRU5UQVRJT05fVU5TUEVDSUZJRUQQABIaChZPUklFTlRBVElPTl9IT1JJWk9OVEFMEAESGAoUT1JJRU5UQVRJT05fVkVSVElDQUwQAjKtBgoMVHltdXhTZXJ2aWNlEkIKDUNyZWF0ZVNlc3Npb24SHi50eW11eC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdBoRLnR5bXV4LnYxLlNlc3Npb24STQoMTGlzdFNlc3Npb25zEh0udHltdXgudjEuTGlzdFNlc3Npb25zUmVxdWVzdBoeLnR5bXV4LnYxLkxpc3RTZXNzaW9uc1Jlc3BvbnNlEkoKC0tpbGxTZXNzaW9uEhwudHltdXgudjEuS2lsbFNlc3Npb25SZXF1ZXN0Gh0udHltdXgudjEuS2lsbFNlc3Npb25SZXNwb25zZRJQCg1SZXZpdmVTZXNzaW9uEh4udHltdXgudjEuUmV2aXZlU2Vzc2lvblJlcXVlc3QaHy50eW11eC52MS5SZXZpdmVTZXNzaW9uUmVzcG9uc2USQwoLQ2FwdHVyZVBhbmUSHC50eW11eC52MS5DYXB0dXJlUGFuZVJlcXVlc3QaFi50eW11eC52MS5QYW5lU25hcHNob3QSWQoQU2VhcmNoU2Nyb2xsYmFjaxIhLnR5bXV4LnYxLlNlYXJjaFNjcm9sbGJhY2tSZXF1ZXN0GiIudHltdXgudjEuU2VhcmNoU2Nyb2xsYmFja1Jlc3BvbnNlEjoKCVNwbGl0UGFuZRIaLnR5bXV4LnYxLlNwbGl0UGFuZVJlcXVlc3QaES50eW11eC52MS5TZXNzaW9uEkQKCUNsb3NlUGFuZRIaLnR5bXV4LnYxLkNsb3NlUGFuZVJlcXVlc3QaGy50eW11eC52MS5DbG9zZVBhbmVSZXNwb25zZRJACgxDcmVhdGVXaW5kb3cSHS50eW11eC52MS5DcmVhdGVXaW5kb3dSZXF1ZXN0GhEudHltdXgudjEuU2Vzc2lvbhJKCgtXYXRjaFdpbmRvdxIcLnR5bXV4LnYxLldhdGNoV2luZG93UmVxdWVzdBobLnR5bXV4LnYxLldpbmRvd0xheW91dEV2ZW50MAESPAoGQXR0YWNoEhcudHltdXgudjEuQXR0YWNoUmVxdWVzdBoVLnR5bXV4LnYxLkF0dGFjaEV2ZW50KAEwAUKWAQoMY29tLnR5bXV4LnYxQgpUeW11eFByb3RvUAFaOWdpdGh1Yi5jb20vdHN0YXBsZXIvdHltdXgvY2xpZW50cy9nby9nZW4vdHltdXgvdjE7dHltdXh2MaICA1RYWKoCCFR5bXV4LlYxygIIVHltdXhcVjHiAhRUeW11eFxWMVxHUEJNZXRhZGF0YeoCCVR5bXV4OjpWMWIGcHJvdG8z");
 
 /**
  * @generated from message tymux.v1.Session
@@ -717,6 +717,20 @@ export type AttachRequest = Message<"tymux.v1.AttachRequest"> & {
     value: Resize;
     case: "resize";
   } | { case: undefined; value?: undefined };
+
+  /**
+   * Epic 1.1 / ADR-004 (revised): the highest OutputChunk.seq this client
+   * already has for the pane named in this same first message. Absent
+   * (None) means "no resume state, full attach" — behaves identically to
+   * a pre-feature client, which never sends this field at all. Present
+   * (Some(n), including Some(0)) asks the daemon to replay from its
+   * ReplayBuffer starting at seq n+1 instead of sending a fresh
+   * PaneSnapshot. See the Attach RPC's doc comment above for the full
+   * reconnect contract.
+   *
+   * @generated from field: optional uint64 resume_from_seq = 4;
+   */
+  resumeFromSeq?: bigint | undefined;
 };
 
 /**
@@ -771,6 +785,76 @@ export const ExitStatusSchema: GenMessage<ExitStatus> = /*@__PURE__*/
   messageDesc(file_tymux_v1_tymux, 27);
 
 /**
+ * Epic 1.1: a single sequenced output chunk. `seq` is the daemon's
+ * monotonically-increasing per-pane sequence number for this chunk (the
+ * same numbering space as PaneSnapshot's sequence and ReplayBuffer's
+ * retention window), letting a client build a `resume_from_seq` resume
+ * token from the highest `seq` it has durably received.
+ *
+ * @generated from message tymux.v1.OutputChunk
+ */
+export type OutputChunk = Message<"tymux.v1.OutputChunk"> & {
+  /**
+   * @generated from field: uint64 seq = 1;
+   */
+  seq: bigint;
+
+  /**
+   * @generated from field: bytes data = 2;
+   */
+  data: Uint8Array;
+};
+
+/**
+ * Describes the message tymux.v1.OutputChunk.
+ * Use `create(OutputChunkSchema)` to create a new message.
+ */
+export const OutputChunkSchema: GenMessage<OutputChunk> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 28);
+
+/**
+ * Epic 1.1: sent instead of a resumed OutputChunk stream when the
+ * client's requested `resume_from_seq` is older than anything the
+ * daemon's ReplayBuffer still retains. Per the Attach RPC's doc comment,
+ * the client MUST treat the PaneSnapshot event that immediately follows
+ * as authoritative and discard any locally buffered partial state — the
+ * gap cannot be closed by replay.
+ *
+ * @generated from message tymux.v1.GapExceeded
+ */
+export type GapExceeded = Message<"tymux.v1.GapExceeded"> & {
+  /**
+   * @generated from field: uint64 oldest_available_seq = 1;
+   */
+  oldestAvailableSeq: bigint;
+};
+
+/**
+ * Describes the message tymux.v1.GapExceeded.
+ * Use `create(GapExceededSchema)` to create a new message.
+ */
+export const GapExceededSchema: GenMessage<GapExceeded> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 29);
+
+/**
+ * Epic 1.1: an empty keepalive event sent on an application-level
+ * interval during an otherwise-idle attach, so a client can distinguish
+ * "still connected, just quiet" from a silently-dead transport without
+ * waiting on TCP/HTTP2-level timeouts alone. Carries no data.
+ *
+ * @generated from message tymux.v1.Heartbeat
+ */
+export type Heartbeat = Message<"tymux.v1.Heartbeat"> & {
+};
+
+/**
+ * Describes the message tymux.v1.Heartbeat.
+ * Use `create(HeartbeatSchema)` to create a new message.
+ */
+export const HeartbeatSchema: GenMessage<Heartbeat> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 30);
+
+/**
  * @generated from message tymux.v1.AttachEvent
  */
 export type AttachEvent = Message<"tymux.v1.AttachEvent"> & {
@@ -812,6 +896,39 @@ export type AttachEvent = Message<"tymux.v1.AttachEvent"> & {
      */
     value: boolean;
     case: "outputGap";
+  } | {
+    /**
+     * Epic 1.1: replay-buffer-exceeded signal for a resume request whose
+     * `resume_from_seq` is too old. See GapExceeded's own doc comment.
+     *
+     * @generated from field: tymux.v1.GapExceeded gap_exceeded = 5;
+     */
+    value: GapExceeded;
+    case: "gapExceeded";
+  } | {
+    /**
+     * Epic 1.1: application-level keepalive. See Heartbeat's own doc
+     * comment.
+     *
+     * @generated from field: tymux.v1.Heartbeat heartbeat = 6;
+     */
+    value: Heartbeat;
+    case: "heartbeat";
+  } | {
+    /**
+     * Epic 1.1 / ADR-001 (revised): a NEW, additive sibling to `output`
+     * above — NOT a promotion/replacement of it. `output` (field 1) stays
+     * byte-for-byte unchanged forever, so any pre-existing client that
+     * only reads field 1 keeps working with zero code change and zero
+     * wire-format difference. A client that wants resume support reads
+     * this field instead: the same raw pty bytes, plus the `seq` needed
+     * to build a `resume_from_seq` token. The daemon populates exactly
+     * one of `output`/`output_chunk` per AttachEvent, not both.
+     *
+     * @generated from field: tymux.v1.OutputChunk output_chunk = 7;
+     */
+    value: OutputChunk;
+    case: "outputChunk";
   } | { case: undefined; value?: undefined };
 };
 
@@ -820,7 +937,7 @@ export type AttachEvent = Message<"tymux.v1.AttachEvent"> & {
  * Use `create(AttachEventSchema)` to create a new message.
  */
 export const AttachEventSchema: GenMessage<AttachEvent> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 28);
+  messageDesc(file_tymux_v1_tymux, 31);
 
 /**
  * Whether a pane's/session's backing process is still running. proto3
@@ -1024,6 +1141,37 @@ export const TymuxService: GenService<{
    *    daemon tracks every attached client's reported viewport per window
    *    and applies the dimension-wise minimum across all of them, rather
    *    than sizing this one pane to this one client's last report.
+   *
+   * Epic 1.1: shared reconnect-loop specification. This is the one
+   * contract `tymux-cli`, `clients/ts`, and `clients/go` (Epics 5.1, 5.2,
+   * 6.1) must all implement identically — do not reinvent per client.
+   *  - resume_from_seq (AttachRequest, outside the oneof) is bound to the
+   *    pane_id carried by that same first message on the stream; it has
+   *    no meaning attached to any other message. Omitting it (None) is a
+   *    full attach and behaves identically to a pre-feature client: the
+   *    daemon responds with a PaneSnapshot priming event, as it always
+   *    has. Setting it to Some(n) asks the daemon to replay OutputChunk
+   *    events from its per-pane ReplayBuffer starting at seq n+1, skipping
+   *    the PaneSnapshot, PROVIDED seq n+1 is still retained.
+   *  - GapExceeded means the requested resume_from_seq is older than
+   *    anything the ReplayBuffer still retains — the gap cannot be closed
+   *    by replay. A GapExceeded event is always immediately followed by a
+   *    PaneSnapshot event, which the client MUST treat as authoritative:
+   *    discard any locally buffered partial/replayed state and redraw
+   *    from the snapshot, exactly as a fresh (non-resuming) attach would.
+   *  - Heartbeat is an empty keepalive sent on an application-level
+   *    interval during an otherwise-idle stream, so a client can tell
+   *    "connected but quiet" apart from a silently-dead transport without
+   *    relying solely on TCP/HTTP2-level timeouts. It carries no data and
+   *    requires no client response.
+   *  - Reconnect backoff policy (ADR-004, revised): on stream failure, a
+   *    conforming client retries with exponential backoff starting at
+   *    200ms, doubling each attempt (x2 multiplier), capped at 8s per
+   *    attempt, with +/-20% jitter, giving up after 14 attempts (nominal
+   *    cumulative backoff ~68.6s). This ceiling is deliberately chosen to
+   *    be >= the daemon's grace_period_duration (60s), so a client that
+   *    keeps retrying on this schedule has a real chance of reconnecting
+   *    before the daemon gives up on the pane's grace period.
    *
    * @generated from rpc tymux.v1.TymuxService.Attach
    */

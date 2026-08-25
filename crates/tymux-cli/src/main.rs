@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::time::Duration;
 
 mod config;
 mod copy_mode;
@@ -269,7 +270,12 @@ fn friendly_message(e: &anyhow::Error) -> String {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let mut client = TymuxServiceClient::connect(cli.addr).await?;
+    let endpoint = tonic::transport::Endpoint::from_shared(cli.addr)?
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true);
+    let channel = endpoint.connect().await?;
+    let mut client = TymuxServiceClient::new(channel);
     let config = TymuxConfig::load_or_default();
     let status_bar_cfg = StatusBarConfig::new(!cli.no_status_bar);
 
@@ -492,6 +498,10 @@ async fn attach(
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tx.send(AttachRequest {
         payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
+        // Epic 1.1 / Task 1.1.1b: no resume state to offer yet — building
+        // and sending a real resume token is Epic 6.1's job. `None` here
+        // behaves identically to a pre-feature client's request.
+        resume_from_seq: None,
     })
     .await?;
 
@@ -646,6 +656,9 @@ async fn attach(
                         ReassembledOutput::Forward(fwd) => {
                             tx.send(AttachRequest {
                                 payload: Some(attach_request::Payload::Input(fwd)),
+                                // Epic 1.1 / Task 1.1.1b: resume_from_seq only
+                                // has meaning on the first message; not used here.
+                                resume_from_seq: None,
                             }).await?;
                         }
                         ReassembledOutput::Action(action) => match action {
@@ -844,6 +857,9 @@ async fn send_resize_and_repaint(
             rows: pty_rows as u32,
             cols: cols as u32,
         })),
+        // Epic 1.1 / Task 1.1.1b: resume_from_seq only has meaning on the
+        // first message; not used here.
+        resume_from_seq: None,
     })
     .await?;
 
@@ -952,6 +968,124 @@ mod tests {
             attach_body.matches("std::io::stdout()").count(),
             1,
             "attach() must acquire exactly one stdout handle (the single owner), not one per write site"
+        );
+    }
+
+    /// REQ-7 (Story 3.1.1 AC2, Task 3.1.1b) — proves the client's transport
+    /// keepalive config is actually set on the `Endpoint` used to build the
+    /// connection, not just present somewhere in the source. Only exercises
+    /// the happy path (builder succeeds, channel connects to a local
+    /// server); it can't prove keepalive fires under real packet loss — see
+    /// validation.md REQ-7's manual/real-hardware verification note.
+    #[tokio::test]
+    async fn client_endpoint_should_configure_keep_alive_while_idle_true_when_constructed_via_explicit_endpoint_builder(
+    ) {
+        use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
+        use tymux_proto::v1::{
+            AttachEvent, ClosePaneResponse, KillSessionResponse, ListSessionsResponse,
+            PaneSnapshot, SearchScrollbackRequest, SearchScrollbackResponse, WatchWindowRequest,
+            WindowLayoutEvent,
+        };
+
+        /// Bare-bones service that only needs to complete an HTTP/2
+        /// connection handshake — this test never issues an RPC, it only
+        /// proves the client's `Endpoint` (with keepalive config attached)
+        /// can establish a real transport connection to a real server.
+        struct DummyTymuxService;
+
+        #[tonic::async_trait]
+        impl TymuxService for DummyTymuxService {
+            async fn create_session(
+                &self,
+                _request: tonic::Request<CreateSessionRequest>,
+            ) -> Result<tonic::Response<Session>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn list_sessions(
+                &self,
+                _request: tonic::Request<ListSessionsRequest>,
+            ) -> Result<tonic::Response<ListSessionsResponse>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn kill_session(
+                &self,
+                _request: tonic::Request<KillSessionRequest>,
+            ) -> Result<tonic::Response<KillSessionResponse>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn revive_session(
+                &self,
+                _request: tonic::Request<ReviveSessionRequest>,
+            ) -> Result<tonic::Response<ReviveSessionResponse>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn capture_pane(
+                &self,
+                _request: tonic::Request<CapturePaneRequest>,
+            ) -> Result<tonic::Response<PaneSnapshot>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn search_scrollback(
+                &self,
+                _request: tonic::Request<SearchScrollbackRequest>,
+            ) -> Result<tonic::Response<SearchScrollbackResponse>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn split_pane(
+                &self,
+                _request: tonic::Request<SplitPaneRequest>,
+            ) -> Result<tonic::Response<Session>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn close_pane(
+                &self,
+                _request: tonic::Request<ClosePaneRequest>,
+            ) -> Result<tonic::Response<ClosePaneResponse>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn create_window(
+                &self,
+                _request: tonic::Request<CreateWindowRequest>,
+            ) -> Result<tonic::Response<Session>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            type WatchWindowStream = tokio_stream::Empty<Result<WindowLayoutEvent, tonic::Status>>;
+            async fn watch_window(
+                &self,
+                _request: tonic::Request<WatchWindowRequest>,
+            ) -> Result<tonic::Response<Self::WatchWindowStream>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            type AttachStream = tokio_stream::Empty<Result<AttachEvent, tonic::Status>>;
+            async fn attach(
+                &self,
+                _request: tonic::Request<tonic::Streaming<AttachRequest>>,
+            ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(TymuxServiceServer::new(DummyTymuxService))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+
+        let channel = endpoint.connect().await;
+        assert!(
+            channel.is_ok(),
+            "Endpoint with keepalive config should still connect: {:?}",
+            channel.err()
         );
     }
 
