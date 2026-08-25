@@ -18,10 +18,10 @@ use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
     attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
     Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse, CreateSessionRequest,
-    CreateWindowRequest, ExitStatus, GapExceeded, KillSessionRequest, KillSessionResponse,
-    Layout as ProtoLayout, LayoutChild as ProtoLayoutChild, ListSessionsRequest,
-    ListSessionsResponse, Liveness, Orientation as ProtoOrientation, OutputChunk,
-    Pane as ProtoPane, PaneSnapshot as ProtoSnapshot, ReviveSessionRequest,
+    CreateWindowRequest, ExitStatus, GapExceeded, Heartbeat, KillSessionRequest,
+    KillSessionResponse, Layout as ProtoLayout, LayoutChild as ProtoLayoutChild,
+    ListSessionsRequest, ListSessionsResponse, Liveness, Orientation as ProtoOrientation,
+    OutputChunk, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot, ReviveSessionRequest,
     ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest, SearchScrollbackResponse,
     Session as ProtoSession, Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest,
     Window as ProtoWindow, WindowLayoutEvent,
@@ -32,6 +32,23 @@ use tymux_proto::v1::{
 /// possible disconnect-survival regression rather than an ordinary exit.
 /// Overridable via `TYMUXD_DISCONNECT_REGRESSION_WINDOW_MS` for testing.
 const DEFAULT_DISCONNECT_REGRESSION_WINDOW: Duration = Duration::from_millis(300);
+
+/// Default grace period (Task 3.2.2a) an `Attach` stream's viewport
+/// registration survives after that stream ends before
+/// `unregister_viewport`/`recompute_window_geometry` actually run. Long
+/// enough that a prompt reconnect (fresh `client_id`, same viewport)
+/// lands before cleanup fires, so a brief network blip never visibly
+/// shrinks and regrows the window's geometry. Overridable via
+/// `TYMUXD_GRACE_PERIOD_MS` for testing.
+const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(60);
+
+/// Default period (Task 3.2.1a) between `Heartbeat` `AttachEvent`s sent on
+/// an otherwise-idle live loop. Not env-configurable in production
+/// (Task 3.2.1a specifies a fixed 15s), but threaded through
+/// [`TymuxDaemon`] rather than hardcoded inline in `attach()` so tests can
+/// construct a daemon with a much shorter interval instead of a real 15s
+/// wait — see `test_daemon_with_intervals`.
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct TymuxDaemon {
     engine: Arc<Engine>,
@@ -54,6 +71,14 @@ pub struct TymuxDaemon {
     /// every change rather than a metrics crate (requirements.md's
     /// security classification: internal/local, no on-call rotation).
     attached_sessions_gauge: Arc<AtomicI64>,
+    /// Task 3.2.2a: how long a deregistered `Attach` stream's viewport
+    /// entry is kept alive after that stream ends, before the deferred
+    /// `unregister_viewport`/`recompute_window_geometry` cleanup fires.
+    grace_period_duration: Duration,
+    /// Task 3.2.1a: period between `Heartbeat` events on the live loop.
+    /// Always `DEFAULT_HEARTBEAT_INTERVAL` in production; only
+    /// `test_daemon_with_intervals` (test-only) sets it shorter.
+    heartbeat_interval: Duration,
 }
 
 impl TymuxDaemon {
@@ -63,11 +88,18 @@ impl TymuxDaemon {
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_DISCONNECT_REGRESSION_WINDOW);
+        let grace_period_duration = std::env::var("TYMUXD_GRACE_PERIOD_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_GRACE_PERIOD);
         TymuxDaemon {
             engine,
             disconnect_tracker: Arc::new(Mutex::new(HashMap::new())),
             disconnect_regression_window,
             attached_sessions_gauge: Arc::new(AtomicI64::new(0)),
+            grace_period_duration,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
     }
 }
@@ -783,6 +815,7 @@ impl TymuxService for TymuxDaemon {
         let pane_for_exit = pane.clone();
         let disconnect_tracker_for_exit = self.disconnect_tracker.clone();
         let disconnect_regression_window = self.disconnect_regression_window;
+        let heartbeat_interval_duration = self.heartbeat_interval;
         let forward_handle = tokio::spawn(async move {
             let _gauge_guard = AttachedGaugeGuard {
                 gauge: attached_sessions_gauge,
@@ -820,11 +853,25 @@ impl TymuxService for TymuxDaemon {
                 }
             }
 
+            // Task 3.2.1a: a periodic application-level proof-of-life event
+            // for this live loop only — the replay-drain loop above does
+            // not get its own branch (plan.md's Story 2.3.1 AC / Story
+            // 3.2.1 note: the steady stream of OutputChunk events during
+            // replay already serves that purpose for the client's idle
+            // timer). `interval_at` (rather than `interval`, whose first
+            // tick fires immediately) means the first Heartbeat lands 15s
+            // out, not the instant the live loop starts.
+            let mut heartbeat_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + heartbeat_interval_duration,
+                heartbeat_interval_duration,
+            );
             loop {
                 // `biased` checks output_rx first every iteration, so any
                 // output already sent before the child exited (the reader
                 // thread sends, then marks exited — see pane.rs) is always
                 // drained before we report the exit, rather than racing.
+                // wait_exit() is checked before the heartbeat tick so a
+                // pane exit is never masked by a coincident 15s tick.
                 tokio::select! {
                     biased;
                     result = output_rx.recv() => {
@@ -848,6 +895,13 @@ impl TymuxService for TymuxDaemon {
                         .await;
                         return;
                     }
+                    _ = heartbeat_interval.tick() => {
+                        if forward_tx.send(Ok(AttachEvent {
+                            payload: Some(attach_event::Payload::Heartbeat(Heartbeat {})),
+                        })).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         });
@@ -857,6 +911,7 @@ impl TymuxService for TymuxDaemon {
         let pane_for_input = pane.clone();
         let engine_for_input = self.engine.clone();
         let disconnect_tracker_for_input = self.disconnect_tracker.clone();
+        let grace_period_duration = self.grace_period_duration;
         let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
@@ -899,9 +954,45 @@ impl TymuxService for TymuxDaemon {
                     .unwrap()
                     .insert(pane_id, Instant::now());
             }
+            // Task 3.2.2a: don't unregister this client's viewport (and
+            // trigger a window-geometry recompute) the instant its stream
+            // ends — defer it by `grace_period_duration` so a prompt
+            // reconnect (fresh client_id, same viewport, well within the
+            // grace period) never observes a transient regrow to the
+            // remaining clients' geometry in between. Each disconnect's
+            // deferred task is independent (Epic 3.3): it only ever acts
+            // on the one client_id/window_id pair it captured here, so a
+            // later disconnect/reconnect of a different client_id can
+            // never delay or cancel this one.
             if let Some(window_id) = window_id {
-                engine_for_input.unregister_viewport(window_id, client_id);
-                engine_for_input.recompute_window_geometry(window_id);
+                let engine_for_deferred = engine_for_input.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(grace_period_duration).await;
+                    // Task 3.2.2b: the window may have closed entirely
+                    // while this task slept (e.g. the pane's session was
+                    // killed) — that path already tears down its own
+                    // viewport/geometry state, so re-running it here would
+                    // be redundant at best and, if the window_id were ever
+                    // reused, actively wrong.
+                    if engine_for_deferred.window_snapshot(window_id).is_none() {
+                        tracing::debug!(
+                            pane_id = %pane_id,
+                            window_id = %window_id,
+                            client_id,
+                            "deferred viewport cleanup skipped: window no longer exists"
+                        );
+                        return;
+                    }
+                    engine_for_deferred.unregister_viewport(window_id, client_id);
+                    engine_for_deferred.recompute_window_geometry(window_id);
+                    tracing::info!(
+                        pane_id = %pane_id,
+                        window_id = %window_id,
+                        client_id,
+                        elapsed_ms = grace_period_duration.as_millis() as u64,
+                        "grace period expired, deferred viewport cleanup fired"
+                    );
+                });
             }
         });
         tokio::spawn(supervise(pane_id, "input", input_handle));
@@ -1134,15 +1225,49 @@ mod tests {
         TymuxDaemon::new(Arc::new(Engine::new()))
     }
 
+    /// Epic 3.2 tests: a daemon with a shortened `heartbeat_interval`
+    /// and/or `grace_period_duration`, bypassing `TymuxDaemon::new`'s env
+    /// var parsing entirely via a direct struct literal (private fields
+    /// are visible to this descendant module). Deliberately does *not* go
+    /// through `TYMUXD_GRACE_PERIOD_MS`/an equivalent heartbeat env var:
+    /// mutating process-global env vars from `cargo test`'s
+    /// parallel-by-default test threads would leak into unrelated tests
+    /// racily. A real (unpaused) short duration here, waited out with a
+    /// real bounded `tokio::time::timeout`, is fast without that hazard —
+    /// see the same tests' doc comments for why `tokio::time::pause()`/
+    /// `advance()` was tried and dropped (it races unpredictably against
+    /// the real gRPC/TCP connection every `Attach`/`WatchWindow` test in
+    /// this module already depends on).
+    fn test_daemon_with_intervals(
+        heartbeat_interval: Duration,
+        grace_period_duration: Duration,
+    ) -> TymuxDaemon {
+        TymuxDaemon {
+            engine: Arc::new(Engine::new()),
+            disconnect_tracker: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_regression_window: DEFAULT_DISCONNECT_REGRESSION_WINDOW,
+            attached_sessions_gauge: Arc::new(AtomicI64::new(0)),
+            grace_period_duration,
+            heartbeat_interval,
+        }
+    }
+
+    /// Extracts the pane from a single-leaf `Layout` — shared by `sole_pane`
+    /// below and by the Epic 3.2 tests, which read a leaf's `rows`/`cols`
+    /// straight off a `WatchWindow`-emitted `WindowLayoutEvent.layout`.
+    fn sole_pane_from_layout(layout: &ProtoLayout) -> &ProtoPane {
+        use tymux_proto::v1::layout::Node;
+        match layout.node.as_ref().unwrap() {
+            Node::Pane(p) => p,
+            Node::Split(_) => panic!("expected a single-leaf window"),
+        }
+    }
+
     /// Extracts the pane from a freshly created single-pane window's
     /// `Layout` — the common case throughout these tests, which mostly
     /// predate splits.
     fn sole_pane(window: &ProtoWindow) -> &ProtoPane {
-        use tymux_proto::v1::layout::Node;
-        match window.layout.as_ref().unwrap().node.as_ref().unwrap() {
-            Node::Pane(p) => p,
-            Node::Split(_) => panic!("expected a single-leaf window"),
-        }
+        sole_pane_from_layout(window.layout.as_ref().unwrap())
     }
 
     // /bin/sh explicitly so these don't depend on $SHELL/bash being present.
@@ -1178,6 +1303,46 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), pane.wait_exit())
             .await
             .expect("pane should exit within 5s");
+    }
+
+    /// Epic 3.2 tests: attaches to `pane_id` over a real client connection
+    /// and immediately reports a viewport via `Resize` — the two-message
+    /// handshake a real client performs, registering a window-geometry
+    /// constraint (`Engine::report_viewport_and_recompute`) under a fresh
+    /// `client_id`. Returns the request-stream sender (drop it to
+    /// disconnect this "client") and the response stream (kept alive so
+    /// the server side doesn't treat this as an already-cancelled call).
+    async fn attach_and_report_viewport(
+        client: &mut TymuxServiceClient<tonic::transport::Channel>,
+        pane_id: &str,
+        rows: u32,
+        cols: u32,
+    ) -> (
+        tokio::sync::mpsc::Sender<AttachRequest>,
+        tonic::Streaming<AttachEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+        let stream = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Resize(tymux_proto::v1::Resize {
+                rows,
+                cols,
+            })),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+        (tx, stream)
     }
 
     #[tokio::test]
@@ -3163,6 +3328,288 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    // --- Epic 3.2: application heartbeat + deferred viewport/geometry cleanup ---
+
+    /// Task 3.2.1b: `forward_handle`'s live loop (Task 3.2.1a) sends a
+    /// `Heartbeat` event roughly every `heartbeat_interval` even when the
+    /// pane produces no output at all, and the connection stays open
+    /// across it (not an error, not `Exited`).
+    ///
+    /// Uses `test_daemon_with_intervals` to shrink `heartbeat_interval` to
+    /// a few tens of milliseconds rather than the real 15s production
+    /// default. An earlier version of this test used the real default
+    /// with `tokio::time::pause()`/`advance()` (as validation.md
+    /// originally called for): `advance()` only bumps the virtual clock
+    /// and yields once — it doesn't drive the runtime to actually finish
+    /// the resulting Heartbeat's trip through the mpsc channel, tonic/h2,
+    /// and the real loopback TCP socket every `Attach` test in this module
+    /// depends on, so the very next real-network read raced (and lost
+    /// against) auto-advance jumping the paused clock past its own
+    /// timeout before those bytes physically arrived — reproduced directly
+    /// (`Elapsed(())` immediately after the first `advance()`) before
+    /// switching to this real-timing approach.
+    #[tokio::test]
+    async fn forward_handle_should_emit_heartbeat_event_when_no_pty_output_occurs_for_fifteen_seconds(
+    ) {
+        let daemon = test_daemon_with_intervals(Duration::from_millis(50), DEFAULT_GRACE_PERIOD);
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+        let mut stream = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Priming event: a Snapshot, sent before the live loop (and its
+        // heartbeat_interval) ever starts running.
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("priming event should arrive promptly")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first.payload, Some(attach_event::Payload::Snapshot(_))),
+            "expected the priming Snapshot before any Heartbeat, got {:?}",
+            first.payload
+        );
+
+        // No pty output — this Heartbeat can only be the interval tick.
+        let second = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("Heartbeat event should arrive after one heartbeat_interval of pty silence")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(second.payload, Some(attach_event::Payload::Heartbeat(_))),
+            "expected a Heartbeat event, got {:?}",
+            second.payload
+        );
+
+        // Periodic, not one-shot — and the connection is still open.
+        let third = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a second Heartbeat should arrive on the next interval tick")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            third.payload,
+            Some(attach_event::Payload::Heartbeat(_))
+        ));
+    }
+
+    /// Task 3.2.2c: a client that disconnects and reconnects (fresh
+    /// `client_id`, same viewport) well within `grace_period_duration`
+    /// must never cause the window's computed geometry to transiently
+    /// reflect its absence — the deferred-cleanup design (Task 3.2.2a)
+    /// exists specifically to prevent this thrash.
+    #[tokio::test]
+    async fn input_handle_should_defer_viewport_cleanup_and_avoid_transient_geometry_shrink_when_client_reconnects_within_grace_period(
+    ) {
+        let daemon = test_daemon();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let window_id = session.windows[0].id.clone();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let mut watch_stream = client
+            .watch_window(WatchWindowRequest {
+                window_id: window_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        // Baseline event: no clients attached yet.
+        tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("baseline layout event")
+            .unwrap()
+            .unwrap();
+
+        // Client A attaches with a larger viewport than client B below, so
+        // B's absence (if cleanup ran immediately) would be observable as
+        // a jump to A's (24, 80) alone.
+        let (_tx_a, _stream_a) = attach_and_report_viewport(&mut client, &pane_id, 24, 80).await;
+        let ev = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("layout event after client A's resize")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            {
+                let p = sole_pane_from_layout(ev.layout.as_ref().unwrap());
+                (p.rows, p.cols)
+            },
+            (24, 80)
+        );
+
+        let (tx_b, _stream_b) = attach_and_report_viewport(&mut client, &pane_id, 10, 40).await;
+        let ev = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("layout event after client B's resize")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            {
+                let p = sole_pane_from_layout(ev.layout.as_ref().unwrap());
+                (p.rows, p.cols)
+            },
+            (10, 40),
+            "steady state with both A and B attached should be the dimension-wise minimum"
+        );
+
+        // Client B disconnects.
+        drop(tx_b);
+
+        // No immediate cleanup: the old immediate-unregister code would
+        // have produced a WindowLayoutEvent reflecting A alone (24, 80)
+        // right here. The deferred design must produce nothing at all
+        // within this short window.
+        let immediate = tokio::time::timeout(Duration::from_millis(500), watch_stream.next()).await;
+        assert!(
+            immediate.is_err(),
+            "expected no WindowLayoutEvent immediately after disconnect (cleanup should be \
+             deferred by grace_period_duration), got {:?}",
+            immediate
+        );
+
+        // Client B reconnects (fresh client_id, same viewport) well within
+        // the default grace period.
+        let (_tx_b2, _stream_b2) = attach_and_report_viewport(&mut client, &pane_id, 10, 40).await;
+        let ev = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("layout event after client B reconnects")
+            .unwrap()
+            .unwrap();
+        // Never transiently observed A-alone geometry (24, 80) at any
+        // point across the disconnect/reconnect.
+        assert_eq!(
+            {
+                let p = sole_pane_from_layout(ev.layout.as_ref().unwrap());
+                (p.rows, p.cols)
+            },
+            (10, 40)
+        );
+    }
+
+    /// Task 3.2.2d: when a disconnected client does *not* reconnect within
+    /// `grace_period_duration`, the deferred cleanup must still fire
+    /// exactly once — `unregister_viewport`/`recompute_window_geometry`
+    /// run, observable via the window reverting to its default geometry —
+    /// and log an `info` line naming `pane_id`/`window_id`/`client_id`/
+    /// `elapsed_ms` (Story 3.2.2 AC2).
+    ///
+    /// Uses `test_daemon_with_intervals` to shrink `grace_period_duration`
+    /// to a few hundred milliseconds rather than the real 60s production
+    /// default — see the heartbeat test above for why an earlier version
+    /// of this test used `tokio::time::pause()`/`advance()` (as
+    /// validation.md originally called for) and why that raced against
+    /// the real gRPC/TCP connection (`Elapsed(())` on the very next real
+    /// read after `advance()`, reproduced directly).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn input_handle_should_fire_deferred_cleanup_and_log_elapsed_ms_when_client_does_not_reconnect_within_grace_period(
+    ) {
+        let daemon =
+            test_daemon_with_intervals(DEFAULT_HEARTBEAT_INTERVAL, Duration::from_millis(300));
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let window_id = session.windows[0].id.clone();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let mut watch_stream = client
+            .watch_window(WatchWindowRequest {
+                window_id: window_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("baseline layout event")
+            .unwrap()
+            .unwrap();
+
+        // Below the (24, 80) default, so cleanup reverting to the default
+        // is unambiguously observable.
+        let (tx, _stream) = attach_and_report_viewport(&mut client, &pane_id, 15, 60).await;
+        let ev = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("layout event after resize")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            {
+                let p = sole_pane_from_layout(ev.layout.as_ref().unwrap());
+                (p.rows, p.cols)
+            },
+            (15, 60)
+        );
+
+        // Disconnect without reconnecting.
+        drop(tx);
+
+        // Not cleaned up yet — well short of this test's 300ms
+        // grace_period_duration.
+        let immediate = tokio::time::timeout(Duration::from_millis(100), watch_stream.next()).await;
+        assert!(
+            immediate.is_err(),
+            "expected no cleanup before grace_period_duration elapses, got {:?}",
+            immediate
+        );
+
+        // Wait past the 300ms grace period for the deferred cleanup to fire.
+        let ev = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("layout event once the deferred cleanup fires")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            {
+                let p = sole_pane_from_layout(ev.layout.as_ref().unwrap());
+                (p.rows, p.cols)
+            },
+            (24, 80),
+            "window should revert to the default geometry once the disconnected client's \
+             viewport is finally unregistered"
+        );
+
+        // Substring checks only (not exact `key=value` formatting): Story
+        // 3.2.2 AC2 requires pane_id/window_id/client_id/elapsed_ms on
+        // this line, but the tracing formatter's exact rendering of each
+        // field isn't this test's concern.
+        assert!(logs_contain(
+            "grace period expired, deferred viewport cleanup fired"
+        ));
+        assert!(logs_contain(&pane_id));
+        assert!(logs_contain(&window_id));
+        assert!(logs_contain("client_id"));
+        assert!(logs_contain("elapsed_ms"));
     }
 
     fn search_req(pane_id: String, pattern: &str, start_offset: u32) -> SearchScrollbackRequest {
