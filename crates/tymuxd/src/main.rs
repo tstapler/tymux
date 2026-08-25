@@ -945,6 +945,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(%addr, "tymuxd listening");
     Server::builder()
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .add_service(TymuxServiceServer::new(daemon))
         .serve_with_shutdown(socket_addr, shutdown_signal())
         .await?;
