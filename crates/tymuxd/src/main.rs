@@ -2432,6 +2432,122 @@ mod tests {
         );
     }
 
+    /// Task 2.4.1c / REQ-6 (Story 2.4.1's second AC): a client whose first
+    /// `AttachRequest` omits `resume_from_seq` never gets `emit_output_chunk:
+    /// true` (see the `None` arm of `attach()`'s `match resume_from_seq`
+    /// and `forward_step_for_output_result`'s doc comment on the oneof's
+    /// mutual exclusivity), so every event on this path must carry the
+    /// legacy `output` field — never `output_chunk`. This converts the
+    /// pre-mortem's P1 finding ("old clients are unaffected") from an
+    /// assumption into a falsifiable check: an old `clients/go@v0.1.0`
+    /// stub that only decodes field 1 would silently see *nothing* for any
+    /// event that instead carried `output_chunk`, so this test panics if
+    /// that ever happens, and separately asserts the concatenated legacy
+    /// `output` bytes are exactly the raw pty echo of a known marker command
+    /// — clean text, not `OutputChunk`'s own wire framing.
+    #[tokio::test]
+    async fn attach_legacy_output_field_should_be_uncontaminated_raw_pty_bytes_when_resume_from_seq_is_absent(
+    ) {
+        let daemon = test_daemon();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Task 2.4.1a's contract: the very first event on the no-resume
+        // path is still the priming Snapshot, exactly as before this
+        // feature existed.
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        assert!(
+            matches!(first.payload, Some(attach_event::Payload::Snapshot(_))),
+            "expected the first AttachEvent to be a Snapshot, got {:?}",
+            first.payload
+        );
+
+        // A fixed, uniquely-identifiable marker written via printf (not
+        // echo) so the only bytes the pty produces are the shell's own
+        // input-echo of this exact command line plus this exact literal
+        // string — nothing ambiguous to search for.
+        const MARKER: &str = "COMPAT-ASSERTION-MARKER-9f3c";
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Input(
+                format!("printf '%s\\n' {MARKER}\n").into_bytes(),
+            )),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+
+        let mut legacy_output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "attach stream did not deliver {MARKER} in time"
+            );
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("attach stream stalled")
+                .unwrap()
+                .expect("attach stream closed before marker arrived");
+            match event.payload {
+                Some(attach_event::Payload::Output(bytes)) => {
+                    legacy_output.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&legacy_output).contains(MARKER) {
+                        break;
+                    }
+                }
+                Some(attach_event::Payload::OutputChunk(chunk)) => {
+                    panic!(
+                        "resume_from_seq: None must never emit output_chunk — an old \
+                         client decoding only field 1 (`output`) would see nothing for \
+                         this event and silently lose data; got OutputChunk {{ seq: {}, \
+                         data: {:?} }}",
+                        chunk.seq, chunk.data
+                    );
+                }
+                Some(attach_event::Payload::OutputGap(_)) => continue,
+                other => panic!(
+                    "unexpected AttachEvent payload while waiting for {MARKER}: {other:?}"
+                ),
+            }
+        }
+
+        // The concatenated legacy `output` bytes must contain exactly the
+        // raw marker text, with nothing between its characters — proof
+        // there's no interleaved protobuf sub-message framing (a varint
+        // seq tag, a length-delimited `data` prefix) corrupting it, which
+        // is exactly what an old client reading only this field depends on.
+        let text = String::from_utf8_lossy(&legacy_output);
+        assert!(
+            text.contains(MARKER),
+            "expected the exact, uninterrupted marker text in the legacy `output` bytes, \
+             got: {text:?}"
+        );
+    }
+
     /// End-to-end regression test for the Ctrl-d hang bug fixed earlier:
     /// spins up a real server, attaches, tells the shell to exit, and
     /// asserts the stream reports Exited and closes — instead of hanging.
