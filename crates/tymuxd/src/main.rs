@@ -71,6 +71,13 @@ pub struct TymuxDaemon {
     /// every change rather than a metrics crate (requirements.md's
     /// security classification: internal/local, no on-call rotation).
     attached_sessions_gauge: Arc<AtomicI64>,
+    /// Task 4.1.1a: backs `tymux_attach_resume_outcome_total`, tagged by
+    /// which of `attach()`'s three branches (Task 2.2.1b: `InWindow`,
+    /// `GapExceeded`, `None`) a given attach took. Same hand-rolled-atomics
+    /// convention as `attached_sessions_gauge` above (requirements.md's
+    /// security classification: internal/local, no on-call rotation, no
+    /// metrics-crate justification).
+    resume_outcome_counters: Arc<ResumeOutcomeCounters>,
     /// Task 3.2.2a: how long a deregistered `Attach` stream's viewport
     /// entry is kept alive after that stream ends, before the deferred
     /// `unregister_viewport`/`recompute_window_geometry` cleanup fires.
@@ -98,6 +105,7 @@ impl TymuxDaemon {
             disconnect_tracker: Arc::new(Mutex::new(HashMap::new())),
             disconnect_regression_window,
             attached_sessions_gauge: Arc::new(AtomicI64::new(0)),
+            resume_outcome_counters: Arc::new(ResumeOutcomeCounters::new()),
             grace_period_duration,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
@@ -120,6 +128,78 @@ impl Drop for AttachedGaugeGuard {
         let new_count = self.gauge.fetch_sub(1, Ordering::SeqCst) - 1;
         tracing::info!(pane_id = %self.pane_id, tymux_attached_sessions_gauge = new_count, "attach: gauge decremented");
     }
+}
+
+/// Task 4.1.1a: Domain Glossary term `ResumeOutcome` — which of `attach()`'s
+/// three branches (Task 2.2.1b) a given attach took, driving the tagged
+/// `tymux_attach_resume_outcome_total` counter (Observability Plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeOutcome {
+    ResumedFromBuffer,
+    GapExceededFallback,
+    NoResumeTokenFullAttach,
+}
+
+impl ResumeOutcome {
+    /// The tag value used both in the `tymux_attach_resume_outcome_total`
+    /// log line and (implicitly) as this counter's metric label — matches
+    /// plan.md's Observability Plan naming (`resumed_from_buffer` /
+    /// `gap_exceeded_fallback` / `no_resume_token_full_attach`) verbatim.
+    fn tag(self) -> &'static str {
+        match self {
+            ResumeOutcome::ResumedFromBuffer => "resumed_from_buffer",
+            ResumeOutcome::GapExceededFallback => "gap_exceeded_fallback",
+            ResumeOutcome::NoResumeTokenFullAttach => "no_resume_token_full_attach",
+        }
+    }
+}
+
+/// Task 4.1.1a: backs `tymux_attach_resume_outcome_total`, tagged by
+/// [`ResumeOutcome`]. Three named atomics rather than a `HashMap` behind a
+/// `Mutex` (plan.md's alternative), since the tag set is fixed, small, and
+/// known at compile time — same hand-rolled-atomics convention as
+/// `attached_sessions_gauge`.
+struct ResumeOutcomeCounters {
+    resumed_from_buffer: AtomicI64,
+    gap_exceeded_fallback: AtomicI64,
+    no_resume_token_full_attach: AtomicI64,
+}
+
+impl ResumeOutcomeCounters {
+    fn new() -> Self {
+        ResumeOutcomeCounters {
+            resumed_from_buffer: AtomicI64::new(0),
+            gap_exceeded_fallback: AtomicI64::new(0),
+            no_resume_token_full_attach: AtomicI64::new(0),
+        }
+    }
+
+    fn atomic_for(&self, outcome: ResumeOutcome) -> &AtomicI64 {
+        match outcome {
+            ResumeOutcome::ResumedFromBuffer => &self.resumed_from_buffer,
+            ResumeOutcome::GapExceededFallback => &self.gap_exceeded_fallback,
+            ResumeOutcome::NoResumeTokenFullAttach => &self.no_resume_token_full_attach,
+        }
+    }
+
+    #[cfg(test)]
+    fn value(&self, outcome: ResumeOutcome) -> i64 {
+        self.atomic_for(outcome).load(Ordering::SeqCst)
+    }
+}
+
+/// Task 4.1.1b: increments the counter matching `outcome` and logs the new
+/// value via `tracing::info!`, mirroring `AttachedGaugeGuard::drop`'s exact
+/// wording style (`main.rs:86-91`) — plain atomics + a log line on change,
+/// not a metrics crate.
+fn record_resume_outcome(counters: &ResumeOutcomeCounters, pane_id: Uuid, outcome: ResumeOutcome) {
+    let new_count = counters.atomic_for(outcome).fetch_add(1, Ordering::SeqCst) + 1;
+    tracing::info!(
+        pane_id = %pane_id,
+        outcome = outcome.tag(),
+        tymux_attach_resume_outcome_total = new_count,
+        "attach: resume outcome counter incremented"
+    );
 }
 
 fn liveness_of(live: bool) -> Liveness {
@@ -735,7 +815,12 @@ impl TymuxService for TymuxDaemon {
         // matching decrement happens via AttachedGaugeGuard, dropped when
         // forward_handle ends for any reason.
         let new_gauge_count = self.attached_sessions_gauge.fetch_add(1, Ordering::SeqCst) + 1;
-        tracing::info!(pane_id = %pane_id, tymux_attached_sessions_gauge = new_gauge_count, "attach: gauge incremented");
+        tracing::info!(
+            pane_id = %pane_id,
+            tymux_attached_sessions_gauge = new_gauge_count,
+            resume_requested = resume_from_seq.is_some(),
+            "attach: gauge incremented"
+        );
         let attached_sessions_gauge = self.attached_sessions_gauge.clone();
 
         // Resize is window-scoped (ADR-004): track this client's reported
@@ -768,6 +853,12 @@ impl TymuxService for TymuxDaemon {
         ) = match resume_from_seq {
             Some(seq) => match pane.replay_since(seq) {
                 ReplayOutcome::InWindow { chunks, tail_seq } => {
+                    // Task 4.1.1a/b: resumed from the retained replay buffer.
+                    record_resume_outcome(
+                        &self.resume_outcome_counters,
+                        pane_id,
+                        ResumeOutcome::ResumedFromBuffer,
+                    );
                     // Task 2.3.1a: don't turn these into AttachEvents and
                     // send them here — a large backlog can exceed the
                     // forward channel's capacity, and sending it
@@ -782,6 +873,18 @@ impl TymuxService for TymuxDaemon {
                 ReplayOutcome::GapExceeded {
                     oldest_available_seq,
                 } => {
+                    // Task 4.1.1a/b/c: fell back past the retained window.
+                    record_resume_outcome(
+                        &self.resume_outcome_counters,
+                        pane_id,
+                        ResumeOutcome::GapExceededFallback,
+                    );
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        resume_from_seq = seq,
+                        oldest_available_seq = oldest_available_seq.unwrap_or(0),
+                        "resume request outside replay buffer retention"
+                    );
                     // Task 2.2.2a: signal the gap, then fall back to
                     // exactly today's snapshot priming path. The
                     // client already declared resume support by
@@ -798,6 +901,12 @@ impl TymuxService for TymuxDaemon {
                 }
             },
             None => {
+                // Task 4.1.1a/b: no resume token sent at all.
+                record_resume_outcome(
+                    &self.resume_outcome_counters,
+                    pane_id,
+                    ResumeOutcome::NoResumeTokenFullAttach,
+                );
                 // Unchanged pre-feature path (Epic 2.4).
                 let (snapshot_event, snapshot_seq) = snapshot_priming_event(&pane, &pane_id_str);
                 (vec![snapshot_event], snapshot_seq, false, Vec::new())
@@ -1247,6 +1356,7 @@ mod tests {
             disconnect_tracker: Arc::new(Mutex::new(HashMap::new())),
             disconnect_regression_window: DEFAULT_DISCONNECT_REGRESSION_WINDOW,
             attached_sessions_gauge: Arc::new(AtomicI64::new(0)),
+            resume_outcome_counters: Arc::new(ResumeOutcomeCounters::new()),
             grace_period_duration,
             heartbeat_interval,
         }
@@ -2451,6 +2561,321 @@ mod tests {
             "expected the second event to be a Snapshot, got {:?}",
             second.payload
         );
+    }
+
+    // --- Epic 4.1: resume-outcome counter + structured logs ---
+
+    /// Story 4.1.1 AC1 / REQ-10: `attach()`'s `InWindow` branch increments
+    /// `tymux_attach_resume_outcome_total{outcome="resumed_from_buffer"}`
+    /// by exactly 1 and logs the new value via `tracing::info!` (Task
+    /// 4.1.1a/b).
+    #[tokio::test]
+    async fn attach_resume_outcome_counter_should_increment_resumed_from_buffer_when_in_window_branch_runs(
+    ) {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let counters = daemon.resume_outcome_counters.clone();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // Settle on a marker to get a real, still-retained resume point
+        // (mirrors `attach_should_replay_missed_chunks_..._in_window`'s
+        // settle-on-a-marker pattern).
+        let mut rx = pane.subscribe();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buffered = Vec::new();
+        pane.write_input(b"echo marker\n").unwrap();
+        let resume_from_seq = loop {
+            match rx.try_recv() {
+                Ok((seq, bytes)) => {
+                    buffered.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&buffered).contains("marker") {
+                        break seq;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "marker output never arrived");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("unexpected broadcast recv error: {e:?}"),
+            }
+        };
+
+        assert_eq!(counters.value(ResumeOutcome::ResumedFromBuffer), 0);
+
+        let (tx, req_rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: Some(resume_from_seq),
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(req_rx)))
+            .await
+            .unwrap()
+            .into_inner();
+        // The InWindow branch runs synchronously inside attach() before it
+        // even returns the Response, so the counter has already moved by
+        // the time the client holds a connected stream — this drain just
+        // gives the server task a scheduling tick, it isn't load-bearing.
+        let _ = tokio::time::timeout(Duration::from_millis(500), inbound.message()).await;
+
+        assert_eq!(
+            counters.value(ResumeOutcome::ResumedFromBuffer),
+            1,
+            "InWindow branch should increment resumed_from_buffer exactly once"
+        );
+        assert_eq!(counters.value(ResumeOutcome::GapExceededFallback), 0);
+        assert_eq!(counters.value(ResumeOutcome::NoResumeTokenFullAttach), 0);
+    }
+
+    /// Story 4.1.1 AC2 / REQ-10: the `GapExceeded` branch emits a
+    /// `tracing::warn!` line with `pane_id`/`resume_from_seq`/
+    /// `oldest_available_seq`, distinct from the counter's own
+    /// `tracing::info!` line (Task 4.1.1c).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn attach_gap_exceeded_branch_should_emit_warn_log_with_pane_id_resume_from_seq_and_oldest_available_seq_fields(
+    ) {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let counters = daemon.resume_outcome_counters.clone();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // Same flood-past-the-replay-budget setup as
+        // `attach_should_emit_gap_exceeded_then_snapshot_when_resume_from_seq_is_stale_and_evicted`
+        // — a pane's first-ever chunk is always seq == 1, so it's a valid
+        // stale resume point once the flood evicts it.
+        let stale_resume_from_seq = 1u64;
+        const LINE_COUNT: usize = 40_000;
+        let cmd = format!(
+            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; echo FLOOD-DONE\n"
+        );
+        pane.write_input(cmd.as_bytes()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = pane.snapshot();
+            let screen_text: String = snapshot
+                .grid
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|c| c.text.as_str())
+                .collect();
+            if screen_text.contains("FLOOD-DONE") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "flood never completed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let (tx, req_rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: Some(stale_resume_from_seq),
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(req_rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        assert!(
+            matches!(first.payload, Some(attach_event::Payload::GapExceeded(_))),
+            "expected the first event to be GapExceeded, got {:?}",
+            first.payload
+        );
+
+        assert_eq!(counters.value(ResumeOutcome::GapExceededFallback), 1);
+
+        // Substring checks only (not exact key=value formatting), matching
+        // this file's existing tracing_test convention (see
+        // `input_handle_should_fire_deferred_cleanup_and_log_elapsed_ms_when_client_does_not_reconnect_within_grace_period`).
+        assert!(logs_contain(
+            "resume request outside replay buffer retention"
+        ));
+        assert!(logs_contain(&pane_id.to_string()));
+        assert!(logs_contain("resume_from_seq"));
+        assert!(logs_contain("oldest_available_seq"));
+    }
+
+    /// Task 4.1.1a/b/c / REQ-10: real `attach()` calls exercising
+    /// `InWindow`, `GapExceeded`, and `None` in turn against a real pane —
+    /// each `ResumeOutcome` tag increments exactly once, and the `attach:
+    /// gauge incremented` line gains a `resume_requested: bool` field.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn attach_should_increment_matching_counter_and_log_for_each_of_three_resume_outcome_branches_when_exercised_in_sequence(
+    ) {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let counters = daemon.resume_outcome_counters.clone();
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // 1) None branch: a plain attach with no resume_from_seq at all.
+        let (tx1, req_rx1) = tokio::sync::mpsc::channel(16);
+        tx1.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str.clone())),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+        let mut inbound1 = client
+            .attach(Request::new(ReceiverStream::new(req_rx1)))
+            .await
+            .unwrap()
+            .into_inner();
+        let _ = tokio::time::timeout(Duration::from_secs(5), inbound1.message())
+            .await
+            .expect("attach must respond within 5s");
+        drop(inbound1);
+        drop(tx1);
+
+        assert_eq!(counters.value(ResumeOutcome::NoResumeTokenFullAttach), 1);
+        assert_eq!(counters.value(ResumeOutcome::ResumedFromBuffer), 0);
+        assert_eq!(counters.value(ResumeOutcome::GapExceededFallback), 0);
+
+        // 2) InWindow branch: settle on a marker for a real, still-retained
+        // resume point.
+        let mut rx = pane.subscribe();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buffered = Vec::new();
+        pane.write_input(b"echo marker\n").unwrap();
+        let resume_from_seq = loop {
+            match rx.try_recv() {
+                Ok((seq, bytes)) => {
+                    buffered.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&buffered).contains("marker") {
+                        break seq;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "marker output never arrived");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("unexpected broadcast recv error: {e:?}"),
+            }
+        };
+
+        let (tx2, req_rx2) = tokio::sync::mpsc::channel(16);
+        tx2.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str.clone())),
+            resume_from_seq: Some(resume_from_seq),
+        })
+        .await
+        .unwrap();
+        let mut inbound2 = client
+            .attach(Request::new(ReceiverStream::new(req_rx2)))
+            .await
+            .unwrap()
+            .into_inner();
+        let _ = tokio::time::timeout(Duration::from_millis(500), inbound2.message()).await;
+        drop(inbound2);
+        drop(tx2);
+
+        assert_eq!(counters.value(ResumeOutcome::ResumedFromBuffer), 1);
+        assert_eq!(counters.value(ResumeOutcome::NoResumeTokenFullAttach), 1);
+        assert_eq!(counters.value(ResumeOutcome::GapExceededFallback), 0);
+
+        // 3) GapExceeded branch: flood past the replay budget, then attach
+        // with a now-evicted resume point (mirrors
+        // `attach_should_emit_gap_exceeded_then_snapshot_when_resume_from_seq_is_stale_and_evicted`).
+        let stale_resume_from_seq = 1u64;
+        const LINE_COUNT: usize = 40_000;
+        let cmd = format!(
+            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; echo FLOOD-DONE\n"
+        );
+        pane.write_input(cmd.as_bytes()).unwrap();
+        let flood_deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = pane.snapshot();
+            let screen_text: String = snapshot
+                .grid
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|c| c.text.as_str())
+                .collect();
+            if screen_text.contains("FLOOD-DONE") {
+                break;
+            }
+            assert!(Instant::now() < flood_deadline, "flood never completed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let (tx3, req_rx3) = tokio::sync::mpsc::channel(16);
+        tx3.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: Some(stale_resume_from_seq),
+        })
+        .await
+        .unwrap();
+        let mut inbound3 = client
+            .attach(Request::new(ReceiverStream::new(req_rx3)))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound3.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        assert!(
+            matches!(first.payload, Some(attach_event::Payload::GapExceeded(_))),
+            "expected the first event to be GapExceeded, got {:?}",
+            first.payload
+        );
+
+        assert_eq!(counters.value(ResumeOutcome::GapExceededFallback), 1);
+        assert_eq!(counters.value(ResumeOutcome::ResumedFromBuffer), 1);
+        assert_eq!(counters.value(ResumeOutcome::NoResumeTokenFullAttach), 1);
+
+        // The gauge-incremented line gains `resume_requested: bool`
+        // (substring check only, matching this file's existing
+        // tracing_test convention).
+        assert!(logs_contain("resume_requested"));
     }
 
     /// Task 1.3.1c / REQ-5: the regression test the previous ("wait for it
