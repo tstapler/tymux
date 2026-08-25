@@ -782,8 +782,8 @@ mod tests {
         // the channel is (re-checked) empty — same settle-and-recheck
         // pattern as the sibling snapshot_with_seq test.
         let settle_on = |rx: &mut broadcast::Receiver<(u64, Vec<u8>)>,
-                          buffered: &mut Vec<u8>,
-                          marker: &str| {
+                         buffered: &mut Vec<u8>,
+                         marker: &str| {
             let mut last_seq = 0u64;
             loop {
                 match rx.try_recv() {

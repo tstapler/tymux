@@ -897,7 +897,12 @@ impl TymuxService for TymuxDaemon {
                     };
                     let (snapshot_event, snapshot_seq) =
                         snapshot_priming_event(&pane, &pane_id_str);
-                    (vec![gap_event, snapshot_event], snapshot_seq, true, Vec::new())
+                    (
+                        vec![gap_event, snapshot_event],
+                        snapshot_seq,
+                        true,
+                        Vec::new(),
+                    )
                 }
             },
             None => {
@@ -1865,8 +1870,12 @@ mod tests {
     #[test]
     fn forward_step_for_output_result_should_emit_output_chunk_with_real_seq_when_resume_aware() {
         let pane_id = Uuid::new_v4();
-        let step =
-            forward_step_for_output_result(Ok((6, b"live-after-replay".to_vec())), pane_id, 5, true);
+        let step = forward_step_for_output_result(
+            Ok((6, b"live-after-replay".to_vec())),
+            pane_id,
+            5,
+            true,
+        );
         assert!(
             matches!(
                 &step,
@@ -1883,8 +1892,8 @@ mod tests {
     /// and `data` through a real prost encode/decode, not just construct
     /// cleanly in memory.
     #[test]
-    fn attach_event_output_should_roundtrip_seq_and_data_when_encoded_and_decoded_as_output_chunk(
-    ) {
+    fn attach_event_output_should_roundtrip_seq_and_data_when_encoded_and_decoded_as_output_chunk()
+    {
         let event = AttachEvent {
             payload: Some(attach_event::Payload::OutputChunk(
                 tymux_proto::v1::OutputChunk {
@@ -2029,8 +2038,8 @@ mod tests {
     /// a doc note (Pattern Decisions' `AttachRequest.resume_from_seq
     /// placement` row).
     #[tokio::test]
-    async fn attach_should_reject_before_reading_resume_from_seq_when_first_message_omits_pane_id(
-    ) {
+    async fn attach_should_reject_before_reading_resume_from_seq_when_first_message_omits_pane_id()
+    {
         let daemon = test_daemon();
         let mut client = spawn_test_server(daemon).await;
 
@@ -2042,13 +2051,17 @@ mod tests {
         .await
         .unwrap();
 
-        let result = client.attach(Request::new(ReceiverStream::new(req_rx))).await;
+        let result = client
+            .attach(Request::new(ReceiverStream::new(req_rx)))
+            .await;
         let status = result.expect_err(
             "attach must reject a first message without pane_id, even with resume_from_seq set",
         );
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(
-            status.message().contains("first Attach message must set pane_id"),
+            status
+                .message()
+                .contains("first Attach message must set pane_id"),
             "unexpected error message: {}",
             status.message()
         );
@@ -2087,8 +2100,8 @@ mod tests {
         let mut rx = pane.subscribe();
         let deadline = Instant::now() + Duration::from_secs(10);
         let settle_on = |rx: &mut tokio::sync::broadcast::Receiver<(u64, Vec<u8>)>,
-                          buffered: &mut Vec<u8>,
-                          marker: &str| {
+                         buffered: &mut Vec<u8>,
+                         marker: &str| {
             let mut last_seq = 0u64;
             loop {
                 match rx.try_recv() {
@@ -2174,7 +2187,9 @@ mod tests {
                 Some(attach_event::Payload::OutputChunk(chunk)) => {
                     received_chunks.push((chunk.seq, chunk.data));
                 }
-                other => panic!("expected only OutputChunk events on the resume path, got {other:?}"),
+                other => {
+                    panic!("expected only OutputChunk events on the resume path, got {other:?}")
+                }
             }
         }
         assert_eq!(
@@ -2258,8 +2273,8 @@ mod tests {
         let mut rx = pane.subscribe();
         let deadline = Instant::now() + Duration::from_secs(10);
         let settle_on = |rx: &mut tokio::sync::broadcast::Receiver<(u64, Vec<u8>)>,
-                          buffered: &mut Vec<u8>,
-                          marker: &str| {
+                         buffered: &mut Vec<u8>,
+                         marker: &str| {
             let mut last_seq = 0u64;
             loop {
                 match rx.try_recv() {
@@ -3119,9 +3134,9 @@ mod tests {
                     );
                 }
                 Some(attach_event::Payload::OutputGap(_)) => continue,
-                other => panic!(
-                    "unexpected AttachEvent payload while waiting for {MARKER}: {other:?}"
-                ),
+                other => {
+                    panic!("unexpected AttachEvent payload while waiting for {MARKER}: {other:?}")
+                }
             }
         }
 
@@ -3814,12 +3829,27 @@ mod tests {
             first.payload
         );
 
-        // No pty output — this Heartbeat can only be the interval tick.
-        let second = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("Heartbeat event should arrive after one heartbeat_interval of pty silence")
-            .unwrap()
-            .unwrap();
+        // The shell's own startup prompt (e.g. macOS's interactive `/bin/sh`
+        // printing "sh-3.2$ ") is real, environment-dependent pty output
+        // that can race with the tiny 50ms heartbeat_interval this test
+        // uses — tolerate it rather than assume the next event is
+        // necessarily the Heartbeat.
+        async fn next_heartbeat(stream: &mut Streaming<AttachEvent>) -> AttachEvent {
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                    .await
+                    .expect(
+                        "Heartbeat event should arrive after one heartbeat_interval of pty silence",
+                    )
+                    .unwrap()
+                    .unwrap();
+                if !matches!(event.payload, Some(attach_event::Payload::Output(_))) {
+                    return event;
+                }
+            }
+        }
+
+        let second = next_heartbeat(&mut stream).await;
         assert!(
             matches!(second.payload, Some(attach_event::Payload::Heartbeat(_))),
             "expected a Heartbeat event, got {:?}",
@@ -3827,11 +3857,7 @@ mod tests {
         );
 
         // Periodic, not one-shot — and the connection is still open.
-        let third = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("a second Heartbeat should arrive on the next interval tick")
-            .unwrap()
-            .unwrap();
+        let third = next_heartbeat(&mut stream).await;
         assert!(matches!(
             third.payload,
             Some(attach_event::Payload::Heartbeat(_))

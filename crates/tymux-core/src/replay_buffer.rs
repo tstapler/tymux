@@ -252,8 +252,8 @@ mod tests {
     /// output yet (empty buffer, `latest_seq == 0`) must return
     /// `InWindow` with no entries and no subtraction underflow.
     #[test]
-    fn replay_buffer_replay_since_should_return_in_window_empty_when_fresh_pane_has_no_output_yet(
-    ) {
+    fn replay_buffer_replay_since_should_return_in_window_empty_when_fresh_pane_has_no_output_yet()
+    {
         let buf = ReplayBuffer::new(1_000);
 
         let outcome = buf.replay_since(0, 0);
