@@ -256,6 +256,28 @@ fn warn_if_exit_follows_disconnect(
     }
 }
 
+/// Sends the terminal `Exited` event for `pane` on `forward_tx` and runs the
+/// disconnect-regression check (Task 1.1.2e). Shared by the replay-drain
+/// loop (Epic 2.3: a pane that exits mid-replay-of-a-large-backlog) and the
+/// live loop's own `wait_exit()` branch, so pane-exit handling never
+/// diverges between the two call sites — both simply `return` right after
+/// calling this.
+async fn send_exited_event(
+    pane: &tymux_core::Pane,
+    forward_tx: &tokio::sync::mpsc::Sender<Result<AttachEvent, Status>>,
+    disconnect_tracker: &Mutex<HashMap<Uuid, Instant>>,
+    disconnect_regression_window: Duration,
+) {
+    tracing::info!(pane_id = %pane.id, "pane exited, closing attach stream");
+    warn_if_exit_follows_disconnect(pane.id, disconnect_tracker, disconnect_regression_window);
+    let event = AttachEvent {
+        payload: Some(attach_event::Payload::Exited(ExitStatus {
+            code: pane.exit_code(),
+        })),
+    };
+    let _ = forward_tx.send(Ok(event)).await;
+}
+
 fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
     match e {
         tymux_core::EngineError::PaneNotFound(id) => {
@@ -706,51 +728,49 @@ impl TymuxService for TymuxDaemon {
         // populates for the rest of this stream (Task 2.2.1c).
         let mut output_rx = pane.subscribe();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let (priming_events, live_threshold_seq, emit_output_chunk): (Vec<AttachEvent>, u64, bool) =
-            match resume_from_seq {
-                Some(seq) => match pane.replay_since(seq) {
-                    ReplayOutcome::InWindow { chunks, tail_seq } => {
-                        // Task 2.2.1c: replay the missed chunks as seq'd
-                        // OutputChunk events. This loop's own
-                        // wait_exit()-vs-send race (so a pane exiting
-                        // mid-replay doesn't hang the stream) is Epic
-                        // 2.3's concern, not this Epic's.
-                        let events = chunks
-                            .into_iter()
-                            .map(|(seq, data)| AttachEvent {
-                                payload: Some(attach_event::Payload::OutputChunk(OutputChunk {
-                                    seq,
-                                    data,
-                                })),
-                            })
-                            .collect();
-                        (events, tail_seq, true)
-                    }
-                    ReplayOutcome::GapExceeded {
-                        oldest_available_seq,
-                    } => {
-                        // Task 2.2.2a: signal the gap, then fall back to
-                        // exactly today's snapshot priming path. The
-                        // client already declared resume support by
-                        // sending resume_from_seq, so its live tail still
-                        // uses the seq'd output_chunk field.
-                        let gap_event = AttachEvent {
-                            payload: Some(attach_event::Payload::GapExceeded(GapExceeded {
-                                oldest_available_seq: oldest_available_seq.unwrap_or(0),
-                            })),
-                        };
-                        let (snapshot_event, snapshot_seq) =
-                            snapshot_priming_event(&pane, &pane_id_str);
-                        (vec![gap_event, snapshot_event], snapshot_seq, true)
-                    }
-                },
-                None => {
-                    // Unchanged pre-feature path (Epic 2.4).
+        let (priming_events, live_threshold_seq, emit_output_chunk, replay_chunks): (
+            Vec<AttachEvent>,
+            u64,
+            bool,
+            Vec<(u64, Vec<u8>)>,
+        ) = match resume_from_seq {
+            Some(seq) => match pane.replay_since(seq) {
+                ReplayOutcome::InWindow { chunks, tail_seq } => {
+                    // Task 2.3.1a: don't turn these into AttachEvents and
+                    // send them here — a large backlog can exceed the
+                    // forward channel's capacity, and sending it
+                    // synchronously in this function body would block
+                    // attach() from ever returning the Response, so nothing
+                    // could drain the channel and free up capacity. Instead,
+                    // thread the raw chunks through to the spawned
+                    // forward_handle task below, which drains them racing
+                    // pane.wait_exit() per chunk, exactly like the live loop.
+                    (Vec::new(), tail_seq, true, chunks)
+                }
+                ReplayOutcome::GapExceeded {
+                    oldest_available_seq,
+                } => {
+                    // Task 2.2.2a: signal the gap, then fall back to
+                    // exactly today's snapshot priming path. The
+                    // client already declared resume support by
+                    // sending resume_from_seq, so its live tail still
+                    // uses the seq'd output_chunk field.
+                    let gap_event = AttachEvent {
+                        payload: Some(attach_event::Payload::GapExceeded(GapExceeded {
+                            oldest_available_seq: oldest_available_seq.unwrap_or(0),
+                        })),
+                    };
                     let (snapshot_event, snapshot_seq) =
                         snapshot_priming_event(&pane, &pane_id_str);
-                    (vec![snapshot_event], snapshot_seq, false)
+                    (vec![gap_event, snapshot_event], snapshot_seq, true, Vec::new())
                 }
-            };
+            },
+            None => {
+                // Unchanged pre-feature path (Epic 2.4).
+                let (snapshot_event, snapshot_seq) = snapshot_priming_event(&pane, &pane_id_str);
+                (vec![snapshot_event], snapshot_seq, false, Vec::new())
+            }
+        };
         // Practically infallible this early (the receiver was just
         // created), but a client that cancelled instantly could already
         // be gone — benign either way, forward_handle's own sends will
@@ -768,6 +788,38 @@ impl TymuxService for TymuxDaemon {
                 gauge: attached_sessions_gauge,
                 pane_id,
             };
+
+            // Task 2.3.1a: drain the resume replay backlog (if any) first,
+            // racing pane.wait_exit() per chunk with the same `biased`
+            // pattern as the live loop below — not just once after the
+            // whole backlog has been sent. Otherwise a pane that exits
+            // partway through a large backlog would leave the stream either
+            // hanging (waiting on a full channel no one drains fast enough)
+            // or blocked until every remaining chunk finishes sending
+            // before the exit is ever noticed.
+            for (seq, data) in replay_chunks {
+                tokio::select! {
+                    biased;
+                    result = forward_tx.send(Ok(AttachEvent {
+                        payload: Some(attach_event::Payload::OutputChunk(OutputChunk { seq, data })),
+                    })) => {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                    _ = pane_for_exit.wait_exit() => {
+                        send_exited_event(
+                            &pane_for_exit,
+                            &forward_tx,
+                            &disconnect_tracker_for_exit,
+                            disconnect_regression_window,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+
             loop {
                 // `biased` checks output_rx first every iteration, so any
                 // output already sent before the child exited (the reader
@@ -787,18 +839,13 @@ impl TymuxService for TymuxDaemon {
                         }
                     }
                     _ = pane_for_exit.wait_exit() => {
-                        tracing::info!(pane_id = %pane_for_exit.id, "pane exited, closing attach stream");
-                        warn_if_exit_follows_disconnect(
-                            pane_for_exit.id,
+                        send_exited_event(
+                            &pane_for_exit,
+                            &forward_tx,
                             &disconnect_tracker_for_exit,
                             disconnect_regression_window,
-                        );
-                        let event = AttachEvent {
-                            payload: Some(attach_event::Payload::Exited(ExitStatus {
-                                code: pane_for_exit.exit_code(),
-                            })),
-                        };
-                        let _ = forward_tx.send(Ok(event)).await;
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -1890,6 +1937,251 @@ mod tests {
                 other => panic!("expected live output to continue as OutputChunk, got {other:?}"),
             }
         }
+    }
+
+    /// REQ-5 / Story 2.3.1 AC1 / Task 2.3.1b: the replay-drain loop itself
+    /// (not just the live loop that follows it) must race
+    /// `pane.wait_exit()` per chunk. Produces a backlog spanning many
+    /// separate replay chunks, drains only part of it over the attach
+    /// stream, then kills the pane's child process directly — mirroring a
+    /// real client that stalls or disconnects partway through a large
+    /// resume replay. Before Task 2.3.1a's restructuring, the replay
+    /// chunks were sent as one synchronous loop with no `wait_exit()` race
+    /// at all (and, moreover, sent *before* `attach()` ever returned its
+    /// `Response`, so nothing could even drain the channel yet); this
+    /// asserts the stream instead reaches a terminal `Exited` event within
+    /// a bounded timeout — never hangs, regardless of how much of the
+    /// backlog happens to have been delivered first.
+    #[tokio::test]
+    async fn attach_should_send_exited_event_and_not_hang_when_pane_process_exits_mid_replay_of_large_backlog(
+    ) {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // `replay_since` treats `resume_from_seq` as "the last seq the
+        // client already has", and a pane's first-ever chunk is always
+        // seq == 1 — so `resume_from_seq=0` is always a gap, even on a
+        // completely fresh buffer (`0 < oldest_available_seq`), not a way
+        // to request "everything since pane creation". Establish a real
+        // resume point first (mirrors
+        // `attach_should_replay_missed_chunks_byte_identical_..._when_resume_from_seq_in_window`'s
+        // settle-on-a-marker pattern), then produce the large backlog
+        // strictly after it.
+        let mut rx = pane.subscribe();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let settle_on = |rx: &mut tokio::sync::broadcast::Receiver<(u64, Vec<u8>)>,
+                          buffered: &mut Vec<u8>,
+                          marker: &str| {
+            let mut last_seq = 0u64;
+            loop {
+                match rx.try_recv() {
+                    Ok((seq, bytes)) => {
+                        last_seq = seq;
+                        buffered.extend_from_slice(&bytes);
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        if String::from_utf8_lossy(buffered).contains(marker)
+                            && matches!(
+                                rx.try_recv(),
+                                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                            )
+                        {
+                            return last_seq;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "output around marker {marker:?} never settled"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("unexpected broadcast recv error: {e:?}"),
+                }
+            }
+        };
+        let mut prefix_bytes = Vec::new();
+        pane.write_input(b"echo START-MARKER\n").unwrap();
+        let resume_from_seq = settle_on(&mut rx, &mut prefix_bytes, "START-MARKER");
+
+        // Produce a backlog spanning many separate replay chunks. Each
+        // line is written from the test itself (rather than a single
+        // shell-side loop) with a real `.await` sleep between writes —
+        // shell-side `sleep` between iterations of a tight loop wasn't
+        // enough to reliably keep the reader thread's read() calls from
+        // coalescing consecutive echoes into far fewer, larger chunks
+        // (confirmed empirically: a 300-line shell loop with a 3ms
+        // in-shell sleep produced only ~7 chunks). Small enough in total
+        // that it stays well under the pane's replay budget (256 KiB
+        // default), so `resume_from_seq` below stays `InWindow` rather
+        // than already evicted.
+        const CHUNK_COUNT: usize = 150;
+        for i in 0..CHUNK_COUNT {
+            pane.write_input(format!("echo C{i}\n").as_bytes()).unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        pane.write_input(b"echo REPLAY-DONE\n").unwrap();
+
+        // Settle until REPLAY-DONE has fully landed *and* stayed quiet for
+        // a short grace period — unlike `settle_on`'s single immediate
+        // re-check, a trailing shell prompt can land a few ms after the
+        // marker text itself, and `expected_chunks` below must be computed
+        // only once nothing more is coming, or it undercounts relative to
+        // what attach() actually replays a moment later.
+        let mut buffered = Vec::new();
+        let settle_deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_activity = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok((_, bytes)) => {
+                    buffered.extend_from_slice(&bytes);
+                    last_activity = Instant::now();
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    if String::from_utf8_lossy(&buffered).contains("REPLAY-DONE")
+                        && last_activity.elapsed() >= Duration::from_millis(150)
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < settle_deadline,
+                        "backlog production did not settle in time"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("unexpected broadcast recv error: {e:?}"),
+            }
+        }
+
+        let expected_chunks = match pane.replay_since(resume_from_seq) {
+            ReplayOutcome::InWindow { chunks, .. } => chunks,
+            other => panic!(
+                "expected the whole backlog to still be InWindow (fits the replay budget), \
+                 got {other:?}"
+            ),
+        };
+        assert!(
+            expected_chunks.len() > 20,
+            "test setup produced too few replay chunks ({}) to exercise a multi-chunk race \
+             — need several dozen at least",
+            expected_chunks.len()
+        );
+
+        // Attach with the established resume point so the whole backlog
+        // above must be replayed.
+        let (tx, req_rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: Some(resume_from_seq),
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(req_rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Drain only a small prefix of the backlog — simulating a client
+        // that's still reading, just not fast enough to be caught up when
+        // the pane dies (a real, common shape: a slow/lagging consumer,
+        // not necessarily one that vanished outright).
+        const PARTIAL_COUNT: usize = 20;
+        let mut received_chunks = Vec::new();
+        for _ in 0..PARTIAL_COUNT {
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("attach stream stalled during partial replay drain")
+                .unwrap()
+                .expect("stream ended before the requested partial replay finished");
+            match event.payload {
+                Some(attach_event::Payload::OutputChunk(chunk)) => {
+                    received_chunks.push((chunk.seq, chunk.data));
+                }
+                other => {
+                    panic!("expected only OutputChunk events on the resume path, got {other:?}")
+                }
+            }
+        }
+
+        // ...then stop draining and kill the pane's process directly —
+        // mirroring a real reconnect where the consumer stalls or
+        // disconnects partway through a large replay.
+        pane.kill().unwrap();
+        wait_for_pane_exit(&pane).await;
+
+        // The core regression check: keep draining — regardless of how
+        // many more OutputChunk events land first, the stream must reach
+        // a terminal Exited event within a bounded timeout, never hang.
+        // Before Task 2.3.1a's restructuring, the replay chunks were sent
+        // as one synchronous for-loop with no `wait_exit()` race and,
+        // worse, run *before* `attach()` ever returned its `Response` at
+        // all — for a backlog exceeding the forward channel's capacity
+        // (64), nothing could ever drain it and this loop would hang
+        // forever, never reaching this point.
+        //
+        // Note: this test's own local network transport (loopback H2)
+        // readily buffers a backlog this size even while the test isn't
+        // actively calling `inbound.message()`, so it's not guaranteed —
+        // nor asserted — that the stream terminates *before* every
+        // remaining chunk has been delivered; the falsifiable property
+        // this asserts is strictly "terminates within a bounded timeout,"
+        // i.e. never hangs, which is what Task 2.3.1b calls for.
+        let exit_deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_exited = false;
+        while !saw_exited {
+            assert!(
+                Instant::now() < exit_deadline,
+                "attach stream did not reach an Exited event within the bounded timeout — \
+                 the replay-drain loop hung instead of racing pane.wait_exit()"
+            );
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("attach stream stalled")
+                .unwrap()
+                .expect("stream ended before an Exited event arrived");
+            match event.payload {
+                Some(attach_event::Payload::OutputChunk(chunk)) => {
+                    received_chunks.push((chunk.seq, chunk.data));
+                }
+                Some(attach_event::Payload::Exited(_)) => saw_exited = true,
+                other => panic!("expected OutputChunk or a terminal Exited event, got {other:?}"),
+            }
+        }
+
+        assert!(
+            saw_exited,
+            "attach stream must terminate with an Exited event, not just close silently"
+        );
+
+        // The reader thread stopped producing at `pane.kill()` above (no
+        // further pushes are possible once the child is dead), so a fresh
+        // `replay_since` query now is stable ground truth — unlike the
+        // `expected_chunks` snapshot taken before attaching, which raced
+        // trailing shell-prompt output still landing after the settle
+        // check above and so isn't safe to compare exactly against.
+        let final_chunks = match pane.replay_since(resume_from_seq) {
+            ReplayOutcome::InWindow { chunks, .. } => chunks,
+            other => panic!("expected the backlog to still be InWindow, got {other:?}"),
+        };
+        assert!(
+            received_chunks.len() <= final_chunks.len(),
+            "must never replay more OutputChunk events than the backlog actually held \
+             ({} received vs {} final)",
+            received_chunks.len(),
+            final_chunks.len()
+        );
     }
 
     /// Story 2.2.2 AC1 / REQ-4 / Task 2.2.2b: a `resume_from_seq` older
