@@ -71,6 +71,27 @@ jobs:
       # (and thus portable-pty's musl linking) continuously, on every PR.
       - run: cargo build --workspace --target ${{ matrix.target }}
 
+  macos-cross-build:
+    # x86_64-apple-darwin is the one release target with no PR coverage:
+    # aarch64-apple-darwin is implicitly exercised by the native build in
+    # the `test` job's macos-latest leg, but the x86_64 cross-target only
+    # ever got built at tag-release time. Same gap class musl-build already
+    # closed for the musl targets — catch a broken cross-link before a
+    # release, not during one.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-cross-build
+      - run: cargo build --workspace --target x86_64-apple-darwin
+
   ts-client:
     # Story 7.1 Task 4 (buf generate drift check) + Story 7.2 Task 3 /
     # Story 7.3 Task 7 (standing cross-language RPC proof on every PR —
