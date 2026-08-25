@@ -3612,6 +3612,176 @@ mod tests {
         assert!(logs_contain("elapsed_ms"));
     }
 
+    // --- Epic 3.3: grace-period design is leak/DoS-safe by construction ---
+
+    /// Task 3.3.1a: 10 rapid attach/detach cycles on the same pane, all
+    /// landing within one shortened test `grace_period_duration` window,
+    /// must each get their own independently-scheduled deferred cleanup —
+    /// none delayed, extended, or reset by any of the other 9 cycles
+    /// (Story 3.3.1 AC1). This is what makes pitfalls.md §4's "grace
+    /// period never expires" DoS vector structurally impossible under the
+    /// per-disconnect-`tokio::spawn` design (Task 3.2.2a), not merely
+    /// mitigated by some cap.
+    ///
+    /// Each of the 10 clients registers a distinct, strictly increasing
+    /// viewport (rows/cols) and detaches immediately after — message
+    /// ordering on a single gRPC stream guarantees the server's
+    /// `input_handle` processes the `Resize` before it ever observes that
+    /// stream's end (`attach()` itself already blocks on reading the
+    /// first `PaneId` message before returning, per Task 2.2.1a; the
+    /// `Resize` sent right after is queued on the very same channel ahead
+    /// of the subsequent `drop(tx)`, so it's guaranteed to be drained
+    /// first), so no extra synchronization is needed to land each
+    /// registration before its own detach.
+    ///
+    /// Because `recompute_window_geometry` takes the dimension-wise
+    /// minimum across all *currently registered* viewports, and all 10
+    /// stay registered until their own grace period elapses (that's the
+    /// whole point of the deferred design), only removing the
+    /// currently-smallest viewport ever changes the observed geometry.
+    /// Client 0 registers the smallest and disconnects first, so cleanups
+    /// fire — and therefore remove viewports — in strict disconnect
+    /// order, each one revealing the next-smallest surviving viewport (or
+    /// the default geometry, for the last). That gives a fully ordered,
+    /// per-task-attributable signal: `WindowLayoutEvent` *j* is
+    /// unambiguously client *j*'s own cleanup firing, so its arrival time
+    /// can be bounded against client *j*'s own disconnect time — not
+    /// against the batch's last disconnect, which is exactly what a
+    /// shared-mutable-deadline bug would produce instead.
+    #[tokio::test]
+    async fn deferred_cleanup_tasks_should_each_fire_independently_on_schedule_when_ten_rapid_reconnect_drop_cycles_occur_within_one_grace_period(
+    ) {
+        const N: usize = 10;
+        let grace_period = Duration::from_millis(400);
+        let daemon = test_daemon_with_intervals(DEFAULT_HEARTBEAT_INTERVAL, grace_period);
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let window_id = session.windows[0].id.clone();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let mut watch_stream = client
+            .watch_window(WatchWindowRequest {
+                window_id: window_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        // Baseline: nobody attached yet.
+        let baseline = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+            .await
+            .expect("baseline layout event")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            {
+                let p = sole_pane_from_layout(baseline.layout.as_ref().unwrap());
+                (p.rows, p.cols)
+            },
+            (24, 80),
+            "baseline geometry should be the default before anyone attaches"
+        );
+
+        // 10 rapid attach/detach cycles, each with a strictly larger
+        // viewport than the last (so client 0 registers the smallest —
+        // the one that actually constrains the computed geometry — and
+        // client 9 the largest). A short real-time gap between cycles
+        // (well under `grace_period`) spreads their disconnect times out
+        // enough that a shared-mutable-deadline bug (all 10 cleanups
+        // firing off the *last* disconnect instead of their own) is
+        // trivially distinguishable from independent per-disconnect
+        // scheduling in the timing assertions below.
+        let mut streams = Vec::with_capacity(N);
+        let mut disconnect_at = Vec::with_capacity(N);
+        for i in 0..N {
+            let rows = 30 + i as u32;
+            let cols = 100 + i as u32;
+            let (tx, stream) = attach_and_report_viewport(&mut client, &pane_id, rows, cols).await;
+            disconnect_at.push(Instant::now());
+            drop(tx); // detach — starts this client's own grace-period clock
+
+            // Kept alive (not dropped) so the client side doesn't RST the
+            // whole bidi call out from under the server's still-running
+            // forward_handle, matching the Task 3.2.2c/3.2.2d tests'
+            // existing pattern above.
+            streams.push(stream);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // 10 setup-time layout events, one per registration —
+        // `recompute_window_geometry` notifies on every call, not only
+        // when its result changes (`engine.rs`'s `recompute_window_geometry`
+        // unconditionally calls `notify_window_changed`). All 10 report
+        // the same (30, 100): client 0's registration set the minimum,
+        // and every later registration (each larger) never lowers it.
+        for i in 0..N {
+            let ev = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("setup layout event {i} never arrived"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                {
+                    let p = sole_pane_from_layout(ev.layout.as_ref().unwrap());
+                    (p.rows, p.cols)
+                },
+                (30, 100),
+                "setup event {i} should still report client 0's (unbeaten) minimum viewport"
+            );
+        }
+
+        // Now the 10 deferred cleanups, one per disconnect, in order.
+        // Each removal reveals the next-smallest surviving viewport (or,
+        // for the last, the default geometry once nobody is left) —
+        // proving both the firing *order* and giving each event an
+        // unambiguous owner to bound its own timing against (bounded
+        // per-task assertions, not one aggregate check).
+        let tolerance = Duration::from_millis(200);
+        for (j, &disconnected_at) in disconnect_at.iter().enumerate() {
+            let ev = tokio::time::timeout(Duration::from_secs(5), watch_stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("cleanup {j}'s layout event never arrived"))
+                .unwrap()
+                .unwrap();
+            let fired_at = Instant::now();
+            let (rows, cols) = {
+                let p = sole_pane_from_layout(ev.layout.as_ref().unwrap());
+                (p.rows, p.cols)
+            };
+            let expected: (u32, u32) = if j + 1 < N {
+                (30 + (j + 1) as u32, 100 + (j + 1) as u32)
+            } else {
+                (24, 80)
+            };
+            assert_eq!(
+                (rows, cols),
+                expected,
+                "cleanup {j} should reveal the next-smallest surviving viewport (or the default, \
+                 if it was the last), proving cleanups fired in disconnect order"
+            );
+
+            // The per-task assertion: this cleanup fired within
+            // `tolerance` of `grace_period` after *its own* disconnect —
+            // not after the batch's last disconnect. A shared/reset
+            // deadline would push every firing to ~`grace_period` after
+            // client 9's disconnect, which for early `j` is far outside
+            // this tolerance window (the 9 * 25ms of inter-cycle gaps
+            // alone exceeds it).
+            let elapsed = fired_at.duration_since(disconnected_at);
+            assert!(
+                elapsed >= grace_period.saturating_sub(tolerance)
+                    && elapsed <= grace_period + tolerance,
+                "cleanup {j} fired {elapsed:?} after its own disconnect, expected ~{grace_period:?} \
+                 (+/- {tolerance:?}) — a shared/reset deadline would show up as a much larger gap \
+                 for early clients"
+            );
+        }
+    }
+
     fn search_req(pane_id: String, pattern: &str, start_offset: u32) -> SearchScrollbackRequest {
         SearchScrollbackRequest {
             pane_id,
