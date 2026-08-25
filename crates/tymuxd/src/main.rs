@@ -11,20 +11,20 @@ use uuid::Uuid;
 
 use tymux_core::{
     Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneLookup,
-    PersistedLayoutNode, PersistenceBackend, SessionSnapshot, WindowSnapshot,
+    PersistedLayoutNode, PersistenceBackend, ReplayOutcome, SessionSnapshot, WindowSnapshot,
     RECOMMENDED_SPLIT_MIN_ROWS,
 };
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
     attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
     Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse, CreateSessionRequest,
-    CreateWindowRequest, ExitStatus, KillSessionRequest, KillSessionResponse,
+    CreateWindowRequest, ExitStatus, GapExceeded, KillSessionRequest, KillSessionResponse,
     Layout as ProtoLayout, LayoutChild as ProtoLayoutChild, ListSessionsRequest,
-    ListSessionsResponse, Liveness, Orientation as ProtoOrientation, Pane as ProtoPane,
-    PaneSnapshot as ProtoSnapshot, ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow,
-    SearchScrollbackRequest, SearchScrollbackResponse, Session as ProtoSession,
-    Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow,
-    WindowLayoutEvent,
+    ListSessionsResponse, Liveness, Orientation as ProtoOrientation, OutputChunk,
+    Pane as ProtoPane, PaneSnapshot as ProtoSnapshot, ReviveSessionRequest,
+    ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest, SearchScrollbackResponse,
+    Session as ProtoSession, Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest,
+    Window as ProtoWindow, WindowLayoutEvent,
 };
 
 /// Default window (Task 1.1.2e / pre-mortem P1 #1) within which a pane
@@ -314,24 +314,43 @@ enum ForwardStep {
 }
 
 /// Maps one `output_rx.recv()` result to a [`ForwardStep`], given the
-/// priming snapshot's sequence number (`snapshot_seq`, from
-/// `pane.snapshot_with_seq()`). Task 1.3.1b / ADR-003 Amendment: an
-/// output chunk whose sequence is `<= snapshot_seq` was already reflected
-/// in the just-sent `Snapshot` event's grid state — forwarding it again
-/// would double-render it, so it's dropped (`Skip`) without ending the
-/// stream. Everything else behaves exactly as before Task 1.3.1: a
-/// normal chunk becomes an `Output` event, a `Lagged` receive becomes
-/// `OutputGap`, and a closed channel ends the stream.
+/// live loop's dedup threshold (`threshold_seq` — either the priming
+/// snapshot's sequence from `pane.snapshot_with_seq()`, or a resume
+/// replay's `ReplayOutcome::InWindow::tail_seq`; Epic 2.2 Task 2.2.1b).
+/// Task 1.3.1b / ADR-003 Amendment: an output chunk whose sequence is
+/// `<= threshold_seq` was already reflected in the just-sent priming
+/// event(s) — forwarding it again would double-render/duplicate it, so
+/// it's dropped (`Skip`) without ending the stream. This skip/dedup logic
+/// is unchanged by Epic 2.2 — only the threshold's source differs
+/// between the no-resume and resume paths.
+///
+/// `emit_output_chunk` selects which sibling of `AttachEvent.payload`'s
+/// single `oneof` an `Emit` populates: `output` (field 1, legacy,
+/// byte-identical to pre-feature `attach()`) when `false`, or the seq'd
+/// `output_chunk` (field 7) when `true`. The two are mutually exclusive
+/// on the wire — `oneof payload` can only hold one variant per message,
+/// per `OutputChunk`'s own proto doc comment ("populates exactly one of
+/// `output`/`output_chunk` per AttachEvent, not both") — so this is a
+/// per-attach-session choice (Some/None `resume_from_seq`, made once in
+/// `attach()`), not a per-event dual-write.
 fn forward_step_for_output_result(
     result: Result<(u64, Vec<u8>), tokio::sync::broadcast::error::RecvError>,
     pane_id: Uuid,
-    snapshot_seq: u64,
+    threshold_seq: u64,
+    emit_output_chunk: bool,
 ) -> ForwardStep {
     use tokio::sync::broadcast::error::RecvError;
     match result {
         Ok((seq, bytes)) => {
-            if seq <= snapshot_seq {
+            if seq <= threshold_seq {
                 ForwardStep::Skip
+            } else if emit_output_chunk {
+                ForwardStep::Emit(AttachEvent {
+                    payload: Some(attach_event::Payload::OutputChunk(OutputChunk {
+                        seq,
+                        data: bytes,
+                    })),
+                })
             } else {
                 ForwardStep::Emit(AttachEvent {
                     payload: Some(attach_event::Payload::Output(bytes)),
@@ -346,6 +365,22 @@ fn forward_step_for_output_result(
         }
         Err(RecvError::Closed) => ForwardStep::End,
     }
+}
+
+/// Builds the priming `Snapshot` `AttachEvent` and its sequence number —
+/// shared by the no-resume path (`attach()`'s `resume_from_seq: None`
+/// arm) and the `GapExceeded` fallback path (Epic 2.2.2), both of which
+/// prime a reattaching client with `pane.snapshot_with_seq()` today.
+fn snapshot_priming_event(pane: &tymux_core::Pane, pane_id_str: &str) -> (AttachEvent, u64) {
+    let (pane_snapshot, snapshot_seq) = pane.snapshot_with_seq();
+    let event = AttachEvent {
+        payload: Some(attach_event::Payload::Snapshot(snapshot_to_proto(
+            pane_id_str,
+            pane_snapshot,
+            true,
+        ))),
+    };
+    (event, snapshot_seq)
 }
 
 #[tonic::async_trait]
@@ -629,6 +664,13 @@ impl TymuxService for TymuxDaemon {
                 ))
             }
         };
+        // Epic 2.2 / Task 2.2.1a: read only after the pane_id check above
+        // has already unconditionally rejected any first message that
+        // omits pane_id — resume_from_seq is never read on such a
+        // request (see `AttachRequest.resume_from_seq placement` in
+        // plan.md's Pattern Decisions; regression-tested by
+        // `attach_should_reject_before_reading_resume_from_seq_when_first_message_omits_pane_id`).
+        let resume_from_seq = first.resume_from_seq;
         let pane_id = parse_uuid(&pane_id_str)?;
         let pane = resolve_live_pane(&self.engine, pane_id).inspect_err(|status| {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "attach: pane unavailable");
@@ -649,28 +691,73 @@ impl TymuxService for TymuxDaemon {
         let window_id = self.engine.window_id_for_pane(pane_id);
         let client_id = self.engine.new_client_id();
 
-        // ADR-003 / Task 1.3.1b: subscribe *before* snapshotting, so no
-        // output produced between the two is lost — then send the
-        // snapshot as the very first AttachEvent, before any live Output.
-        // Its sequence number (read atomically with the grid under the
-        // same lock, Task 1.3.1a) is threaded into forward_handle so it
-        // can drop any already-subscribed chunk that predates the
-        // snapshot and would otherwise double-render it.
+        // ADR-003 / Task 1.3.1b: subscribe *before* snapshotting/replaying,
+        // so no output produced in between is ever lost — then send
+        // whichever priming event(s) apply as the very first AttachEvent(s),
+        // before any live Output/OutputChunk.
+        //
+        // Epic 2.2: which priming path runs depends on whether this
+        // client asked to resume. `live_threshold_seq` is threaded into
+        // forward_handle below exactly as the old `snapshot_seq` was —
+        // it's now either the priming snapshot's seq (no-resume and
+        // GapExceeded-fallback paths) or the resume replay's
+        // `tail_seq` (in-window path) — and `emit_output_chunk` decides
+        // which sibling of `AttachEvent.payload`'s oneof the live loop
+        // populates for the rest of this stream (Task 2.2.1c).
         let mut output_rx = pane.subscribe();
-        let (pane_snapshot, snapshot_seq) = pane.snapshot_with_seq();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let priming_event = AttachEvent {
-            payload: Some(attach_event::Payload::Snapshot(snapshot_to_proto(
-                &pane_id_str,
-                pane_snapshot,
-                true,
-            ))),
-        };
+        let (priming_events, live_threshold_seq, emit_output_chunk): (Vec<AttachEvent>, u64, bool) =
+            match resume_from_seq {
+                Some(seq) => match pane.replay_since(seq) {
+                    ReplayOutcome::InWindow { chunks, tail_seq } => {
+                        // Task 2.2.1c: replay the missed chunks as seq'd
+                        // OutputChunk events. This loop's own
+                        // wait_exit()-vs-send race (so a pane exiting
+                        // mid-replay doesn't hang the stream) is Epic
+                        // 2.3's concern, not this Epic's.
+                        let events = chunks
+                            .into_iter()
+                            .map(|(seq, data)| AttachEvent {
+                                payload: Some(attach_event::Payload::OutputChunk(OutputChunk {
+                                    seq,
+                                    data,
+                                })),
+                            })
+                            .collect();
+                        (events, tail_seq, true)
+                    }
+                    ReplayOutcome::GapExceeded {
+                        oldest_available_seq,
+                    } => {
+                        // Task 2.2.2a: signal the gap, then fall back to
+                        // exactly today's snapshot priming path. The
+                        // client already declared resume support by
+                        // sending resume_from_seq, so its live tail still
+                        // uses the seq'd output_chunk field.
+                        let gap_event = AttachEvent {
+                            payload: Some(attach_event::Payload::GapExceeded(GapExceeded {
+                                oldest_available_seq: oldest_available_seq.unwrap_or(0),
+                            })),
+                        };
+                        let (snapshot_event, snapshot_seq) =
+                            snapshot_priming_event(&pane, &pane_id_str);
+                        (vec![gap_event, snapshot_event], snapshot_seq, true)
+                    }
+                },
+                None => {
+                    // Unchanged pre-feature path (Epic 2.4).
+                    let (snapshot_event, snapshot_seq) =
+                        snapshot_priming_event(&pane, &pane_id_str);
+                    (vec![snapshot_event], snapshot_seq, false)
+                }
+            };
         // Practically infallible this early (the receiver was just
         // created), but a client that cancelled instantly could already
         // be gone — benign either way, forward_handle's own sends will
         // fail and end the stream the same way any other disconnect does.
-        let _ = tx.send(Ok(priming_event)).await;
+        for event in priming_events {
+            let _ = tx.send(Ok(event)).await;
+        }
 
         let forward_tx = tx.clone();
         let pane_for_exit = pane.clone();
@@ -689,7 +776,7 @@ impl TymuxService for TymuxDaemon {
                 tokio::select! {
                     biased;
                     result = output_rx.recv() => {
-                        match forward_step_for_output_result(result, pane_for_exit.id, snapshot_seq) {
+                        match forward_step_for_output_result(result, pane_for_exit.id, live_threshold_seq, emit_output_chunk) {
                             ForwardStep::Emit(event) => {
                                 if forward_tx.send(Ok(event)).await.is_err() {
                                     return;
@@ -1385,7 +1472,7 @@ mod tests {
     #[test]
     fn attach_should_not_emit_output_gap_event_when_consumer_keeps_pace() {
         let pane_id = Uuid::new_v4();
-        let step = forward_step_for_output_result(Ok((1, b"hello".to_vec())), pane_id, 0);
+        let step = forward_step_for_output_result(Ok((1, b"hello".to_vec())), pane_id, 0, false);
         assert!(matches!(
             step,
             ForwardStep::Emit(AttachEvent {
@@ -1401,6 +1488,7 @@ mod tests {
             Err(tokio::sync::broadcast::error::RecvError::Lagged(5)),
             pane_id,
             0,
+            false,
         );
         assert!(matches!(
             step,
@@ -1418,8 +1506,53 @@ mod tests {
                 Err(tokio::sync::broadcast::error::RecvError::Closed),
                 pane_id,
                 0,
+                false,
             ),
             ForwardStep::End
+        );
+    }
+
+    /// Story 2.2.1 AC2 / REQ-4 / Task 2.2.1c: a live chunk whose seq is
+    /// already covered by the resume replay's `tail_seq` (the threshold
+    /// source on the resume path, per `attach()`'s Task 2.2.1b branch)
+    /// must be skipped, not re-emitted as a duplicate.
+    #[test]
+    fn forward_step_for_output_result_should_skip_duplicate_when_seq_already_covered_by_replay_tail_seq(
+    ) {
+        let pane_id = Uuid::new_v4();
+        let tail_seq = 5u64;
+        assert_eq!(
+            forward_step_for_output_result(
+                Ok((5, b"already-replayed".to_vec())),
+                pane_id,
+                tail_seq,
+                true,
+            ),
+            ForwardStep::Skip,
+            "a live chunk at exactly the resume replay's tail_seq must be skipped, not \
+             re-emitted"
+        );
+    }
+
+    /// Story 2.2.1 AC2 / Task 2.2.1c: on the resume path (`emit_output_chunk:
+    /// true`), an `Emit` populates the seq'd `output_chunk` sibling of
+    /// `AttachEvent.payload`'s oneof, not the legacy `output` field —
+    /// `output`/`output_chunk` are mutually exclusive oneof variants (see
+    /// `OutputChunk`'s proto doc comment), so which one gets populated is
+    /// this per-session flag's job, not a per-event dual-write.
+    #[test]
+    fn forward_step_for_output_result_should_emit_output_chunk_with_real_seq_when_resume_aware() {
+        let pane_id = Uuid::new_v4();
+        let step =
+            forward_step_for_output_result(Ok((6, b"live-after-replay".to_vec())), pane_id, 5, true);
+        assert!(
+            matches!(
+                &step,
+                ForwardStep::Emit(AttachEvent {
+                    payload: Some(attach_event::Payload::OutputChunk(chunk))
+                }) if chunk.seq == 6 && chunk.data == b"live-after-replay"
+            ),
+            "expected an OutputChunk{{seq: 6, ..}} Emit, got {step:?}"
         );
     }
 
@@ -1497,7 +1630,8 @@ mod tests {
             forward_step_for_output_result(
                 Ok((10, b"already-in-snapshot".to_vec())),
                 pane_id,
-                snapshot_seq
+                snapshot_seq,
+                false,
             ),
             ForwardStep::Skip,
             "a chunk at exactly the snapshot's sequence must be dropped, not forwarded"
@@ -1506,14 +1640,15 @@ mod tests {
             forward_step_for_output_result(
                 Ok((3, b"predates-snapshot".to_vec())),
                 pane_id,
-                snapshot_seq
+                snapshot_seq,
+                false,
             ),
             ForwardStep::Skip,
             "a chunk older than the snapshot's sequence must be dropped, not forwarded"
         );
         assert!(
             matches!(
-                forward_step_for_output_result(Ok((11, b"new-output".to_vec())), pane_id, snapshot_seq),
+                forward_step_for_output_result(Ok((11, b"new-output".to_vec())), pane_id, snapshot_seq, false),
                 ForwardStep::Emit(AttachEvent {
                     payload: Some(attach_event::Payload::Output(bytes))
                 }) if bytes == b"new-output"
@@ -1538,7 +1673,7 @@ mod tests {
             let _ = tx.send((i as u64, vec![i]));
         }
 
-        let first = forward_step_for_output_result(rx.recv().await, pane_id, 0);
+        let first = forward_step_for_output_result(rx.recv().await, pane_id, 0, false);
         assert!(
             matches!(
                 first,
@@ -1553,13 +1688,312 @@ mod tests {
         // its last `capacity` (2) buffered items (3, 4) — the next recv()
         // must yield one of them as an ordinary Output event, not another
         // Lagged/OutputGap.
-        let second = forward_step_for_output_result(rx.recv().await, pane_id, 0);
+        let second = forward_step_for_output_result(rx.recv().await, pane_id, 0, false);
         assert!(matches!(
             second,
             ForwardStep::Emit(AttachEvent {
                 payload: Some(attach_event::Payload::Output(_))
             })
         ));
+    }
+
+    /// Task 2.2.1d / REQ-4: `AttachRequest.resume_from_seq` sits outside
+    /// the `oneof`, so `{ payload: None, resume_from_seq: Some(_) }` is
+    /// representable at the type level even though it's meaningless —
+    /// `attach()`'s pane_id check (`main.rs` around the `first.payload`
+    /// match) already unconditionally rejects any first message without
+    /// pane_id before `resume_from_seq` is ever read. This regression
+    /// test closes that concern with a falsifiable check rather than only
+    /// a doc note (Pattern Decisions' `AttachRequest.resume_from_seq
+    /// placement` row).
+    #[tokio::test]
+    async fn attach_should_reject_before_reading_resume_from_seq_when_first_message_omits_pane_id(
+    ) {
+        let daemon = test_daemon();
+        let mut client = spawn_test_server(daemon).await;
+
+        let (tx, req_rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: None,
+            resume_from_seq: Some(5),
+        })
+        .await
+        .unwrap();
+
+        let result = client.attach(Request::new(ReceiverStream::new(req_rx))).await;
+        let status = result.expect_err(
+            "attach must reject a first message without pane_id, even with resume_from_seq set",
+        );
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("first Attach message must set pane_id"),
+            "unexpected error message: {}",
+            status.message()
+        );
+    }
+
+    /// Story 2.2.1 AC1 / REQ-4: a client that disconnects after seeing
+    /// output up to some seq, then reattaches with `resume_from_seq` set
+    /// to that seq, must see the missed chunks replayed byte-identical to
+    /// what a client that never disconnected would have seen — no gap, no
+    /// duplicate — followed by live output continuing seamlessly.
+    /// Mirrors `pane_replay_since_should_match_bytes_delivered_by_live_subscribe_when_queried_concurrently_with_new_output`'s
+    /// settle-and-compare style in `tymux-core::pane`, at the `attach()`
+    /// RPC layer instead of the bare `Pane` API.
+    #[tokio::test]
+    async fn attach_should_replay_missed_chunks_byte_identical_to_never_disconnected_client_when_resume_from_seq_in_window(
+    ) {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // Settle-and-drain helper (mirrors pane.rs's own pattern): drains
+        // rx until `marker` has fully arrived and the channel is
+        // re-checked empty, returning the seq of the last chunk observed.
+        let mut rx = pane.subscribe();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let settle_on = |rx: &mut tokio::sync::broadcast::Receiver<(u64, Vec<u8>)>,
+                          buffered: &mut Vec<u8>,
+                          marker: &str| {
+            let mut last_seq = 0u64;
+            loop {
+                match rx.try_recv() {
+                    Ok((seq, bytes)) => {
+                        last_seq = seq;
+                        buffered.extend_from_slice(&bytes);
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        if String::from_utf8_lossy(buffered).contains(marker)
+                            && matches!(
+                                rx.try_recv(),
+                                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                            )
+                        {
+                            return last_seq;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "output around marker {marker:?} never settled"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("unexpected broadcast recv error: {e:?}"),
+                }
+            }
+        };
+
+        // Settle past a first marker to establish a real, already-retained
+        // resume point — this is the "already disconnected, already saw
+        // this much" baseline the client reattaches at.
+        let mut prefix_bytes = Vec::new();
+        pane.write_input(b"echo marker-one\n").unwrap();
+        let resume_from_seq = settle_on(&mut rx, &mut prefix_bytes, "marker-one");
+
+        // Produce the "missed" output, settling so it's fully landed
+        // (including in the replay buffer — pushed in the reader thread
+        // strictly before the broadcast send settle_on observes, so by
+        // the time this returns the chunk is already retained) before
+        // querying replay_since for ground truth.
+        let mut suffix_bytes = Vec::new();
+        pane.write_input(b"echo marker-two\n").unwrap();
+        settle_on(&mut rx, &mut suffix_bytes, "marker-two");
+
+        // Ground truth: exactly what Epic 2.1's own replay_since returns
+        // for this window — separately proven byte-identical to live
+        // subscribe() by
+        // `pane_replay_since_should_match_bytes_delivered_by_live_subscribe_when_queried_concurrently_with_new_output`
+        // in `tymux-core::pane`'s own test suite, so this test's job is
+        // to prove attach() forwards it verbatim as OutputChunk events,
+        // not to re-derive the reference independently via timing.
+        let expected_chunks = match pane.replay_since(resume_from_seq) {
+            ReplayOutcome::InWindow { chunks, .. } => chunks,
+            other => panic!("expected InWindow, got {other:?}"),
+        };
+        assert!(
+            !expected_chunks.is_empty(),
+            "test setup produced no chunks to replay"
+        );
+
+        // Reattach with the resume token — the daemon must replay exactly
+        // expected_chunks as OutputChunk events, in order, seq-for-seq.
+        let (tx, req_rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: Some(resume_from_seq),
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(req_rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mut received_chunks = Vec::new();
+        while received_chunks.len() < expected_chunks.len() {
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("attach stream stalled")
+                .unwrap()
+                .expect("stream ended before replay finished");
+            match event.payload {
+                Some(attach_event::Payload::OutputChunk(chunk)) => {
+                    received_chunks.push((chunk.seq, chunk.data));
+                }
+                other => panic!("expected only OutputChunk events on the resume path, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            received_chunks, expected_chunks,
+            "attach()'s replayed OutputChunk seq/data pairs must exactly match \
+             pane.replay_since(resume_from_seq)'s chunks, in order — no gap, no duplicate"
+        );
+
+        // Live output after the replay continues seamlessly as
+        // OutputChunk too (Story 2.2.1 AC1's "then any further live
+        // output" clause).
+        let mut last_seq = expected_chunks.last().unwrap().0;
+        pane.write_input(b"echo marker-three\n").unwrap();
+        let mut live_bytes = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("attach stream stalled")
+                .unwrap()
+                .expect("stream ended before live output arrived");
+            match event.payload {
+                Some(attach_event::Payload::OutputChunk(chunk)) => {
+                    assert!(
+                        chunk.seq > last_seq,
+                        "live seq must keep strictly increasing past the replay's tail: \
+                         last={last_seq}, got={}",
+                        chunk.seq
+                    );
+                    last_seq = chunk.seq;
+                    live_bytes.extend_from_slice(&chunk.data);
+                    if String::from_utf8_lossy(&live_bytes).contains("marker-three") {
+                        break;
+                    }
+                }
+                other => panic!("expected live output to continue as OutputChunk, got {other:?}"),
+            }
+        }
+    }
+
+    /// Story 2.2.2 AC1 / REQ-4 / Task 2.2.2b: a `resume_from_seq` older
+    /// than anything the replay buffer still retains must produce
+    /// `GapExceeded{oldest_available_seq}` as the first event, followed
+    /// immediately by a `Snapshot` — matching what a fresh no-token
+    /// attach sends as its very first event.
+    #[tokio::test]
+    async fn attach_should_emit_gap_exceeded_then_snapshot_when_resume_from_seq_is_stale_and_evicted(
+    ) {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let mut client = spawn_test_server(daemon).await;
+
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        // A pane's very first-ever chunk is always seq == 1 (Epic 2.1's
+        // own documented invariant, exercised directly in
+        // `tymux-core::replay_buffer`'s boundary tests) — guaranteed to
+        // predate the flood below, so it's a valid stale resume point
+        // with no need to settle on a specific marker first.
+        let stale_resume_from_seq = 1u64;
+
+        // Flood well past DEFAULT_REPLAY_BUFFER_BYTES (256 KiB): 40,000
+        // lines of "L0000000E\n" (10 bytes each) is ~390 KiB, evicting
+        // the earliest retained chunk(s) from the ring buffer. Detection
+        // polls the pane's own rendered grid (authoritative,
+        // parser-lock-protected) rather than a live broadcast
+        // subscriber — a subscriber can legitimately Lag/drop under this
+        // much volume (the same known, accepted behavior the
+        // double-render test above notes), which would make a
+        // marker-in-broadcast-stream wait unreliable here.
+        const LINE_COUNT: usize = 40_000;
+        let cmd = format!(
+            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; echo FLOOD-DONE\n"
+        );
+        pane.write_input(cmd.as_bytes()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = pane.snapshot();
+            let screen_text: String = snapshot
+                .grid
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|c| c.text.as_str())
+                .collect();
+            if screen_text.contains("FLOOD-DONE") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "flood never completed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let (tx, req_rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: Some(stale_resume_from_seq),
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(req_rx)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        match first.payload {
+            Some(attach_event::Payload::GapExceeded(gap)) => {
+                assert!(
+                    gap.oldest_available_seq > stale_resume_from_seq,
+                    "oldest_available_seq ({}) must be past the now-stale resume point ({})",
+                    gap.oldest_available_seq,
+                    stale_resume_from_seq
+                );
+            }
+            other => panic!("expected the first event to be GapExceeded, got {other:?}"),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before the fallback Snapshot event");
+        assert!(
+            matches!(second.payload, Some(attach_event::Payload::Snapshot(_))),
+            "expected the second event to be a Snapshot, got {:?}",
+            second.payload
+        );
     }
 
     /// Task 1.3.1c / REQ-5: the regression test the previous ("wait for it
