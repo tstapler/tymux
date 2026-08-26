@@ -30,10 +30,18 @@ jobs:
           # from an arm64 host. macos-13 (Intel) is deliberately not used
           # here — GitHub-hosted macos-13 runners queued 50+ min with zero
           # progress when tried on this repo in Epic 1's CI (see ci.yml).
+          # codesign: "-" is ad-hoc signing (no certificate, no secret to
+          # manage) — satisfies Apple Silicon's hard requirement that a
+          # binary be signed to execute at all. It does NOT satisfy
+          # Gatekeeper for a downloaded/quarantined file; that needs a
+          # paid Apple Developer ID certificate + notarization, which
+          # nobody has provisioned for this repo yet.
           - target: x86_64-apple-darwin
             os: macos-latest
+            codesign: "-"
           - target: aarch64-apple-darwin
             os: macos-latest
+            codesign: "-"
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -63,4 +71,5 @@ jobs:
           # per target, so this must be named explicitly.
           archive: tymux-$target
           target: ${{ matrix.target }}
+          codesign: ${{ matrix.codesign }}
           token: ${{ secrets.GITHUB_TOKEN }}
