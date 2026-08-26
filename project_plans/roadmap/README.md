@@ -1,6 +1,6 @@
 # Roadmap: tymux
 
-**Date**: 2026-08-23
+**Date**: 2026-08-23 (last updated 2026-08-26: attach resume protocol shipped)
 **Type**: outcome-based roadmap (post-v1.0)
 
 ## Vision
@@ -10,10 +10,28 @@ detach, copy, kill — has a typed RPC underneath it, so an AI coding agent
 or a web frontend can drive a multiplexer as reliably as a human at a
 terminal. v1.0 (shipped, tag `v1.0.0`) proved the model works end-to-end:
 splits, Tier-0 persistence, copy-mode, a status bar, config/keybindings,
-and a real non-Rust client. What's next is making that model **robust**
+and a real non-Rust client. v1.1.0 (tag `v1.1.0`) added the first piece of
+robustness: resumable `Attach` streams, so a network drop no longer means
+losing scrollback. What's next is making that model **robust**
 enough to trust with real, unattended workloads (agents, hosted
 multi-user backends) and closing the remaining gap with tmux/zellij/wezterm
 for the parts of the surface v1.0 deliberately deferred.
+
+## Shipped since this roadmap was written
+
+### `v1.1.0` (2026-08-26): attach resume protocol
+
+The first "Next" outcome below — resumable `Attach` — is done, ahead of
+the auth work it was originally sequenced after. All three of its bullets
+landed: resume token + sequence numbers (`resume_from_seq`,
+`OutputChunk.seq`, `GapExceeded` fallback to a fresh `CapturePane`
+snapshot), a per-attach resume cursor (each `attach()` call carries its
+own `resume_from_seq`, so concurrent subscribers to one pane don't share
+a cursor), and heartbeat/keepalive with a configurable grace period before
+disconnect-triggered cleanup. `clients/ts` and `clients/go` both exercise
+the resume path in CI against a real `tymuxd`. See
+[`project_plans/attach-resume-protocol/`](../attach-resume-protocol/) for
+the full epic breakdown and [PR #38](https://github.com/tstapler/tymux/pull/38).
 
 ## Now (Committed — current focus)
 
@@ -43,37 +61,6 @@ This is already fully scoped in
   in the fully integrated stack (Epic 3)
 
 ## Next (Planned — high confidence, not yet started)
-
-### Outcome: an abrupt network drop never loses state, for *any* client, not just stapler-squad
-
-The Now milestone fixes one instance of this bug for one consumer. This
-generalizes the fix into a protocol-level guarantee, since the underlying
-gap — the `Attach` stream has no resume mechanism — will resurface for the
-next client the moment it deals with a flaky connection instead of a
-clean unit test.
-
-- **Resume token + sequence numbers on `Attach`.** On reattach, the client
-  sends the last sequence number it applied; the daemon replays only the
-  gap from the per-pane broadcast buffer's retained history, falling back
-  to a full `CapturePane` snapshot once the gap exceeds retention. This is
-  the same shape `output_gap` already signals, made resumable instead of
-  just detectable — mirrors Eternal Terminal's `BackedReader`/`BackedWriter`
-  byte-sequence replay and mosh's State Synchronization Protocol fallback
-  for "too far behind, resync to current state."
-- **Per-subscriber cursor, not one shared gap bit.** Multiple clients can
-  attach to one pane's broadcast channel; each needs its own reconnect
-  cursor so one client's catch-up doesn't affect another's live stream.
-- **Heartbeat/keepalive on `Attach` + a configurable grace period before
-  any disconnect-triggered cleanup.** Distinguishes "client slow" from
-  "client actually gone" within a bounded window, and — mirroring zellij's
-  explicit `Active → ActiveDetached → Killed` state machine — makes
-  "orphaned but still running" a first-class, intentional state instead of
-  the ad hoc thing the Now milestone is fixing one bug at a time.
-
-**Why now, not later**: this is tmux's entire value proposition
-(disconnect ≠ death), it's the exact class of bug currently blocking the
-stapler-squad milestone, and the fix generalizes cleanly from work already
-in flight.
 
 ### Outcome: `tymuxd` can be exposed beyond loopback without being an open door
 
