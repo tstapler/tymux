@@ -27,6 +27,8 @@ use tymux_proto::v1::{
     Window as ProtoWindow, WindowLayoutEvent,
 };
 
+mod auth;
+
 /// Default window (Task 1.1.2e / pre-mortem P1 #1) within which a pane
 /// exiting shortly after its last `Attach` stream dropped is treated as a
 /// possible disconnect-survival regression rather than an ordinary exit.
@@ -1227,22 +1229,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("TYMUXD_ADDR").unwrap_or_else(|_| "127.0.0.1:7419".to_string());
     let socket_addr: std::net::SocketAddr = addr.parse()?;
 
-    // There is no authentication anywhere in this daemon today: any client
-    // that can reach this port can CreateSession (spawning an arbitrary
-    // command) and Attach/CapturePane/KillSession against any pane_id with
-    // no ownership check. That's an acceptable default on loopback, where
-    // only local processes can reach it — it is unauthenticated remote
-    // code execution if bound to a non-loopback address. This can't be
-    // forbidden outright (a real multi-host deployment may need it and
-    // that's a legitimate choice), but it must not be silent.
-    if !socket_addr.ip().is_loopback() {
+    // Bearer-token auth: a non-loopback bind requires --token/TYMUXD_TOKEN
+    // (enforced below by auth::check_non_loopback_requires_token) and every
+    // TymuxService RPC is gated by auth::BearerAuthInterceptor when bound
+    // non-loopback (wired at server construction below). Loopback binds are
+    // unaffected — only local processes can reach the port there.
+    let args: Vec<String> = std::env::args().collect();
+    let configured_token = auth::resolve_token(&args);
+    let is_loopback = socket_addr.ip().is_loopback();
+
+    // NOT `.map_err(...)?` — main()'s return type is
+    // `Result<(), Box<dyn std::error::Error>>`, and Rust's default
+    // Termination impl reports a returned Err via its `Debug` impl, not
+    // `Display`. A `String` (converted to `Box<dyn Error>` via `?`) prints
+    // as `Error: "the message\nwith literal backslash-n text and quotes"`
+    // — exactly the Debug-dump this message's multi-line formatting is
+    // designed to avoid (empirically confirmed: reproduced this exact
+    // pattern standalone and got literal `\n` in the output, not real
+    // newlines). Print directly and exit instead, matching this repo's
+    // "one clean line" convention in spirit even though the pre-existing
+    // `sessions_dir` precedent (main.rs:1254-1259) has this same latent
+    // bug — less visible there only because that message has no embedded
+    // newline. Not fixing sessions_dir's version here (out of this
+    // feature's scope), but not repeating its mistake either.
+    if let Err(e) = auth::check_non_loopback_requires_token(is_loopback, configured_token.as_ref())
+    {
+        eprintln!("Error: {e} (bind address: {socket_addr})");
+        std::process::exit(1);
+    }
+
+    if !is_loopback {
         tracing::warn!(
             %socket_addr,
-            "tymuxd is binding to a non-loopback address with NO authentication of any kind. \
-             Any client that can reach this port has full control: it can run arbitrary \
-             commands via CreateSession and attach to any existing pane. Do not do this on an \
-             untrusted network. Per-pane authorization is not implemented yet — see \
-             docs/reviews/is-it-ready-2026-07-13.md."
+            "tymuxd is binding to a non-loopback address; bearer-token auth is enforced on every call"
+        );
+    } else {
+        tracing::info!(
+            %socket_addr,
+            "tymuxd binding to loopback; no auth required (if this daemon is reachable through a reverse proxy or tunnel, loopback auto-exemption does not protect you — bind non-loopback and set --token/TYMUXD_TOKEN instead)"
         );
     }
 
@@ -1283,12 +1307,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let daemon = TymuxDaemon::new(engine);
 
     tracing::info!(%addr, "tymuxd listening");
-    Server::builder()
-        .http2_keepalive_interval(Some(Duration::from_secs(30)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .add_service(TymuxServiceServer::new(daemon))
-        .serve_with_shutdown(socket_addr, shutdown_signal())
-        .await?;
+    if let Some(token) = configured_token {
+        let rejection_count = Arc::new(AtomicI64::new(0));
+        Server::builder()
+            .http2_keepalive_interval(Some(Duration::from_secs(30)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+            .add_service(TymuxServiceServer::with_interceptor(
+                daemon,
+                auth::BearerAuthInterceptor::new(token, rejection_count),
+            ))
+            .serve_with_shutdown(socket_addr, shutdown_signal())
+            .await?;
+    } else {
+        Server::builder()
+            .http2_keepalive_interval(Some(Duration::from_secs(30)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+            .add_service(TymuxServiceServer::new(daemon))
+            .serve_with_shutdown(socket_addr, shutdown_signal())
+            .await?;
+    }
     tracing::info!("tymuxd shut down");
     Ok(())
 }
@@ -1410,6 +1447,35 @@ mod tests {
                 .unwrap();
         });
         TymuxServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client should connect to the just-bound listener")
+    }
+
+    /// Non-loopback counterpart to `spawn_test_server`: binds `0.0.0.0:0`
+    /// (non-loopback per `Ipv4Addr::is_loopback()`, but still local-only in
+    /// practice — safe for CI) and wires in a `BearerAuthInterceptor` for
+    /// `token`, returning a connected client in the same shape
+    /// `spawn_test_server` returns. Individual tests attach/omit the
+    /// `authorization` metadata per-call on the returned client's requests
+    /// to exercise accept/reject behavior (Task 1.2.2b).
+    async fn spawn_non_loopback_test_server(
+        daemon: TymuxDaemon,
+        token: auth::BearerToken,
+    ) -> TymuxServiceClient<tonic::transport::Channel> {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rejection_count = Arc::new(AtomicI64::new(0));
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TymuxServiceServer::with_interceptor(
+                    daemon,
+                    auth::BearerAuthInterceptor::new(token, rejection_count),
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        TymuxServiceClient::connect(format!("http://127.0.0.1:{}", addr.port()))
             .await
             .expect("client should connect to the just-bound listener")
     }
@@ -4507,5 +4573,61 @@ mod tests {
         };
 
         assert_eq!(count_orphan_candidates(&[record]), 0);
+    }
+
+    // --- Story 1.2.2: interceptor wired into a real, non-loopback server ---
+
+    #[tokio::test]
+    async fn non_loopback_server_rejects_list_sessions_with_missing_token() {
+        let token = auth::BearerToken::parse("s3cr3t").unwrap();
+        let daemon = test_daemon();
+        let mut client = spawn_non_loopback_test_server(daemon, token).await;
+
+        let status = client
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn non_loopback_server_accepts_list_sessions_with_correct_token() {
+        let token = auth::BearerToken::parse("s3cr3t").unwrap();
+        let daemon = test_daemon();
+        let mut client = spawn_non_loopback_test_server(daemon, token).await;
+
+        let mut req = Request::new(ListSessionsRequest {});
+        req.metadata_mut()
+            .insert("authorization", "Bearer s3cr3t".parse().unwrap());
+        let response = client.list_sessions(req).await;
+        assert!(
+            response.is_ok(),
+            "expected success with the correct token, got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_loopback_server_rejects_attach_stream_with_missing_token_promptly() {
+        let token = auth::BearerToken::parse("s3cr3t").unwrap();
+        let daemon = test_daemon();
+        let mut client = spawn_non_loopback_test_server(daemon, token).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(Uuid::new_v4().to_string())),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.attach(Request::new(ReceiverStream::new(rx))),
+        )
+        .await
+        .expect("Attach should fail promptly, not hang");
+
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 }
