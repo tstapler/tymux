@@ -1,9 +1,10 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { createClient } from "@connectrpc/connect";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createGrpcTransport } from "@connectrpc/connect-node";
 import { TymuxService, type AttachRequest } from "../gen/tymux/v1/tymux_pb.js";
 import { runAttachDemo } from "../examples/attach.js";
+import { tymuxClient } from "../examples/client.js";
 import { capturePane } from "../examples/capture-pane.js";
 import { startDaemon, type TestDaemon } from "./daemon.js";
 
@@ -52,6 +53,79 @@ test("attach executes input and full-cancellation leaves the pane live; captureP
     screenText.includes("tymux-ts-marker-output"),
     "capturePane snapshot should reflect the pane's actual current screen",
   );
+});
+
+// --- Epic 3.2: TS client bearer-token auth against a live, token-gated
+// daemon. Each test spins up its own token-gated daemon (distinct from the
+// no-auth `daemon` shared above) since auth enforcement only kicks in on a
+// non-loopback bind (`startDaemon({ token })` binds 0.0.0.0 for this
+// reason — see daemon.ts's doc comment) and these tests would otherwise
+// interfere with the no-token tests sharing the module-level `daemon`.
+
+const AUTH_TOKEN = "s3cr3t";
+
+function assertUnauthenticated(err: unknown) {
+  assert.ok(err instanceof ConnectError, `expected a ConnectError, got ${String(err)}`);
+  assert.equal((err as ConnectError).code, Code.Unauthenticated);
+  return true;
+}
+
+// Story 3.2.1 AC1 / Task 3.2.1c: missing/wrong token rejected on a unary call.
+test("listSessions rejects a missing/wrong token", async () => {
+  const tokenDaemon = await startDaemon({ token: AUTH_TOKEN });
+  try {
+    const unauthedClient = tymuxClient(tokenDaemon.addr);
+    await assert.rejects(() => unauthedClient.listSessions({}), assertUnauthenticated);
+  } finally {
+    tokenDaemon.stop();
+  }
+});
+
+// Story 3.2.1 AC2 / Task 3.2.1c: correct token succeeds on a unary call.
+test("listSessions succeeds with the correct token", async () => {
+  const tokenDaemon = await startDaemon({ token: AUTH_TOKEN });
+  try {
+    const authedClient = tymuxClient(tokenDaemon.addr, AUTH_TOKEN);
+    const listed = await authedClient.listSessions({});
+    assert.ok(Array.isArray(listed.sessions), "listSessions should succeed and return a sessions array");
+  } finally {
+    tokenDaemon.stop();
+  }
+});
+
+// Story 3.2.1 AC3 / Task 3.2.1d: missing/wrong token rejected on the
+// streaming Attach RPC specifically — the auth interceptor applies
+// uniformly to unary and streaming calls, so a bogus pane ID is enough to
+// prove rejection happens before any pane lookup.
+test("attach rejects a missing/wrong token", async () => {
+  const tokenDaemon = await startDaemon({ token: AUTH_TOKEN });
+  try {
+    await assert.rejects(
+      () => runAttachDemo("nonexistent-pane-id", { baseUrl: tokenDaemon.addr }),
+      assertUnauthenticated,
+    );
+  } finally {
+    tokenDaemon.stop();
+  }
+});
+
+// Story 3.2.1 AC4 / Task 3.2.1d: correct token succeeds on Attach — streams
+// real command output just like the no-auth "attach executes input..." test.
+test("attach succeeds with the correct token", async () => {
+  const tokenDaemon = await startDaemon({ token: AUTH_TOKEN });
+  try {
+    const authedClient = tymuxClient(tokenDaemon.addr, AUTH_TOKEN);
+    const session = await authedClient.createSession({ name: "ts-auth-attach-integration", command: "" });
+    const node = session.windows[0]?.layout?.node;
+    assert.equal(node?.case, "pane", "a fresh session's window should be a single-pane leaf");
+    if (node?.case !== "pane") throw new Error("unreachable");
+    const paneId = node.value.id;
+
+    const { output } = await runAttachDemo(paneId, { baseUrl: tokenDaemon.addr, token: AUTH_TOKEN });
+    assert.ok(output.includes("tymux-ts-marker-output"), "attach should observe the command's real output");
+  } finally {
+    tokenDaemon.stop();
+  }
 });
 
 // --- Epic 5.1: resume support ---
