@@ -124,8 +124,12 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
 
         match presented {
             None => {
-                self.rejection_count.fetch_add(1, Ordering::SeqCst);
-                tracing::warn!(peer = %peer, "rejected TymuxService call: missing bearer token");
+                let count = self.rejection_count.fetch_add(1, Ordering::SeqCst) + 1;
+                tracing::warn!(
+                    peer = %peer,
+                    tymux_auth_rejection_count = count,
+                    "rejected TymuxService call: missing bearer token"
+                );
                 Err(Status::unauthenticated("missing bearer token"))
             }
             Some(supplied)
@@ -137,8 +141,12 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
                 Ok(req)
             }
             Some(_) => {
-                self.rejection_count.fetch_add(1, Ordering::SeqCst);
-                tracing::warn!(peer = %peer, "rejected TymuxService call: invalid bearer token");
+                let count = self.rejection_count.fetch_add(1, Ordering::SeqCst) + 1;
+                tracing::warn!(
+                    peer = %peer,
+                    tymux_auth_rejection_count = count,
+                    "rejected TymuxService call: invalid bearer token"
+                );
                 Err(Status::unauthenticated("invalid bearer token"))
             }
         }

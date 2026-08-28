@@ -22,6 +22,8 @@ type Interceptor struct {
 	Token string
 }
 
+var _ connect.Interceptor = Interceptor{}
+
 func (a Interceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
 		if a.Token != "" {

@@ -333,8 +333,7 @@ func resolveBinary(t *testing.T) string {
 // for its "tymuxd listening" stdout line, same signal daemon.ts waits on.
 func startDaemon(t *testing.T) string {
 	t.Helper()
-	port := 30000 + time.Now().UnixNano()%20000
-	return startDaemonOn(t, fmt.Sprintf("127.0.0.1:%d", port), "")
+	return startDaemonOn(t, fmt.Sprintf("127.0.0.1:%d", ephemeralPort()), "")
 }
 
 // startDaemonWithToken spawns a real tymuxd bound non-loopback (0.0.0.0) on
@@ -347,8 +346,17 @@ func startDaemon(t *testing.T) string {
 // startDaemon above unchanged.
 func startDaemonWithToken(t *testing.T, token string) string {
 	t.Helper()
-	port := 30000 + time.Now().UnixNano()%20000
-	return startDaemonOn(t, fmt.Sprintf("0.0.0.0:%d", port), token)
+	return startDaemonOn(t, fmt.Sprintf("0.0.0.0:%d", ephemeralPort()), token)
+}
+
+// ephemeralPort picks a pseudo-random port in a fixed high range, shared by
+// startDaemon and startDaemonWithToken so the two stay in sync by
+// construction. A bind-then-close probe would avoid collision risk
+// entirely, but this mirrors the pre-existing scheme startDaemon already
+// used before this feature — not changing the underlying approach here,
+// only removing the duplication.
+func ephemeralPort() int64 {
+	return 30000 + time.Now().UnixNano()%20000
 }
 
 // startDaemonOn spawns a real tymuxd bound to addr and waits for its "tymuxd

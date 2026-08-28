@@ -308,19 +308,29 @@ impl BearerToken {
 /// Attaches the configured bearer token to every outgoing RPC as
 /// `authorization: Bearer <token>`, unary and streaming (`Attach`) alike.
 /// No-ops when no token is configured — loopback usage must stay
-/// byte-for-byte unaffected.
+/// byte-for-byte unaffected. The `authorization` header value is formatted
+/// and validated once at construction, not per call, since this
+/// interceptor sits on the hot path of every RPC (e.g. every navigation
+/// keystroke in `redraw_copy_mode`'s shared redraw path).
 #[derive(Clone)]
 struct BearerAuth {
-    token: Option<BearerToken>,
+    header: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl BearerAuth {
+    fn new(token: Option<BearerToken>) -> anyhow::Result<Self> {
+        let header = token
+            .map(|token| format!("Bearer {}", token.as_str()).parse())
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("token contains invalid header characters"))?;
+        Ok(Self { header })
+    }
 }
 
 impl tonic::service::Interceptor for BearerAuth {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        if let Some(token) = &self.token {
-            let value = format!("Bearer {}", token.as_str())
-                .parse()
-                .map_err(|_| tonic::Status::internal("token contains invalid header characters"))?;
-            req.metadata_mut().insert("authorization", value);
+        if let Some(header) = &self.header {
+            req.metadata_mut().insert("authorization", header.clone());
         }
         Ok(req)
     }
@@ -335,9 +345,7 @@ async fn run() -> Result<()> {
     let channel = endpoint.connect().await?;
     let mut client = TymuxServiceClient::with_interceptor(
         channel,
-        BearerAuth {
-            token: cli.token.as_deref().and_then(BearerToken::parse),
-        },
+        BearerAuth::new(cli.token.as_deref().and_then(BearerToken::parse))?,
     );
     let config = TymuxConfig::load_or_default();
     let status_bar_cfg = StatusBarConfig::new(!cli.no_status_bar);
@@ -1139,9 +1147,7 @@ mod tests {
 
         let mut authed_client = TymuxServiceClient::with_interceptor(
             channel.clone(),
-            BearerAuth {
-                token: BearerToken::parse("s3cr3t-integration-token"),
-            },
+            BearerAuth::new(BearerToken::parse("s3cr3t-integration-token")).unwrap(),
         );
         authed_client
             .list_sessions(ListSessionsRequest {})
@@ -1149,7 +1155,7 @@ mod tests {
             .expect("ListSessions should succeed with the correct bearer token");
 
         let mut unauthed_client =
-            TymuxServiceClient::with_interceptor(channel, BearerAuth { token: None });
+            TymuxServiceClient::with_interceptor(channel, BearerAuth::new(None).unwrap());
         let err = unauthed_client
             .list_sessions(ListSessionsRequest {})
             .await
@@ -1169,9 +1175,7 @@ mod tests {
 
         let mut client = TymuxServiceClient::with_interceptor(
             channel,
-            BearerAuth {
-                token: BearerToken::parse("s3cr3t-attach-token"),
-            },
+            BearerAuth::new(BearerToken::parse("s3cr3t-attach-token")).unwrap(),
         );
 
         let session = client
