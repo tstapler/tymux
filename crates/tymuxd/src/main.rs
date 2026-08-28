@@ -1261,7 +1261,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !is_loopback {
         tracing::warn!(
             %socket_addr,
-            "tymuxd is binding to a non-loopback address; bearer-token auth is enforced on every call"
+            "tymuxd is binding to a non-loopback address; bearer-token auth is enforced on every call \
+             — note this connection is not encrypted; the token itself travels in cleartext, so treat \
+             the network path as trusted or put tymuxd behind a TLS-terminating proxy/tunnel if it isn't"
         );
     } else {
         tracing::info!(
@@ -1314,7 +1316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .http2_keepalive_timeout(Some(Duration::from_secs(10)))
             .add_service(TymuxServiceServer::with_interceptor(
                 daemon,
-                auth::BearerAuthInterceptor::new(token, rejection_count),
+                auth::BearerAuthInterceptor::new(Arc::new(token), rejection_count),
             ))
             .serve_with_shutdown(socket_addr, shutdown_signal())
             .await?;
@@ -1469,7 +1471,7 @@ mod tests {
             Server::builder()
                 .add_service(TymuxServiceServer::with_interceptor(
                     daemon,
-                    auth::BearerAuthInterceptor::new(token, rejection_count),
+                    auth::BearerAuthInterceptor::new(Arc::new(token), rejection_count),
                 ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await

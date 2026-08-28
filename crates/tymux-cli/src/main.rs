@@ -142,10 +142,7 @@ fn first_pane_id(session: &Session) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("window {} has no panes", window.id))
 }
 
-async fn resolve_target(
-    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
-    target: &TargetString,
-) -> Result<ProtoPane> {
+async fn resolve_target(client: &mut TymuxClient, target: &TargetString) -> Result<ProtoPane> {
     let resp = client
         .list_sessions(ListSessionsRequest {})
         .await?
@@ -190,7 +187,10 @@ struct Cli {
 
     /// Bearer token to authenticate against a non-loopback tymuxd.
     /// Generate one with `openssl rand -hex 32` if you don't already have
-    /// one configured on the daemon side.
+    /// one configured on the daemon side. Prefer TYMUXD_TOKEN over --token
+    /// on a shared host — argv (and thus --token's value) is visible to
+    /// any local user via `ps`/`/proc/<pid>/cmdline`, while environment
+    /// variables are only readable via the owner-only `/proc/<pid>/environ`.
     #[arg(long, global = true, env = "TYMUXD_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
@@ -316,6 +316,11 @@ impl BearerToken {
 struct BearerAuth {
     header: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
+
+/// Shorthand for the client type every RPC helper in this file threads
+/// through — spelled out in full (`TymuxServiceClient<InterceptedService<
+/// Channel, BearerAuth>>`) it was repeated at every call site.
+type TymuxClient = TymuxServiceClient<InterceptedService<Channel, BearerAuth>>;
 
 impl BearerAuth {
     fn new(token: Option<BearerToken>) -> anyhow::Result<Self> {
@@ -506,7 +511,7 @@ enum AttachOutcome {
 /// Loops `attach()` to follow `NextWindow`/`PrevWindow` reattachment
 /// requests until the user actually detaches (or the pane/stream ends).
 async fn attach_and_follow(
-    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
+    client: &mut TymuxClient,
     mut pane_id: String,
     session_name: &str,
     config: &TymuxConfig,
@@ -525,7 +530,7 @@ async fn attach_and_follow(
 /// NextWindow/PrevWindow cycle through (no server RPC; "next"/"prev" is
 /// purely an ordering over `ListSessions`' response).
 async fn adjacent_window_pane(
-    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
+    client: &mut TymuxClient,
     session_name: &str,
     current_pane_id: &str,
     forward: bool,
@@ -560,7 +565,7 @@ async fn adjacent_window_pane(
 }
 
 async fn attach(
-    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
+    client: &mut TymuxClient,
     pane_id: String,
     session_name: &str,
     config: &TymuxConfig,
@@ -866,7 +871,7 @@ fn render_plain_grid(
 /// it plus copy-mode's status line — the shared redraw path both entering
 /// copy-mode and every subsequent navigation keystroke use.
 async fn redraw_copy_mode(
-    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
+    client: &mut TymuxClient,
     pane_id: &str,
     cs: &CopyModeState,
     stdout: &mut std::io::Stdout,
@@ -1211,6 +1216,42 @@ mod tests {
             matches!(first.payload, Some(attach_event::Payload::Snapshot(_))),
             "expected the first AttachEvent to be a Snapshot, got {first:?}"
         );
+    }
+
+    /// Counterpart to `attach_succeeds_against_token_gated_daemon_with_correct_token`:
+    /// proves the `Attach` bidi stream is rejected, not just unary calls,
+    /// when the client presents no bearer token at all — mirrors
+    /// `crates/tymuxd/src/main.rs`'s
+    /// `non_loopback_server_rejects_attach_stream_with_missing_token_promptly`
+    /// for the identical scenario, including the bounded timeout to avoid a
+    /// hang risk if rejection ever stopped happening promptly.
+    #[tokio::test]
+    async fn attach_rejected_against_token_gated_daemon_with_missing_token() {
+        let daemon = spawn_token_gated_daemon("s3cr3t-attach-reject-token");
+        let channel = wait_for_daemon(&daemon.addr).await;
+
+        let mut client =
+            TymuxServiceClient::with_interceptor(channel, BearerAuth::new(None).unwrap());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(
+                "missing-token-test-pane".to_string(),
+            )),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.attach(Request::new(ReceiverStream::new(rx))),
+        )
+        .await
+        .expect("Attach should fail promptly, not hang");
+
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 
     fn parse(args: &[&str]) -> Cli {

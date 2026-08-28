@@ -50,6 +50,11 @@ impl BearerToken {
 /// accidentally bypassed if a third token source is ever added (see
 /// Unresolved Questions' `TYMUXD_TOKEN_FILE` note).
 ///
+/// Prefer TYMUXD_TOKEN over --token on a shared host — argv (and thus
+/// --token's value) is visible to any local user via `ps`/
+/// `/proc/<pid>/cmdline`, while environment variables are only
+/// readable via the owner-only `/proc/<pid>/environ`.
+///
 /// Generate a token with `openssl rand -hex 32` if you don't already
 /// have one to configure.
 pub fn resolve_token(args: &[String]) -> Option<BearerToken> {
@@ -96,12 +101,12 @@ pub fn check_non_loopback_requires_token(
 /// (research/architecture.md §2).
 #[derive(Clone)]
 pub struct BearerAuthInterceptor {
-    token: BearerToken,
+    token: Arc<BearerToken>,
     rejection_count: Arc<AtomicI64>,
 }
 
 impl BearerAuthInterceptor {
-    pub fn new(token: BearerToken, rejection_count: Arc<AtomicI64>) -> Self {
+    pub fn new(token: Arc<BearerToken>, rejection_count: Arc<AtomicI64>) -> Self {
         Self {
             token,
             rejection_count,
@@ -111,10 +116,11 @@ impl BearerAuthInterceptor {
 
 impl tonic::service::Interceptor for BearerAuthInterceptor {
     fn call(&mut self, req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-        let peer = req
-            .remote_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        // `remote_addr()` itself is cheap (no allocation); only the
+        // `.to_string()` in each rejection arm heap-allocates, so the
+        // common accepted-call path doesn't pay for a peer string it
+        // never uses.
+        let remote_addr = req.remote_addr();
 
         let presented = req
             .metadata()
@@ -124,10 +130,13 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
 
         match presented {
             None => {
-                let count = self.rejection_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let peer = remote_addr
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let count = self.rejection_count.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::warn!(
                     peer = %peer,
-                    tymux_auth_rejection_count = count,
+                    tymux_auth_rejection_total = count,
                     "rejected TymuxService call: missing bearer token"
                 );
                 Err(Status::unauthenticated("missing bearer token"))
@@ -141,10 +150,13 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
                 Ok(req)
             }
             Some(_) => {
-                let count = self.rejection_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let peer = remote_addr
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let count = self.rejection_count.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::warn!(
                     peer = %peer,
-                    tymux_auth_rejection_count = count,
+                    tymux_auth_rejection_total = count,
                     "rejected TymuxService call: invalid bearer token"
                 );
                 Err(Status::unauthenticated("invalid bearer token"))
@@ -294,7 +306,7 @@ mod tests {
     fn bearer_auth_interceptor_accepts_matching_token() {
         let token = BearerToken::parse("s3cr3t").unwrap();
         let counter = Arc::new(AtomicI64::new(0));
-        let mut interceptor = BearerAuthInterceptor::new(token, counter.clone());
+        let mut interceptor = BearerAuthInterceptor::new(Arc::new(token), counter.clone());
         let req = metadata_request(Some("Bearer s3cr3t"));
         assert!(interceptor.call(req).is_ok());
         assert_eq!(counter.load(Ordering::SeqCst), 0);
@@ -304,7 +316,7 @@ mod tests {
     fn bearer_auth_interceptor_rejects_missing_token() {
         let token = BearerToken::parse("s3cr3t").unwrap();
         let counter = Arc::new(AtomicI64::new(0));
-        let mut interceptor = BearerAuthInterceptor::new(token, counter.clone());
+        let mut interceptor = BearerAuthInterceptor::new(Arc::new(token), counter.clone());
         let req = metadata_request(None);
         let err = interceptor.call(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -316,7 +328,7 @@ mod tests {
     fn bearer_auth_interceptor_rejects_wrong_token() {
         let token = BearerToken::parse("s3cr3t").unwrap();
         let counter = Arc::new(AtomicI64::new(0));
-        let mut interceptor = BearerAuthInterceptor::new(token, counter.clone());
+        let mut interceptor = BearerAuthInterceptor::new(Arc::new(token), counter.clone());
         let req = metadata_request(Some("Bearer wrongvalue"));
         let err = interceptor.call(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -328,7 +340,7 @@ mod tests {
     fn bearer_auth_interceptor_rejects_malformed_authorization_header() {
         let token = BearerToken::parse("s3cr3t").unwrap();
         let counter = Arc::new(AtomicI64::new(0));
-        let mut interceptor = BearerAuthInterceptor::new(token, counter.clone());
+        let mut interceptor = BearerAuthInterceptor::new(Arc::new(token), counter.clone());
         let req = metadata_request(Some("Bearer"));
         let err = interceptor.call(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -340,7 +352,7 @@ mod tests {
     fn bearer_auth_interceptor_rejection_counter_counts_only_rejections() {
         let token = BearerToken::parse("s3cr3t").unwrap();
         let counter = Arc::new(AtomicI64::new(0));
-        let mut interceptor = BearerAuthInterceptor::new(token, counter.clone());
+        let mut interceptor = BearerAuthInterceptor::new(Arc::new(token), counter.clone());
 
         // 3 rejected, 2 accepted, interleaved.
         assert!(interceptor.call(metadata_request(None)).is_err());
@@ -363,7 +375,7 @@ mod tests {
     fn bearer_auth_interceptor_logs_real_peer_address_when_available() {
         let token = BearerToken::parse("s3cr3t").unwrap();
         let counter = Arc::new(AtomicI64::new(0));
-        let mut interceptor = BearerAuthInterceptor::new(token, counter);
+        let mut interceptor = BearerAuthInterceptor::new(Arc::new(token), counter);
 
         let mut req = Request::new(());
         req.extensions_mut().insert(TcpConnectInfo {
