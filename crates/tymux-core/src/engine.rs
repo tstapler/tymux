@@ -197,6 +197,13 @@ pub struct Engine {
     /// [`WindowIndex`]'s own doc comment for what it's for and why it's one
     /// lock, not two.
     window_index: Mutex<WindowIndex>,
+    /// One dedicated `Mutex` per window, held for the full duration of
+    /// [`Engine::recompute_window_geometry`] — see that function's doc
+    /// comment for the race it closes. Lazily created, never removed (same
+    /// accepted one-entry-per-window-ever-created tradeoff as
+    /// `window_watchers`): a stray empty `Mutex` is a few bytes, not worth
+    /// threading cleanup into every window-removal call site for.
+    resize_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     /// Storage seam (Story 4.1 Task 5, architecture-review.md Blocker #2):
     /// `Engine::new()` uses `NullPersistenceBackend` (tests never touch
     /// disk unless they opt in via `Engine::with_persistence`); `tymuxd`'s
@@ -250,6 +257,7 @@ impl Default for Engine {
             next_client_id: AtomicU64::new(1),
             window_watchers: Mutex::new(HashMap::new()),
             window_index: Mutex::new(WindowIndex::default()),
+            resize_locks: Mutex::new(HashMap::new()),
             persistence: Box::new(NullPersistenceBackend),
         }
     }
@@ -891,7 +899,32 @@ impl Engine {
     /// registered) — used both after `report_viewport_and_recompute` and
     /// after `unregister_viewport` (a detaching client's departure can
     /// itself change the dimension-wise minimum).
+    ///
+    /// Holds `resize_locks[window_id]` for the entire function body,
+    /// including the unlocked `Pane::resize()` syscalls below — this is
+    /// the fix for the known resize-race (ADR-004/pre-mortem P3): without
+    /// it, two overlapping recompute triggers for the *same* window (rapid
+    /// drag-resize, or two clients reporting viewports near-simultaneously)
+    /// have no ordering guarantee between their unlocked apply phases, so
+    /// an older, stale computation's `Pane::resize()` calls can physically
+    /// run *after* a newer one's — sibling panes in one window can briefly
+    /// (or, without this fix, indefinitely until the next resize event)
+    /// disagree about their own window's size. A per-window lock (not the
+    /// global `sessions`/`panes`/`viewports` locks) fully serializes calls
+    /// for one window while leaving every other window's recompute, and
+    /// unrelated operations like `list_sessions()`, unaffected — a second
+    /// caller for this window blocks briefly (at most as long as this
+    /// window's own `Pane::resize()` calls take) rather than racing.
     pub fn recompute_window_geometry(&self, window_id: Uuid) -> Option<(u16, u16)> {
+        let window_lock = self
+            .resize_locks
+            .lock()
+            .unwrap()
+            .entry(window_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _window_resize_guard = window_lock.lock().unwrap();
+
         let (rows, cols) = {
             let viewports = self.viewports.lock().unwrap();
             match viewports.get(&window_id) {
@@ -1861,6 +1894,105 @@ mod tests {
              call was {max_list_sessions_latency:?} while the resize \
              itself took {resize_duration:?} — list_sessions should \
              complete in a small fraction of that, not scale with it"
+        );
+    }
+
+    /// Regression test for the resize-race `recompute_window_geometry`'s
+    /// own doc comment describes (ADR-004/pre-mortem P3): two overlapping
+    /// recompute triggers for the same window, with no serialization
+    /// between them, can let an older, stale computation's
+    /// `Pane::resize()` calls physically land *after* a newer one's.
+    ///
+    /// Proves the mechanism directly rather than chasing one specific
+    /// interleaving: a second `report_viewport_and_recompute` call for
+    /// the *same* window, issued while a first, genuinely slow one is
+    /// still in flight, must be fully serialized after it — self-
+    /// calibrated against the slow call's own measured duration, same
+    /// style as the `list_sessions` test above. Full serialization is
+    /// sufficient to rule out the stale-overwrite race by construction:
+    /// whichever call runs second always re-reads the *current* viewport
+    /// map under `resize_locks`, so it can only ever apply fresh data.
+    /// (A single pane's own `vt100::Parser` mutex — see the `list_sessions`
+    /// test above — happens to serialize this specific two-thread
+    /// interleaving on its own too, so this test can't cleanly isolate
+    /// this fix's contribution from that pre-existing, narrower
+    /// protection; it still exercises and documents the intended,
+    /// stronger guarantee — full mutual exclusion for the whole
+    /// compute-apply-persist cycle, including the window-level
+    /// bookkeeping and persisted-record writes pane-level locking
+    /// doesn't cover at all.)
+    #[test]
+    fn recompute_window_geometry_should_serialize_overlapping_triggers_for_the_same_window() {
+        let engine = Arc::new(Engine::new());
+        let session_id = engine
+            .create_session("resize-race".to_string(), sh(), None)
+            .unwrap();
+        let session_snapshot = |engine: &Engine| {
+            engine
+                .list_sessions()
+                .into_iter()
+                .find(|s| s.id == session_id)
+                .unwrap()
+        };
+        let window_id = session_snapshot(&engine).windows[0].id;
+
+        let client_slow = engine.new_client_id();
+        let client_fast = engine.new_client_id();
+
+        // Large enough that vt100's screen reallocation is genuinely slow
+        // (same calibration as the test above).
+        const SLOW_ROWS: u16 = 1200;
+        const SLOW_COLS: u16 = 2400;
+        const FAST_ROWS: u16 = 30;
+        const FAST_COLS: u16 = 160;
+
+        // Both clients register on the *same* window, and every recompute
+        // derives rows/cols as the dimension-wise minimum across whatever
+        // is currently registered (ADR-004) — so if `slow`'s own read of
+        // the viewport map happened to land *after* `fast` registers, it
+        // would compute `fast`'s small size too, not `slow`'s, making the
+        // latency measurement below meaningless. `started` + a short grace
+        // sleep guarantees `slow_thread` has read the viewport map (a
+        // couple of near-instant, uncontended mutex ops) while only
+        // `client_slow` is registered, before `fast` ever registers.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_slow = started.clone();
+        let engine_slow = engine.clone();
+        let slow_start = std::time::Instant::now();
+        let slow_thread = std::thread::spawn(move || {
+            started_slow.store(true, Ordering::SeqCst);
+            engine_slow
+                .report_viewport_and_recompute(window_id, client_slow, SLOW_ROWS, SLOW_COLS)
+                .unwrap();
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let fast_start = std::time::Instant::now();
+        engine
+            .report_viewport_and_recompute(window_id, client_fast, FAST_ROWS, FAST_COLS)
+            .unwrap();
+        let fast_duration = fast_start.elapsed();
+
+        slow_thread.join().unwrap();
+        let slow_duration = slow_start.elapsed();
+
+        assert!(
+            slow_duration >= std::time::Duration::from_millis(50),
+            "the calibrated slow resize should take a real, measurable \
+             amount of wall-clock time (got {slow_duration:?}) — if this \
+             is failing, the dimensions in this test need to be made \
+             larger for this hardware"
+        );
+        assert!(
+            fast_duration >= slow_duration / 2,
+            "a second recompute for the *same* window, issued while the \
+             first is still in flight, must be serialized after it (blocked \
+             for a real fraction of the first call's own duration) rather \
+             than racing it: fast call took {fast_duration:?} while the \
+             slow call it overlapped with took {slow_duration:?}"
         );
     }
 
