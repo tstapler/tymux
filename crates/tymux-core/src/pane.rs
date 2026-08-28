@@ -211,6 +211,13 @@ impl Pane {
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
+        // Never let the daemon's own bearer secret (if TYMUXD_TOKEN is set in
+        // tymuxd's process environment) reach a spawned pane — portable_pty's
+        // CommandBuilder inherits the full parent environment by default, and
+        // this is the daemon's own secret, not something a pane's user should
+        // ever see via `env`/`printenv` (research/pitfalls.md §2, HIGH
+        // PRIORITY).
+        cmd.env_remove("TYMUXD_TOKEN");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
@@ -930,5 +937,65 @@ mod tests {
             .await
             .expect("wait_exit should resolve once the child process exits");
         assert_eq!(pane.exit_code(), Some(0));
+    }
+
+    /// Task 1.3.1b (bearer-token-auth Epic 1.3): `TYMUXD_TOKEN` — the
+    /// daemon's own bearer secret, if set in `tymuxd`'s process
+    /// environment — must never reach a spawned pane's process
+    /// environment, since `portable_pty::CommandBuilder` inherits the full
+    /// parent environment by default (research/pitfalls.md §2, HIGH
+    /// PRIORITY). The fix (`cmd.env_remove("TYMUXD_TOKEN")` in
+    /// `spawn_internal`) must be targeted: every other variable still
+    /// reaches the pane.
+    #[test]
+    fn spawn_should_not_leak_tymuxd_token_into_pane_environment() {
+        std::env::set_var("TYMUXD_TOKEN", "leaked-secret");
+        std::env::set_var("TYMUX_TEST_CONTROL_VAR", "visible");
+
+        // Generous size so `env`'s full output (which can run to several
+        // dozen lines) stays on the live grid rather than scrolling into
+        // history, keeping the snapshot-based capture below simple.
+        let pane = Pane::spawn("/bin/sh", 300, 200).unwrap();
+        // The marker is reversed and emitted by a separate `echo ... | rev`
+        // (not printed by `env` itself) so the terminal's echo of this
+        // typed command line — which doesn't contain the marker text
+        // itself — can never satisfy the completion poll before `env` has
+        // actually run (same trick used by `spawn_shell_with_numbered_lines`
+        // above).
+        pane.write_input(b"env; echo DONE-MARKER | rev\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut text = String::new();
+        let mut completed = false;
+        while Instant::now() < deadline {
+            text = pane
+                .snapshot()
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.as_str())
+                .collect();
+            if text.contains("REKRAM-ENOD") {
+                completed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Clean up process-global env vars before any assertion below can
+        // panic, so this test never bleeds state into others in the same
+        // process.
+        std::env::remove_var("TYMUXD_TOKEN");
+        std::env::remove_var("TYMUX_TEST_CONTROL_VAR");
+
+        assert!(completed, "shell output did not complete in time");
+        assert!(
+            !text.contains("TYMUXD_TOKEN"),
+            "spawned pane's environment must not contain TYMUXD_TOKEN"
+        );
+        assert!(
+            text.contains("TYMUX_TEST_CONTROL_VAR=visible"),
+            "spawned pane's environment must still inherit other variables"
+        );
     }
 }
