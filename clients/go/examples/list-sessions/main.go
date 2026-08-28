@@ -16,14 +16,18 @@ import (
 	"connectrpc.com/connect"
 	"golang.org/x/net/http2"
 
+	"github.com/tstapler/tymux/clients/go/authinterceptor"
 	tymuxv1 "github.com/tstapler/tymux/clients/go/gen/tymux/v1"
 	"github.com/tstapler/tymux/clients/go/gen/tymux/v1/tymuxv1connect"
 )
 
 // tymuxd listens on loopback-only plain HTTP/2 (h2c, no TLS — see the
 // loopback-trust security model ADR), and is a strict gRPC server (tonic),
-// so the client needs an h2c-capable transport and connect.WithGRPC().
-func newClient(baseURL string) tymuxv1connect.TymuxServiceClient {
+// so the client needs an h2c-capable transport and connect.WithGRPC(). token
+// is attached via authinterceptor.Interceptor on every outgoing call; an
+// empty token is a no-op, so this example still works unmodified against a
+// loopback, non-token-gated daemon.
+func newClient(baseURL, token string) tymuxv1connect.TymuxServiceClient {
 	httpClient := &http.Client{
 		Transport: &http2.Transport{
 			AllowHTTP: true,
@@ -32,7 +36,8 @@ func newClient(baseURL string) tymuxv1connect.TymuxServiceClient {
 			},
 		},
 	}
-	return tymuxv1connect.NewTymuxServiceClient(httpClient, baseURL, connect.WithGRPC())
+	return tymuxv1connect.NewTymuxServiceClient(httpClient, baseURL, connect.WithGRPC(),
+		connect.WithInterceptors(authinterceptor.Interceptor{Token: token}))
 }
 
 // flattenPaneIDs walks a window's layout tree in tree order, returning
@@ -56,7 +61,7 @@ func flattenPaneIDs(layout *tymuxv1.Layout) []string {
 }
 
 func main() {
-	client := newClient("http://127.0.0.1:7419")
+	client := newClient("http://127.0.0.1:7419", os.Getenv("TYMUXD_TOKEN"))
 
 	resp, err := client.ListSessions(context.Background(), connect.NewRequest(&tymuxv1.ListSessionsRequest{}))
 	if err != nil {

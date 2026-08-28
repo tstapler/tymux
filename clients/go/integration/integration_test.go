@@ -23,6 +23,7 @@ import (
 	"connectrpc.com/connect"
 	"golang.org/x/net/http2"
 
+	"github.com/tstapler/tymux/clients/go/authinterceptor"
 	tymuxv1 "github.com/tstapler/tymux/clients/go/gen/tymux/v1"
 	"github.com/tstapler/tymux/clients/go/gen/tymux/v1/tymuxv1connect"
 )
@@ -127,7 +128,7 @@ func runAttachUntilMarker(t *testing.T, client tymuxv1connect.TymuxServiceClient
 // command without ever disconnecting.
 func TestAttachResumesByteIdenticalAfterDisconnectAndReattachWithRecordedSeq(t *testing.T) {
 	addr := startDaemon(t)
-	client := newClient(addr)
+	client := newClient(addr, "")
 	ctx := context.Background()
 
 	// Deterministic, non-timestamped output so two independent shell
@@ -239,7 +240,7 @@ func TestAttachResumesByteIdenticalAfterDisconnectAndReattachWithRecordedSeq(t *
 // followed immediately by a Snapshot.
 func TestAttachReceivesGapExceededThenSnapshotWhenResumeFromSeqIsStaleAndEvicted(t *testing.T) {
 	addr := startDaemon(t)
-	client := newClient(addr)
+	client := newClient(addr, "")
 	ctx := context.Background()
 
 	session, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{Name: "go-integration-gap"}))
@@ -332,13 +333,38 @@ func resolveBinary(t *testing.T) string {
 // for its "tymuxd listening" stdout line, same signal daemon.ts waits on.
 func startDaemon(t *testing.T) string {
 	t.Helper()
-
 	port := 30000 + time.Now().UnixNano()%20000
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	return startDaemonOn(t, fmt.Sprintf("127.0.0.1:%d", port), "")
+}
+
+// startDaemonWithToken spawns a real tymuxd bound non-loopback (0.0.0.0) on
+// an ephemeral port, with TYMUXD_TOKEN=token in the spawned process's env —
+// mirroring crates/tymuxd's Story 1.2.2b harness shape and daemon.ts's
+// identically-shaped StartDaemonOptions{token}. A loopback bind never
+// enforces auth (crates/tymuxd/src/main.rs's own startup gate), so proving
+// reject/accept behavior against a token-gated daemon needs a real
+// non-loopback socket. Existing tests keep using the loopback/no-token
+// startDaemon above unchanged.
+func startDaemonWithToken(t *testing.T, token string) string {
+	t.Helper()
+	port := 30000 + time.Now().UnixNano()%20000
+	return startDaemonOn(t, fmt.Sprintf("0.0.0.0:%d", port), token)
+}
+
+// startDaemonOn spawns a real tymuxd bound to addr and waits for its "tymuxd
+// listening" stdout line, same signal daemon.ts waits on. token is set as
+// TYMUXD_TOKEN in the spawned process's env when non-empty.
+func startDaemonOn(t *testing.T, addr, token string) string {
+	t.Helper()
+
 	stateDir := t.TempDir()
 
 	cmd := exec.Command(resolveBinary(t))
-	cmd.Env = append(os.Environ(), "TYMUXD_ADDR="+addr, "XDG_STATE_HOME="+stateDir)
+	env := append(os.Environ(), "TYMUXD_ADDR="+addr, "XDG_STATE_HOME="+stateDir)
+	if token != "" {
+		env = append(env, "TYMUXD_TOKEN="+token)
+	}
+	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("StdoutPipe: %v", err)
@@ -401,8 +427,11 @@ func startDaemon(t *testing.T) string {
 }
 
 // newClient mirrors examples/list-sessions/main.go's newClient: tymuxd is a
-// strict gRPC server (tonic) on plain h2c, no TLS.
-func newClient(baseURL string) tymuxv1connect.TymuxServiceClient {
+// strict gRPC server (tonic) on plain h2c, no TLS. token is attached via
+// authinterceptor.Interceptor on every outgoing call (unary and streaming
+// alike); an empty token is a no-op, matching the loopback/no-auth daemon
+// most existing tests here run against.
+func newClient(baseURL, token string) tymuxv1connect.TymuxServiceClient {
 	httpClient := &http.Client{
 		Transport: &http2.Transport{
 			AllowHTTP: true,
@@ -411,7 +440,8 @@ func newClient(baseURL string) tymuxv1connect.TymuxServiceClient {
 			},
 		},
 	}
-	return tymuxv1connect.NewTymuxServiceClient(httpClient, baseURL, connect.WithGRPC())
+	return tymuxv1connect.NewTymuxServiceClient(httpClient, baseURL, connect.WithGRPC(),
+		connect.WithInterceptors(authinterceptor.Interceptor{Token: token}))
 }
 
 // TestListSessionsReflectsCreateSession mirrors
@@ -420,7 +450,7 @@ func newClient(baseURL string) tymuxv1connect.TymuxServiceClient {
 // through the generated client against a live daemon.
 func TestListSessionsReflectsCreateSession(t *testing.T) {
 	addr := startDaemon(t)
-	client := newClient(addr)
+	client := newClient(addr, "")
 	ctx := context.Background()
 
 	created, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{
