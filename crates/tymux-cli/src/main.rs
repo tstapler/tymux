@@ -9,6 +9,7 @@ mod status_bar;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -142,7 +143,7 @@ fn first_pane_id(session: &Session) -> Result<String> {
 }
 
 async fn resolve_target(
-    client: &mut TymuxServiceClient<Channel>,
+    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
     target: &TargetString,
 ) -> Result<ProtoPane> {
     let resp = client
@@ -186,6 +187,12 @@ struct Cli {
     /// (accessibility floor, ux.md §3).
     #[arg(long, global = true)]
     no_status_bar: bool,
+
+    /// Bearer token to authenticate against a non-loopback tymuxd.
+    /// Generate one with `openssl rand -hex 32` if you don't already have
+    /// one configured on the daemon side.
+    #[arg(long, global = true, env = "TYMUXD_TOKEN", hide_env_values = true)]
+    token: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -263,9 +270,60 @@ fn friendly_message(e: &anyhow::Error) -> String {
             .to_string();
     }
     if let Some(status) = e.downcast_ref::<tonic::Status>() {
+        if status.code() == tonic::Code::Unauthenticated {
+            return format!(
+                "tymuxd rejected this connection: {} (set --token or TYMUXD_TOKEN to authenticate)",
+                status.message()
+            );
+        }
         return status.message().to_string();
     }
     e.to_string()
+}
+
+/// Mirrors tymuxd's `BearerToken` (crates/tymuxd/src/auth.rs) — same
+/// invariant (empty token unrepresentable), same reason (no `Debug`/
+/// `PartialEq` derive to prevent a value leak or an accidental
+/// non-constant-time comparison). Not shared as a library type: this is
+/// the client side, tymuxd's is the server side, and they have no other
+/// reason to depend on each other.
+#[derive(Clone)]
+struct BearerToken(String);
+
+impl std::fmt::Debug for BearerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<redacted>")
+    }
+}
+
+impl BearerToken {
+    fn parse(raw: &str) -> Option<Self> {
+        (!raw.is_empty()).then(|| Self(raw.to_string()))
+    }
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Attaches the configured bearer token to every outgoing RPC as
+/// `authorization: Bearer <token>`, unary and streaming (`Attach`) alike.
+/// No-ops when no token is configured — loopback usage must stay
+/// byte-for-byte unaffected.
+#[derive(Clone)]
+struct BearerAuth {
+    token: Option<BearerToken>,
+}
+
+impl tonic::service::Interceptor for BearerAuth {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(token) = &self.token {
+            let value = format!("Bearer {}", token.as_str())
+                .parse()
+                .map_err(|_| tonic::Status::internal("token contains invalid header characters"))?;
+            req.metadata_mut().insert("authorization", value);
+        }
+        Ok(req)
+    }
 }
 
 async fn run() -> Result<()> {
@@ -275,7 +333,12 @@ async fn run() -> Result<()> {
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true);
     let channel = endpoint.connect().await?;
-    let mut client = TymuxServiceClient::new(channel);
+    let mut client = TymuxServiceClient::with_interceptor(
+        channel,
+        BearerAuth {
+            token: cli.token.as_deref().and_then(BearerToken::parse),
+        },
+    );
     let config = TymuxConfig::load_or_default();
     let status_bar_cfg = StatusBarConfig::new(!cli.no_status_bar);
 
@@ -435,7 +498,7 @@ enum AttachOutcome {
 /// Loops `attach()` to follow `NextWindow`/`PrevWindow` reattachment
 /// requests until the user actually detaches (or the pane/stream ends).
 async fn attach_and_follow(
-    client: &mut TymuxServiceClient<Channel>,
+    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
     mut pane_id: String,
     session_name: &str,
     config: &TymuxConfig,
@@ -454,7 +517,7 @@ async fn attach_and_follow(
 /// NextWindow/PrevWindow cycle through (no server RPC; "next"/"prev" is
 /// purely an ordering over `ListSessions`' response).
 async fn adjacent_window_pane(
-    client: &mut TymuxServiceClient<Channel>,
+    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
     session_name: &str,
     current_pane_id: &str,
     forward: bool,
@@ -489,7 +552,7 @@ async fn adjacent_window_pane(
 }
 
 async fn attach(
-    client: &mut TymuxServiceClient<Channel>,
+    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
     pane_id: String,
     session_name: &str,
     config: &TymuxConfig,
@@ -795,7 +858,7 @@ fn render_plain_grid(
 /// it plus copy-mode's status line — the shared redraw path both entering
 /// copy-mode and every subsequent navigation keystroke use.
 async fn redraw_copy_mode(
-    client: &mut TymuxServiceClient<Channel>,
+    client: &mut TymuxServiceClient<InterceptedService<Channel, BearerAuth>>,
     pane_id: &str,
     cs: &CopyModeState,
     stdout: &mut std::io::Stdout,
@@ -931,7 +994,12 @@ fn spawn_resize_watcher() -> tokio::sync::mpsc::Receiver<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::sync::Mutex;
     use tymux_proto::v1::ExitStatus;
+
+    // std::env::set_var/remove_var mutate global process state, so tests
+    // touching TYMUXD_TOKEN must not run concurrently with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("tymux").chain(args.iter().copied())).unwrap()
@@ -1124,6 +1192,73 @@ mod tests {
     fn friendly_message_passes_through_generic_errors() {
         let err = anyhow::anyhow!("no such session: abc");
         assert_eq!(friendly_message(&err), "no such session: abc");
+    }
+
+    /// Task 2.2.1b, AC1: an `Unauthenticated` status gets the dedicated,
+    /// remedy-naming message rather than a bare passthrough of
+    /// `status.message()`.
+    #[test]
+    fn friendly_message_names_the_remedy_for_unauthenticated_status() {
+        let status = tonic::Status::unauthenticated("missing bearer token");
+        let err: anyhow::Error = status.into();
+        assert_eq!(
+            friendly_message(&err),
+            "tymuxd rejected this connection: missing bearer token (set --token or TYMUXD_TOKEN to authenticate)"
+        );
+    }
+
+    /// Task 2.2.1b, AC2: other status codes are unaffected by the new
+    /// `Unauthenticated` branch — no regression on the existing passthrough
+    /// behavior.
+    #[test]
+    fn friendly_message_unaffected_for_other_status_codes() {
+        let status = tonic::Status::not_found("no such session: abc");
+        let err: anyhow::Error = status.into();
+        assert_eq!(friendly_message(&err), "no such session: abc");
+    }
+
+    /// Task 2.1.1c: `--token s3cr3t` parses into `cli.token`.
+    #[test]
+    fn token_flag_parses() {
+        let cli = parse(&["--token", "s3cr3t", "ls"]);
+        assert_eq!(cli.token, Some("s3cr3t".to_string()));
+    }
+
+    /// Task 2.1.1c: with no `--token` flag, `TYMUXD_TOKEN` is used as a
+    /// fallback.
+    #[test]
+    fn token_env_var_used_as_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TYMUXD_TOKEN", "s3cr3t");
+        let cli = Cli::try_parse_from(["tymux", "ls"]);
+        std::env::remove_var("TYMUXD_TOKEN");
+        assert_eq!(cli.unwrap().token, Some("s3cr3t".to_string()));
+    }
+
+    /// Task 2.1.1c: an explicit `--token` flag overrides `TYMUXD_TOKEN`.
+    #[test]
+    fn token_flag_overrides_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TYMUXD_TOKEN", "envval");
+        let cli = Cli::try_parse_from(["tymux", "--token", "flagval", "ls"]);
+        std::env::remove_var("TYMUXD_TOKEN");
+        assert_eq!(cli.unwrap().token, Some("flagval".to_string()));
+    }
+
+    /// Task 2.1.1d (security-critical): rendered `--help` text must never
+    /// echo a live `TYMUXD_TOKEN` value — `hide_env_values = true` on the
+    /// `token` field is what prevents clap's default `[env:
+    /// TYMUXD_TOKEN=<value>]` annotation from leaking it.
+    #[test]
+    fn cli_help_does_not_echo_configured_token_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TYMUXD_TOKEN", "s3cr3t-live-value");
+        let help = Cli::command().render_help().to_string();
+        std::env::remove_var("TYMUXD_TOKEN");
+        assert!(
+            !help.contains("s3cr3t-live-value"),
+            "--help must never echo the live TYMUXD_TOKEN value, got: {help}"
+        );
     }
 
     #[test]
