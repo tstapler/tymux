@@ -101,7 +101,12 @@ test("attach rejects a missing/wrong token", async () => {
   const tokenDaemon = await startDaemon({ token: AUTH_TOKEN });
   try {
     await assert.rejects(
-      () => runAttachDemo("nonexistent-pane-id", { baseUrl: tokenDaemon.addr }),
+      () =>
+        withTimeout(
+          runAttachDemo("nonexistent-pane-id", { baseUrl: tokenDaemon.addr }),
+          5_000,
+          "attach rejects a missing/wrong token",
+        ),
       assertUnauthenticated,
     );
   } finally {
