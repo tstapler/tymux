@@ -357,6 +357,25 @@ func startDaemonWithToken(t *testing.T, token string) string {
 func startDaemonOn(t *testing.T, addr, token string) string {
 	t.Helper()
 
+	// The bind address (addr, e.g. "0.0.0.0:<port>" for the non-loopback
+	// auth harness) is not always a valid outbound *connect* target — on
+	// Linux the kernel happens to route a 0.0.0.0-destination dial to
+	// localhost, but that's not portable (confirmed against
+	// crates/tymuxd/src/main.rs's own non-loopback test harness,
+	// spawn_non_loopback_test_server, and crates/tymuxd/tests/
+	// daemon_startup.rs: both bind 0.0.0.0 but connect via 127.0.0.1
+	// explicitly for this reason). Bind stays whatever addr says (needed
+	// to exercise the non-loopback auth gate); only the returned,
+	// client-facing dial target is normalized to 127.0.0.1.
+	connectHost, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", addr, err)
+	}
+	if connectHost == "0.0.0.0" {
+		connectHost = "127.0.0.1"
+	}
+	connectAddr := net.JoinHostPort(connectHost, port)
+
 	stateDir := t.TempDir()
 
 	cmd := exec.Command(resolveBinary(t))
@@ -423,7 +442,7 @@ func startDaemonOn(t *testing.T, addr, token string) string {
 		t.Fatal("tymuxd did not report listening within 5s")
 	}
 
-	return "http://" + addr
+	return "http://" + connectAddr
 }
 
 // newClient mirrors examples/list-sessions/main.go's newClient: tymuxd is a
@@ -478,5 +497,112 @@ func TestListSessionsReflectsCreateSession(t *testing.T) {
 	}
 	if found.GetName() != "go-integration" {
 		t.Errorf("got name %q, want %q", found.GetName(), "go-integration")
+	}
+}
+
+// TestListSessionsRejectsMissingOrWrongToken proves clients/go's
+// authinterceptor.Interceptor actually gates a unary call against a live,
+// token-gated tymuxd (Task 3.1.1d, AC1) — not just that the interceptor
+// compiles or that a loopback daemon still works unauthenticated. An empty
+// token (authinterceptor.Interceptor{Token: ""} is a documented no-op, so
+// this doubles as the "missing" case) and a wrong token must both fail with
+// connect.CodeUnauthenticated.
+func TestListSessionsRejectsMissingOrWrongToken(t *testing.T) {
+	addr := startDaemonWithToken(t, "s3cr3t")
+	ctx := context.Background()
+
+	for name, token := range map[string]string{
+		"missing token": "",
+		"wrong token":   "wrong-value",
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := newClient(addr, token)
+			_, err := client.ListSessions(ctx, connect.NewRequest(&tymuxv1.ListSessionsRequest{}))
+			if err == nil {
+				t.Fatal("ListSessions: expected an error, got nil")
+			}
+			if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
+				t.Fatalf("ListSessions: got code %v, want %v (err: %v)", got, connect.CodeUnauthenticated, err)
+			}
+		})
+	}
+}
+
+// TestListSessionsSucceedsWithCorrectToken proves the correct token
+// authenticates successfully against a live, token-gated tymuxd (Task
+// 3.1.1d, AC2).
+func TestListSessionsSucceedsWithCorrectToken(t *testing.T) {
+	addr := startDaemonWithToken(t, "s3cr3t")
+	client := newClient(addr, "s3cr3t")
+	ctx := context.Background()
+
+	if _, err := client.ListSessions(ctx, connect.NewRequest(&tymuxv1.ListSessionsRequest{})); err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+}
+
+// TestAttachRejectsMissingOrWrongToken proves
+// authinterceptor.Interceptor.WrapStreamingClient — not just WrapUnary — is
+// actually wired into the Go client's Attach call (Task 3.1.1e, AC3).
+// connect-go's convenience connect.UnaryInterceptorFunc only implements
+// WrapUnary, leaving WrapStreamingClient a documented no-op that would
+// silently exempt Attach from auth (research/pitfalls.md §4); this test is
+// the one that would catch that regression. The rejection happens before
+// any handler runs, so it can surface on the initial Send (request headers
+// rejected outright) or on the first Receive (headers accepted, response
+// arrives as a trailers-only Unauthenticated status) depending on
+// transport timing — both are checked.
+func TestAttachRejectsMissingOrWrongToken(t *testing.T) {
+	addr := startDaemonWithToken(t, "s3cr3t")
+
+	for name, token := range map[string]string{
+		"missing token": "",
+		"wrong token":   "wrong-value",
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := newClient(addr, token)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			stream := client.Attach(ctx)
+			err := stream.Send(&tymuxv1.AttachRequest{
+				Payload: &tymuxv1.AttachRequest_PaneId{PaneId: "irrelevant-pane-id"},
+			})
+			if err == nil {
+				_, err = stream.Receive()
+			}
+			if err == nil {
+				t.Fatal("Attach: expected an error, got nil")
+			}
+			if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
+				t.Fatalf("Attach: got code %v, want %v (err: %v)", got, connect.CodeUnauthenticated, err)
+			}
+		})
+	}
+}
+
+// TestAttachSucceedsWithCorrectToken proves Attach streams normally when
+// the correct token is presented against a live, token-gated tymuxd (Task
+// 3.1.1e, AC4).
+func TestAttachSucceedsWithCorrectToken(t *testing.T) {
+	addr := startDaemonWithToken(t, "s3cr3t")
+	client := newClient(addr, "s3cr3t")
+	ctx := context.Background()
+
+	session, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{Name: "go-integration-auth-attach"}))
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	paneID := firstPaneID(t, session.Msg)
+
+	// resume_from_seq=Some(0) opts this attach into the OutputChunk field
+	// runAttachUntilMarker reads from — see its doc comment and the
+	// byte-identical resume test above for why omitting it entirely would
+	// leave this call watching only the legacy, seq-less Output field and
+	// hang until the timeout.
+	const marker = "AUTH-ATTACH-DONE"
+	out := runAttachUntilMarker(t, client, paneID, seqPtr(0), "printf '"+marker+"\\n'\n", marker, 10*time.Second)
+	if len(out) == 0 {
+		t.Fatal("Attach: expected non-empty output, got none")
 	}
 }
