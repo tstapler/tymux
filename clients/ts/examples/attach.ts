@@ -13,6 +13,12 @@ export interface AttachDemoOptions {
    * (Story 5.1.1 AC1).
    */
   resumeFromSeq?: bigint;
+  /**
+   * Bearer token to attach to the underlying transport (Epic 3.2), threaded
+   * into `tymuxClient(baseUrl, token)`. Omit for a loopback/no-auth daemon —
+   * identical to a pre-feature client.
+   */
+  token?: string;
 }
 
 export interface AttachDemoResult {
@@ -33,8 +39,8 @@ export interface AttachDemoResult {
 // `resumeFromSeq` switches the live tail from the plain `output` field to
 // the seq'd `output_chunk` field, letting a caller track how far it got.
 export async function runAttachDemo(paneId: string, options: AttachDemoOptions = {}): Promise<AttachDemoResult> {
-  const { baseUrl, resumeFromSeq } = options;
-  const client = tymuxClient(baseUrl);
+  const { baseUrl, resumeFromSeq, token } = options;
+  const client = tymuxClient(baseUrl, token);
   const controller = new AbortController();
 
   async function* requests(): AsyncIterable<AttachRequest> {

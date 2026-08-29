@@ -26,16 +26,35 @@ export interface TestDaemon {
   stop(): void;
 }
 
+export interface StartDaemonOptions {
+  // When set, binds tymuxd to 0.0.0.0 on an ephemeral port instead of the
+  // default loopback bind, and sets TYMUXD_TOKEN in the spawned process's
+  // env — mirroring the Go (`startDaemonWithToken`) and Rust (Story
+  // 1.2.2b) non-loopback test harnesses. Omit to keep today's
+  // loopback/no-token default behavior unchanged.
+  token?: string;
+}
+
 // Spawns a real tymuxd on an ephemeral loopback port, per this repo's own
 // `restart_persistence.rs` pattern of testing against the real binary
-// rather than mocking the daemon.
-export async function startDaemon(): Promise<TestDaemon> {
+// rather than mocking the daemon. Pass `{ token }` to instead bind
+// non-loopback with bearer-token auth enforced.
+export async function startDaemon(options: StartDaemonOptions = {}): Promise<TestDaemon> {
+  const { token } = options;
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const addr = `127.0.0.1:${port}`;
+  const bindHost = token ? "0.0.0.0" : "127.0.0.1";
+  const addr = `${bindHost}:${port}`;
   const stateDir = mkdtempSync(join(tmpdir(), "tymuxd-ts-test-"));
 
+  const env: NodeJS.ProcessEnv = { ...process.env, TYMUXD_ADDR: addr, XDG_STATE_HOME: stateDir };
+  if (token) {
+    env.TYMUXD_TOKEN = token;
+  } else {
+    delete env.TYMUXD_TOKEN;
+  }
+
   const child: ChildProcessByStdio<null, Readable, Readable> = spawn(resolveBinary(), [], {
-    env: { ...process.env, TYMUXD_ADDR: addr, XDG_STATE_HOME: stateDir },
+    env,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -55,8 +74,15 @@ export async function startDaemon(): Promise<TestDaemon> {
     });
   });
 
+  // The daemon binds bindHost (0.0.0.0 for the token case, so
+  // socket_addr.ip().is_loopback() is false and auth is enforced
+  // server-side), but a 0.0.0.0 destination isn't reliably connectable
+  // from a client across platforms — connect via 127.0.0.1, which a
+  // 0.0.0.0 bind also listens on.
+  const connectHost = token ? "127.0.0.1" : bindHost;
+
   return {
-    addr: `http://${addr}`,
+    addr: `http://${connectHost}:${port}`,
     stop() {
       child.kill("SIGTERM");
       rmSync(stateDir, { recursive: true, force: true });
