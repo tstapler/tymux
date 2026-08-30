@@ -27,3 +27,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing-test = { workspace = true }
 prost = { workspace = true }
+# Epic 5.1: spawn_uds_test_server dials its harness the same way
+# tymux-cli's dial_uds does (tower::service_fn + hyper_util::rt::TokioIo
+# wrapping a real tokio::net::UnixStream) — test-only, not needed by the
+# daemon binary itself.
+tower = { workspace = true }
+hyper-util = { workspace = true }

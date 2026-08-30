@@ -1646,6 +1646,65 @@ mod tests {
             .expect("client should connect to the just-bound listener")
     }
 
+    /// Epic 5.1 / Task 5.1.1a: UDS counterpart to `spawn_test_server`/
+    /// `spawn_non_loopback_test_server` — binds a real
+    /// `tokio::net::UnixListener` at a fresh temp path (bypassing
+    /// `bind_uds_listener`'s lock/stale-check/chown machinery, which is
+    /// already independently tested in Phase 2; this harness only needs a
+    /// bound listener), wires it with the same
+    /// `PreAuthorizedUnixStream` + `UdsPeerCredInterceptor` pairing
+    /// `main()` uses, and returns a client dialed over the real socket
+    /// via the same `tower::service_fn` + `hyper_util::rt::TokioIo`
+    /// connector `tymux-cli`'s `dial_uds` uses (duplicated here rather
+    /// than shared — this repo has no test-utility crate to place it in
+    /// without a larger restructure out of Epic 5.1's scope).
+    ///
+    /// `daemon_uid`/`allowed_gid` are caller-supplied so tests can lie to
+    /// the harness about the daemon's own configured identity (Story
+    /// 5.1.1's mismatched-uid case, Story 5.1.2's group case) without
+    /// requiring root/CAP_SETUID to fabricate a genuinely different
+    /// *peer* uid.
+    async fn spawn_uds_test_server(
+        daemon: TymuxDaemon,
+        daemon_uid: u32,
+        allowed_gid: Option<u32>,
+    ) -> TymuxServiceClient<tonic::transport::Channel> {
+        let socket_path =
+            std::env::temp_dir().join(format!("tymux-uds-test-{}.sock", Uuid::new_v4()));
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .expect("should bind a fresh temp UDS path");
+        let rejection_count = Arc::new(AtomicI64::new(0));
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TymuxServiceServer::with_interceptor(
+                    daemon,
+                    auth::UdsPeerCredInterceptor::new(rejection_count),
+                ))
+                .serve_with_incoming(futures::TryStreamExt::map_ok(
+                    tokio_stream::wrappers::UnixListenerStream::new(listener),
+                    move |stream| {
+                        auth::PreAuthorizedUnixStream::new(stream, daemon_uid, allowed_gid)
+                    },
+                ))
+                .await
+                .unwrap();
+        });
+
+        let connect_path = socket_path.clone();
+        let connector = tower::service_fn(move |_: tonic::transport::Uri| {
+            let path = connect_path.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(&path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        });
+        let channel = tonic::transport::Endpoint::from_static("http://localhost")
+            .connect_with_connector(connector)
+            .await
+            .expect("client should connect to the just-bound uds listener");
+        TymuxServiceClient::new(channel)
+    }
+
     async fn wait_for_pane_exit(pane: &Arc<tymux_core::Pane>) {
         tokio::time::timeout(Duration::from_secs(5), pane.wait_exit())
             .await
@@ -4932,5 +4991,106 @@ mod tests {
         log_socket_group_caveat(None, None);
 
         assert!(!logs_contain("full daemon control"));
+    }
+
+    // --- Epic 5.1: accept/reject over a real UDS connection ---
+    //
+    // These three tests exercise the full UDS request path end-to-end —
+    // bind, connect, peer-cred extraction (via a real `SO_PEERCRED`
+    // syscall on a real accepted `tokio::net::UnixStream`), the
+    // `PreAuthorizedUnixStream`/`UdsPeerCredInterceptor` wiring, and an
+    // actual RPC — rather than only the pure `peer_is_authorized`/
+    // `peer_is_group_member` functions Epic 3's unit tests already cover
+    // in isolation. Per pitfalls.md §7 and the plan's own Unresolved
+    // Questions, none of them attempt a genuine cross-uid connection
+    // (that requires `CAP_SETUID`/root, unavailable in this repo's CI);
+    // instead each one lies to the *harness* about the daemon's own
+    // configured uid/gid, which forces the real acceptance path down the
+    // reject/group branch even though the connecting peer's own identity
+    // never changes. See each test's doc comment for exactly what it
+    // proves vs. what it approximates.
+
+    /// Task 5.1.1b (accept case): a client connecting as the daemon's own
+    /// uid succeeds. In a non-root test process this test's own real uid
+    /// always "matches the daemon's own uid" (both are the same OS
+    /// process), so this proves the wiring accepts the ordinary case —
+    /// not a distinguishing cross-identity proof (see the reject test
+    /// below for that half).
+    #[tokio::test]
+    async fn uds_server_accepts_matching_uid_client() {
+        let real_uid = unsafe { libc::geteuid() };
+        let mut client = spawn_uds_test_server(test_daemon(), real_uid, None).await;
+
+        let response = client
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await;
+
+        assert!(
+            response.is_ok(),
+            "expected success when the harness's configured daemon_uid matches this test \
+             process's real uid, got {response:?}"
+        );
+    }
+
+    /// Task 5.1.1b (reject case): proves the *server-side wiring* — real
+    /// accept, real `SO_PEERCRED` read, `PreAuthorizedUnixStream`'s cached
+    /// decision, `UdsPeerCredInterceptor`'s read of it — rejects a real
+    /// connection end-to-end, over and above Story 3.2.1b's unit-level
+    /// proof of `peer_is_authorized` alone.
+    ///
+    /// What this does NOT prove: a genuine cross-uid connection. The
+    /// connecting peer here is still this same test process (its real
+    /// uid never changes); what's fabricated is the harness's
+    /// `daemon_uid` configuration (`real_uid + 1`), which is enough to
+    /// force `peer_is_authorized` to evaluate false down the real
+    /// accept-and-reject path without root/`CAP_SETUID`. A true
+    /// cross-process, cross-uid reject is out of reach on this repo's CI
+    /// per pitfalls.md §7 / plan.md's Unresolved Questions.
+    #[tokio::test]
+    async fn uds_server_rejects_when_daemon_uid_does_not_match_wiring() {
+        let real_uid = unsafe { libc::geteuid() };
+        let mismatched_uid = real_uid.wrapping_add(1);
+        let mut client = spawn_uds_test_server(test_daemon(), mismatched_uid, None).await;
+
+        let status = client
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// Task 5.1.2a: proves the group-relaxation path (`peer_is_group_member`'s
+    /// genuine Linux `/proc`-based check from Story 3.1.1) against a real
+    /// accepted connection, not just as an isolated unit test.
+    ///
+    /// What this does NOT prove: a genuine cross-uid, cross-gid
+    /// connection. As with the reject test above, the connecting peer is
+    /// still this same test process — what's fabricated is the harness's
+    /// `daemon_uid` (`real_uid + 1`, forcing the uid check to fail and
+    /// fall through to the group check), while `allowed_gid` is set to
+    /// this test process's own real egid, which it is trivially (and
+    /// genuinely) a member of. That's enough to exercise the real
+    /// `/proc/<pid>/status` read against this process's own real pid and
+    /// gid over a real accepted socket; it doesn't prove the daemon
+    /// correctly reads a *different* process's `/proc` entry, which
+    /// would require a second uid/gid unavailable without root.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uds_server_accepts_group_member_when_uid_differs_but_gid_matches() {
+        let real_uid = unsafe { libc::geteuid() };
+        let mismatched_uid = real_uid.wrapping_add(1);
+        let real_gid = unsafe { libc::getegid() };
+        let mut client = spawn_uds_test_server(test_daemon(), mismatched_uid, Some(real_gid)).await;
+
+        let response = client
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await;
+
+        assert!(
+            response.is_ok(),
+            "expected success via the group path when uid is mismatched but the configured \
+             allowed_gid matches this test process's own real egid, got {response:?}"
+        );
     }
 }
