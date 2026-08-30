@@ -106,6 +106,45 @@ review this status section originally drew from.
   `NO_COLOR`, but a screen-reader user with multiple panes/windows has no
   non-visual navigation aid beyond the plain keyboard bindings.
 
+## Multi-user / shared-host deployment
+
+`tymuxd` listens on both a Unix domain socket and TCP loopback by
+default. Read this before running it on a host other users can reach.
+
+- **TCP loopback has no authentication.** Any local process that can
+  reach `127.0.0.1` at `tymuxd`'s port can drive the daemon — create
+  sessions, attach to any pane, kill anything — with no login and no
+  token. This is unchanged by adding the Unix socket, and it stays
+  unauthenticated by design for now. The only way to close it is
+  `--disable-tcp-loopback` (or `TYMUXD_DISABLE_TCP_LOOPBACK=1`), which
+  turns off the TCP listener entirely and leaves the Unix socket as the
+  sole way in.
+- **`--socket-group` (or `TYMUXD_SOCKET_GROUP`) grants full control, not
+  a scoped subset.** Anyone in the configured group can create sessions
+  (run arbitrary commands), attach to and read/write any pane, and kill
+  any session — the same access the socket's owner has. There's no
+  per-user or per-session scoping, the same shape as Unix's own
+  `docker` group: convenient, but equivalent to full daemon access for
+  every member.
+- **A client connecting through a bind-mounted socket from inside a
+  container may not see the uid it expects.** `tymuxd` authorizes Unix
+  socket connections by asking the kernel for the connecting process's
+  identity, and the kernel always reports the *host* uid — not the
+  uid a container's own namespace maps it to. If you bind-mount a host
+  `tymuxd` socket into a container (common with rootless
+  Docker/Podman, where in-container uids are shifted), the identity
+  `tymuxd` sees can differ from what `id -u` reports inside that
+  container. So a `--socket-path`/`--socket-group` access decision that
+  looks right from inside the container can still fail, and the
+  resulting rejection won't match the uid you expected. This isn't a
+  security gap — the daemon is checking the real identity — but it's a
+  common source of a confusing "permission denied" the first time you
+  try it.
+- **On macOS/BSD, `--socket-group` only checks the connecting process's
+  primary group.** Full supplementary-group support (checking every
+  group a user belongs to, not just their primary one) is Linux-only in
+  this project for now.
+
 ## Accessibility
 
 v1.0 supports fully keyboard-only operation (every action — split,
