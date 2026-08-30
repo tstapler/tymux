@@ -14,9 +14,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -26,6 +29,7 @@ import (
 	"github.com/tstapler/tymux/clients/go/authinterceptor"
 	tymuxv1 "github.com/tstapler/tymux/clients/go/gen/tymux/v1"
 	"github.com/tstapler/tymux/clients/go/gen/tymux/v1/tymuxv1connect"
+	"github.com/tstapler/tymux/clients/go/udsdialer"
 )
 
 // flattenPaneIDs walks a window's layout tree in tree order, returning
@@ -365,21 +369,20 @@ func ephemeralPort() int64 {
 // startDaemonWithUDS spawns a real tymuxd on an ephemeral loopback TCP port
 // (tymuxd currently always needs a valid TYMUXD_ADDR to bind, even when the
 // caller only cares about its UDS listener) with TYMUXD_SOCKET_PATH set to
-// a fixed path under t.TempDir(), mirroring startDaemonWithToken's shape
-// (Task 7.2.1a). Returns the socket path (not an HTTP addr) for the caller
-// to dial via udsdialer.DialUnixHTTPClient.
+// a fixed path under a fresh subdirectory of t.TempDir(), mirroring
+// startDaemonWithToken's shape (Task 7.2.1a). Returns the socket path (not
+// an HTTP addr) for the caller to dial via udsdialer.DialUnixHTTPClient.
 //
-// NOTE (as of this writing): crates/tymuxd's dual-listener wiring (Phase 4
-// — main.rs binding auth::bind_uds_listener alongside its existing TCP
-// listener) had not yet landed on this branch; that work is tracked
-// separately (project_plans/unix-socket-auth/implementation/plan.md Phase
-// 4) and is out of this package's scope. This helper is plumbing for Phase
-// 7.3's accept/reject tests (a later wave) to consume once Phase 4 lands —
-// no test in this file calls it yet, so a caller dialing the returned path
-// today gets ENOENT, not a live connection.
+// The socket lives in a "uds" subdirectory that must not already exist,
+// not directly in t.TempDir() itself: crates/tymuxd/src/auth.rs's
+// ensure_socket_parent_dir requires the socket's immediate parent be
+// either freshly created by tymuxd (and thus owned/moded by tymuxd itself
+// at 0700) or already owned by the daemon's own uid at exactly that mode —
+// t.TempDir() already exists (created by the testing package itself, at
+// 0755) before tymuxd ever runs, which fails that check.
 func startDaemonWithUDS(t *testing.T, token string) string {
 	t.Helper()
-	socketPath := filepath.Join(t.TempDir(), "tymuxd.sock")
+	socketPath := filepath.Join(t.TempDir(), "uds", "tymuxd.sock")
 	startDaemonOn(t, fmt.Sprintf("127.0.0.1:%d", ephemeralPort()), token, "TYMUXD_SOCKET_PATH="+socketPath)
 	return socketPath
 }
@@ -635,5 +638,207 @@ func TestAttachSucceedsWithCorrectToken(t *testing.T) {
 	out := runAttachUntilMarker(t, client, paneID, seqPtr(0), "printf '"+marker+"\\n'\n", marker, 10*time.Second)
 	if len(out) == 0 {
 		t.Fatal("Attach: expected non-empty output, got none")
+	}
+}
+
+// newUDSClient mirrors newClient but dials socketPath over a real Unix
+// domain socket via udsdialer.DialUnixHTTPClient instead of TCP loopback.
+// baseURL is a fixed placeholder ("http://unix", the same value
+// udsdialer_test.go and examples/list-sessions/main.go use) rather than a
+// real address: DialUnixHTTPClient's http2.Transport ignores the
+// network/addr connect-go passes at request time and always dials
+// socketPath instead (the seam research/stack.md §4 identified), so the
+// base URL only needs to be well-formed, not reachable.
+func newUDSClient(socketPath string) tymuxv1connect.TymuxServiceClient {
+	return tymuxv1connect.NewTymuxServiceClient(udsdialer.DialUnixHTTPClient(socketPath), "http://unix", connect.WithGRPC())
+}
+
+// TestListSessionsSucceedsOverUDS is Task 7.3.1a: proves Go's UDS-first
+// dialing (Epic 7.1, commit 861e123) actually round-trips against a real,
+// dual-listener tymuxd (commit b44aae1) — not just the in-process fake
+// server udsdialer_test.go's own TestDialUnixHTTPClientRoundTripsListSessions
+// already covers, and not just that this uid (the daemon's own) is
+// authorized, which mirrors clients/ts's and tymux-cli's own accept-path
+// integration tests (validation.md R13 row).
+func TestListSessionsSucceedsOverUDS(t *testing.T) {
+	socketPath := startDaemonWithUDS(t, "")
+	client := newUDSClient(socketPath)
+	ctx := context.Background()
+
+	created, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{Name: "go-integration-uds"}))
+	if err != nil {
+		t.Fatalf("CreateSession over UDS: %v", err)
+	}
+
+	listed, err := client.ListSessions(ctx, connect.NewRequest(&tymuxv1.ListSessionsRequest{}))
+	if err != nil {
+		t.Fatalf("ListSessions over UDS: %v", err)
+	}
+
+	var found bool
+	for _, s := range listed.Msg.GetSessions() {
+		if s.GetId() == created.Msg.GetId() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("created session %q not found in ListSessions response over UDS", created.Msg.GetId())
+	}
+}
+
+// TestHelperProcessUDSListSessionsRejected is a re-exec helper, not a real
+// test: TestListSessionsRejectsOverUDSWithMismatchedUID below spawns the Go
+// test binary itself (via os.Args[0]) with -test.run scoped to just this
+// function so it runs as a distinct OS process it can pin to a specific uid
+// via exec.Cmd.SysProcAttr.Credential — the same re-exec-self idiom
+// os/exec_test.go's own TestHelperProcess uses, needed here because Go has
+// no in-process way to change a goroutine's real/effective uid mid-test.
+// The GO_WANT_HELPER_PROCESS guard mirrors that idiom too, so a plain `go
+// test -run TestHelperProcessUDSListSessionsRejected` (no env var) is a
+// harmless skip rather than a confusing failure.
+func TestHelperProcessUDSListSessionsRejected(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		t.Skip("only runs as a re-exec helper for TestListSessionsRejectsOverUDSWithMismatchedUID")
+	}
+	socketPath := os.Getenv("TYMUX_HELPER_SOCKET_PATH")
+	client := newUDSClient(socketPath)
+	_, err := client.ListSessions(context.Background(), connect.NewRequest(&tymuxv1.ListSessionsRequest{}))
+	// Printed (not returned/asserted here) because this process's exit
+	// code/panic output is not what the parent test inspects — it greps
+	// this exact, unambiguous line out of the child's combined output.
+	fmt.Printf("HELPER-RESULT:%s\n", connect.CodeOf(err))
+}
+
+// TestListSessionsRejectsOverUDSWithMismatchedUID is Task 7.3.1b: the true
+// cross-uid reject proof validation.md's R14 row calls for — a real
+// SO_PEERCRED-delivered uid mismatch rejected by crates/tymuxd/src/auth.rs's
+// UdsPeerCredInterceptor with Status::permission_denied (connect-go's
+// connect.CodePermissionDenied), not just the synthetic UCred Story 3.1.2's
+// peer_is_authorized unit tests already exercise.
+//
+// Per pitfalls.md §7 / validation.md R14 / plan.md's Unresolved Questions,
+// this is only meaningful when the test process can actually create a
+// second, genuinely different real uid — which requires CAP_SETUID
+// (root, in practice) and is therefore unavailable on this repo's actual
+// CI (.github/workflows/ci.yml runs plain ubuntu-latest/macos-latest, no
+// container, no root). This test skips unconditionally in that
+// environment rather than failing; it is not conditionally gated on a
+// feature flag, only on privilege.
+//
+// The daemon binds its UDS at mode 0600 (bind_uds_listener's default, no
+// --socket-group configured), and man 7 unix documents that "connecting to
+// a stream socket object requires write permission on that socket" — so a
+// mismatched-uid connect() only reaches the daemon's accept()/peer_cred
+// gate at all (rather than failing earlier with a plain filesystem EACCES,
+// which is Task 7.3.1c's distinct scenario) when the connecting process
+// holds CAP_DAC_OVERRIDE, i.e. is root. That is why, once privilege is
+// available, this test spawns the *daemon* under a fixed unprivileged uid
+// ("nobody") and keeps the client at uid 0: root's DAC-bypass is what lets
+// its connect() succeed despite the mismatch, so the rejection actually
+// observed is the daemon's own peer_is_authorized decision (peer uid 0 !=
+// daemon uid, no --socket-group configured), not a filesystem-level error.
+func TestListSessionsRejectsOverUDSWithMismatchedUID(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root/CAP_SETUID to spawn the daemon under a distinct unprivileged uid and reach a real SO_PEERCRED mismatch (see plan.md Unresolved Questions and validation.md R14) -- not available on this repo's actual ubuntu-latest/macos-latest CI runners")
+	}
+
+	nobody, err := user.Lookup("nobody")
+	if err != nil {
+		t.Skipf("could not resolve the 'nobody' user needed to run the daemon under a distinct unprivileged uid: %v", err)
+	}
+	daemonUID, err := strconv.ParseUint(nobody.Uid, 10, 32)
+	if err != nil {
+		t.Fatalf("parsing nobody's uid %q: %v", nobody.Uid, err)
+	}
+	daemonGID, err := strconv.ParseUint(nobody.Gid, 10, 32)
+	if err != nil {
+		t.Fatalf("parsing nobody's gid %q: %v", nobody.Gid, err)
+	}
+
+	// The socket's immediate parent directory must not already exist —
+	// crates/tymuxd/src/auth.rs's ensure_socket_parent_dir requires it be
+	// either freshly created (and thus owned/moded by tymuxd itself, here
+	// running as "nobody") or already owned by the daemon's own uid at
+	// its expected mode; a directory this (root) test process pre-created
+	// would fail that check. The grandparent, which this process does
+	// pre-create, is chmoded world-searchable so "nobody" can still
+	// traverse into it to create its own socket directory underneath.
+	base, err := os.MkdirTemp("", "tymuxd-uds-reject-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	if err := os.Chmod(base, 0o711); err != nil {
+		t.Fatalf("chmod %s: %v", base, err)
+	}
+	socketPath := filepath.Join(base, "sockdir", "tymuxd.sock")
+
+	stateDir := filepath.Join(base, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", stateDir, err)
+	}
+	if err := os.Chown(stateDir, int(daemonUID), int(daemonGID)); err != nil {
+		t.Fatalf("chown %s to nobody: %v", stateDir, err)
+	}
+
+	addr := fmt.Sprintf("127.0.0.1:%d", ephemeralPort())
+	daemonCmd := exec.Command(resolveBinary(t))
+	daemonCmd.Env = append(os.Environ(),
+		"TYMUXD_ADDR="+addr,
+		"XDG_STATE_HOME="+stateDir,
+		"TYMUXD_SOCKET_PATH="+socketPath,
+	)
+	daemonCmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(daemonUID), Gid: uint32(daemonGID)},
+	}
+	stdout, err := daemonCmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	daemonCmd.Stderr = os.Stderr
+	if err := daemonCmd.Start(); err != nil {
+		t.Fatalf("tymuxd start (as nobody): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = daemonCmd.Process.Signal(os.Interrupt)
+		_ = daemonCmd.Wait()
+	})
+
+	ready := make(chan struct{})
+	go func() {
+		var closeOnce sync.Once
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), "tymuxd listening") {
+				closeOnce.Do(func() { close(ready) })
+			}
+		}
+	}()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tymuxd (as nobody) did not report listening within 5s")
+	}
+
+	// Re-exec this test binary as the "client" half, pinned to uid 0
+	// (root) via Credential — see the doc comment above for why staying
+	// root, not "nobody" or any other non-daemon uid, is what lets this
+	// child's connect() actually reach the daemon's peer_cred gate.
+	clientCmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessUDSListSessionsRejected$", "-test.v")
+	clientCmd.Env = append(os.Environ(),
+		"GO_WANT_HELPER_PROCESS=1",
+		"TYMUX_HELPER_SOCKET_PATH="+socketPath,
+	)
+	clientCmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: 0, Gid: 0},
+	}
+	out, err := clientCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("client helper subprocess failed: %v\noutput:\n%s", err, out)
+	}
+	wantLine := "HELPER-RESULT:" + connect.CodePermissionDenied.String()
+	if !strings.Contains(string(out), wantLine) {
+		t.Fatalf("expected client helper subprocess output to contain %q, got:\n%s", wantLine, out)
 	}
 }
