@@ -253,70 +253,99 @@ pub fn reconcile_stale_socket(socket_path: &std::path::Path) -> Result<(), Strin
     }
 }
 
-/// Binds a `UnixListener` at `socket_path` with its final permissions
-/// (`0600` owner-only, or `0660` group-accessible when `group_gid` is
-/// `Some`) set atomically with creation via `umask`, then `chown`s the
-/// socket to the configured group immediately after (ADR-001) — no window
-/// where the socket is briefly world-accessible.
-///
-/// The socket's *immediate* parent directory is created at `0700`
+/// Shared error text for both `ensure_socket_parent_dir` and
+/// `bind_uds_listener`'s own bind failure — a single wording so
+/// `main()`'s callers only ever relay one message shape for "something
+/// about the socket path itself is wrong."
+fn socket_creation_error(socket_path: &std::path::Path, e: std::io::Error) -> String {
+    format!(
+        "failed to create Unix socket at {}: {e}. Check that the parent directory \
+         exists and is writable, or override the path with --socket-path/TYMUXD_SOCKET_PATH.",
+        socket_path.display()
+    )
+}
+
+/// Ensures `socket_path`'s *immediate* parent directory exists at `0700`
 /// (owner-only) or `0750` (group-access, enough for a group member's
 /// process to traverse into the directory and reach the socket by name
-/// without granting group write access) if it doesn't already exist. If it
-/// does already exist, it is validated — not trusted — to be owned by this
+/// without granting group write access) when `group_gid` is `Some`. If it
+/// already exists, it is validated — not trusted — to be owned by this
 /// process's own uid at exactly the expected mode (pre-mortem.md P1 #2):
 /// an attacker-planted directory on the `/tmp`-fallback path must never be
 /// silently bound into. A pre-existing *grandparent* directory (e.g.
 /// `$XDG_RUNTIME_DIR` itself, which `tymuxd` doesn't own) is never touched
 /// — only the directly-containing directory is created/validated
 /// (architecture-review.md Blocker fix).
-pub fn bind_uds_listener(
+///
+/// Split out of `bind_uds_listener` (Epic 4.2 fix) so `main()` can call it
+/// *before* `acquire_socket_lock`: the lock file lives in this same
+/// directory, so on a genuinely fresh `$XDG_RUNTIME_DIR`/`/tmp`-fallback
+/// path — nothing has ever created `tymuxd/` there yet — acquiring the
+/// lock before this directory exists fails with ENOENT, breaking the very
+/// first cold start on a machine (confirmed by manually running `tymuxd`
+/// against a fresh `XDG_RUNTIME_DIR`: `failed to open lock file
+/// .../tymuxd/tymuxd.sock.lock: No such file or directory`). Idempotent —
+/// `bind_uds_listener` also calls this itself, so direct callers of that
+/// function (all of its existing unit tests) are unaffected.
+pub fn ensure_socket_parent_dir(
     socket_path: &std::path::Path,
     group_gid: Option<u32>,
-) -> Result<tokio::net::UnixListener, String> {
-    let fail_bind = |e: std::io::Error| {
-        format!(
-            "failed to create Unix socket at {}: {e}. Check that the parent directory \
-             exists and is writable, or override the path with --socket-path/TYMUXD_SOCKET_PATH.",
-            socket_path.display()
-        )
-    };
+) -> Result<(), String> {
     // Directory mode this function requires for an *immediate* parent of
     // the socket, in both the fresh-create and pre-existing cases: 0o700
     // (owner rwx only) when no group is configured, or 0o750 (owner rwx,
     // group r-x) when group_gid is set.
     let expected_parent_mode = if group_gid.is_some() { 0o750 } else { 0o700 };
-    if let Some(parent) = socket_path.parent() {
-        if parent.exists() {
-            // "Never chmod a directory tymuxd doesn't itself own" stays an
-            // invariant of this function for any input (architecture-review.md
-            // iteration-2 Blocker fix) — but a pre-existing parent is now
-            // validated, not silently trusted (pre-mortem.md P1 #2 fix).
-            // Fatal, not a silent bind-into-it, if the pre-existing
-            // directory isn't owned by this process's own uid at exactly
-            // the expected mode.
-            let meta = std::fs::symlink_metadata(parent).map_err(fail_bind)?;
-            let owner_uid = std::os::unix::fs::MetadataExt::uid(&meta);
-            let mode = meta.permissions().mode() & 0o777;
-            let daemon_uid = unsafe { libc::geteuid() };
-            if owner_uid != daemon_uid || mode != expected_parent_mode {
-                return Err(format!(
-                    "refusing to bind Unix socket at {}: its parent directory {} already \
-                     exists but is owned by uid {owner_uid} at mode {mode:o} (expected uid \
-                     {daemon_uid} at mode {expected_parent_mode:o}). A pre-existing socket \
-                     directory not owned and permissioned by tymuxd itself may have been \
-                     created by another, possibly untrusted, process — remove it or point \
-                     --socket-path/TYMUXD_SOCKET_PATH somewhere tymuxd can create fresh.",
-                    socket_path.display(),
-                    parent.display()
-                ));
-            }
-        } else {
-            std::fs::create_dir_all(parent).map_err(fail_bind)?;
-            std::fs::set_permissions(parent, PermissionsExt::from_mode(expected_parent_mode))
-                .map_err(fail_bind)?;
+    let Some(parent) = socket_path.parent() else {
+        return Ok(());
+    };
+    if parent.exists() {
+        // "Never chmod a directory tymuxd doesn't itself own" stays an
+        // invariant of this function for any input (architecture-review.md
+        // iteration-2 Blocker fix) — but a pre-existing parent is now
+        // validated, not silently trusted (pre-mortem.md P1 #2 fix).
+        // Fatal, not a silent bind-into-it, if the pre-existing
+        // directory isn't owned by this process's own uid at exactly
+        // the expected mode.
+        let meta = std::fs::symlink_metadata(parent)
+            .map_err(|e| socket_creation_error(socket_path, e))?;
+        let owner_uid = std::os::unix::fs::MetadataExt::uid(&meta);
+        let mode = meta.permissions().mode() & 0o777;
+        let daemon_uid = unsafe { libc::geteuid() };
+        if owner_uid != daemon_uid || mode != expected_parent_mode {
+            return Err(format!(
+                "refusing to bind Unix socket at {}: its parent directory {} already \
+                 exists but is owned by uid {owner_uid} at mode {mode:o} (expected uid \
+                 {daemon_uid} at mode {expected_parent_mode:o}). A pre-existing socket \
+                 directory not owned and permissioned by tymuxd itself may have been \
+                 created by another, possibly untrusted, process — remove it or point \
+                 --socket-path/TYMUXD_SOCKET_PATH somewhere tymuxd can create fresh.",
+                socket_path.display(),
+                parent.display()
+            ));
         }
+        Ok(())
+    } else {
+        std::fs::create_dir_all(parent).map_err(|e| socket_creation_error(socket_path, e))?;
+        std::fs::set_permissions(parent, PermissionsExt::from_mode(expected_parent_mode))
+            .map_err(|e| socket_creation_error(socket_path, e))
     }
+}
+
+/// Binds a `UnixListener` at `socket_path` with its final permissions
+/// (`0600` owner-only, or `0660` group-accessible when `group_gid` is
+/// `Some`) set atomically with creation via `umask`, then `chown`s the
+/// socket to the configured group immediately after (ADR-001) — no window
+/// where the socket is briefly world-accessible. Ensures the socket's
+/// immediate parent directory exists first via `ensure_socket_parent_dir`
+/// (see that function's doc comment for the pre-existing-directory
+/// validation invariant).
+pub fn bind_uds_listener(
+    socket_path: &std::path::Path,
+    group_gid: Option<u32>,
+) -> Result<tokio::net::UnixListener, String> {
+    let fail_bind = |e: std::io::Error| socket_creation_error(socket_path, e);
+    ensure_socket_parent_dir(socket_path, group_gid)?;
     // 0o177 -> 0777 & ~0177 = 0600 (owner-only); 0o117 -> 0777 & ~0117 =
     // 0660 (owner+group). Set immediately before bind() so the kernel
     // creates the file already at this mode — no post-bind chmod window

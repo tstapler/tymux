@@ -72,10 +72,28 @@ impl Drop for DaemonProcess {
     }
 }
 
+/// A short, fresh, per-test socket directory — deliberately NOT nested
+/// under `xdg_state_home` (whose naming can push a nested socket path
+/// past `SUN_LEN`, the ~108-byte kernel limit on `AF_UNIX` paths — hit in
+/// practice while wiring this up, especially under a long `$TMPDIR`) and
+/// NOT `xdg_state_home` itself (already pre-created at the default,
+/// non-0700 mode; `bind_uds_listener` refuses to bind into a pre-existing
+/// directory at the wrong mode, by design).
+fn short_unique_socket_path() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("tymuxd-test-{}", Uuid::new_v4().simple()))
+        .join("s.sock")
+}
+
 fn spawn_daemon(addr: &str, xdg_state_home: &Path) -> DaemonProcess {
     let child = Command::new(env!("CARGO_BIN_EXE_tymuxd"))
         .env("TYMUXD_ADDR", addr)
         .env("XDG_STATE_HOME", xdg_state_home)
+        // Epic 4.2: tymuxd now binds a UDS listener by default, singleton
+        // per socket path (ADR-001's flock) — give each spawned daemon its
+        // own path so concurrent real-subprocess tests in this crate don't
+        // contend for the same uid-scoped default socket.
+        .env("TYMUXD_SOCKET_PATH", short_unique_socket_path())
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
