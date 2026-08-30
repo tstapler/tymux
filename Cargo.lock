@@ -1855,6 +1855,7 @@ dependencies = [
  "futures",
  "libc",
  "prost",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-stream",

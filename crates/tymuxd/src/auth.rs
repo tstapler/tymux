@@ -5,6 +5,7 @@
 //! architecture review to keep the god-file from absorbing another
 //! concern (see plan.md's Pattern Decisions).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -71,6 +72,112 @@ pub fn resolve_token(args: &[String]) -> Option<BearerToken> {
     flag_value
         .or(env_value)
         .and_then(|t| BearerToken::parse(&t))
+}
+
+/// The one documented default-socket-path algorithm this feature
+/// defines. Mirrored independently (not shared — see plan.md Pattern
+/// Decisions row 10) in tymux-cli's main.rs, clients/go's udsdialer
+/// package, and clients/ts's socket-path module. Any change here must
+/// be mirrored in all three.
+///
+/// Both branches nest under a subdirectory tymuxd itself creates and
+/// owns (`tymuxd/` under $XDG_RUNTIME_DIR, `tymuxd-<uid>/` under the
+/// /tmp fallback) — deliberately symmetric, so bind_uds_listener's
+/// create_dir_all+chmod(0700) sequence (Epic 2.2) never has to
+/// special-case which directory it's touching (architecture-review.md
+/// Blocker fix: a bare `$XDG_RUNTIME_DIR/tymuxd.sock` would make
+/// bind_uds_listener chmod the session manager's own shared directory).
+pub fn default_uds_socket_path(uid: u32) -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir).join("tymuxd").join("tymuxd.sock");
+    }
+    let base = std::env::var_os("TMPDIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join(format!("tymuxd-{uid}")).join("tymuxd.sock")
+}
+
+/// Resolves the effective UDS socket path: `--socket-path`/
+/// `TYMUXD_SOCKET_PATH` (flag beats env, empty treated as absent) if
+/// set, else `default_uds_socket_path`. Note: prefer pointing the
+/// override at a `tymuxd`-owned subdirectory (e.g.
+/// `$XDG_RUNTIME_DIR/tymuxd/tymuxd.sock`, matching
+/// `default_uds_socket_path`'s own nesting) rather than directly at a
+/// shared runtime directory — this is a documentation nicety, not a
+/// safety requirement: `bind_uds_listener` (Epic 2.2) only
+/// creates/chmods a parent directory that doesn't already exist, so
+/// the socket binds safely either way.
+pub fn resolve_uds_socket_path(args: &[String], uid: u32) -> PathBuf {
+    let flag = args
+        .iter()
+        .position(|a| a == "--socket-path")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| {
+            args.iter()
+                .find_map(|a| a.strip_prefix("--socket-path=").map(str::to_string))
+        });
+    let env = std::env::var("TYMUXD_SOCKET_PATH")
+        .ok()
+        .filter(|v| !v.is_empty());
+    flag.or(env)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_uds_socket_path(uid))
+}
+
+/// Resolves `--socket-group`/`TYMUXD_SOCKET_GROUP` (flag beats env,
+/// `=`-joined and space-separated flag forms both supported, empty
+/// treated as absent — same shape as `resolve_uds_socket_path`).
+/// `None` means "owner-only socket", today's behavior.
+///
+/// Group members get FULL daemon control — CreateSession/Attach/
+/// KillSession against every session, identical to the socket owner,
+/// not a scoped subset. See the README's "Multi-user / shared-host
+/// deployment" section for the containerized/bind-mounted-socket
+/// uid-mismatch caveat, which applies to any UDS connection —
+/// group-access or owner-only alike.
+pub fn resolve_socket_group_name(args: &[String]) -> Option<String> {
+    let flag = args
+        .iter()
+        .position(|a| a == "--socket-group")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| {
+            args.iter()
+                .find_map(|a| a.strip_prefix("--socket-group=").map(str::to_string))
+        });
+    let env = std::env::var("TYMUXD_SOCKET_GROUP").ok();
+    flag.or(env).filter(|v| !v.is_empty())
+}
+
+/// Resolves a POSIX group name to its gid via getgrnam(3). Safe
+/// wrapper: getgrnam's returned pointer is into a non-thread-safe
+/// static buffer, but this is called exactly once, synchronously,
+/// during single-threaded daemon startup before any listener task is
+/// spawned (ADR-002 does not apply here — this is a distinct,
+/// well-scoped unsafe call already covered by tymuxd's existing libc
+/// dependency).
+pub fn resolve_gid_by_name(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let grp = unsafe { libc::getgrnam(cname.as_ptr()) };
+    if grp.is_null() {
+        None
+    } else {
+        Some(unsafe { (*grp).gr_gid })
+    }
+}
+
+/// Resolves whether the TCP loopback listener should be disabled: the
+/// bare `--disable-tcp-loopback` flag (no value), or a non-empty
+/// `TYMUXD_DISABLE_TCP_LOOPBACK` env value. Neither present defaults
+/// to `false` — TCP stays on, today's behavior — so a future removal
+/// project only needs to flip this default (architecture.md §6).
+pub fn resolve_tcp_disabled(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--disable-tcp-loopback")
+        || std::env::var("TYMUXD_DISABLE_TCP_LOOPBACK")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
 }
 
 /// The fail-fast invariant this feature exists to enforce: a
@@ -255,6 +362,245 @@ mod tests {
         let args: Vec<String> = vec!["tymuxd"].into_iter().map(String::from).collect();
         let resolved = resolve_token(&args);
         assert!(resolved.is_none());
+    }
+
+    // --- socket-path-fixtures.json loading (shared with tymux-cli, the Go
+    // and TS clients — see plan.md Task 1.1.1b) ---
+
+    #[derive(serde::Deserialize)]
+    struct DefaultPathCase {
+        case: String,
+        env: std::collections::HashMap<String, String>,
+        uid: u32,
+        expected: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ResolvePathCase {
+        case: String,
+        #[serde(default)]
+        args: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        uid: u32,
+        expected: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SocketPathFixtures {
+        default_path_cases: Vec<DefaultPathCase>,
+        resolve_path_cases: Vec<ResolvePathCase>,
+    }
+
+    const SOCKET_PATH_FIXTURES_JSON: &str =
+        include_str!("../../../project_plans/unix-socket-auth/socket-path-fixtures.json");
+
+    fn load_socket_path_fixtures() -> SocketPathFixtures {
+        serde_json::from_str(SOCKET_PATH_FIXTURES_JSON)
+            .expect("socket-path-fixtures.json must be valid JSON matching the shared schema")
+    }
+
+    fn default_path_case(name: &str) -> DefaultPathCase {
+        load_socket_path_fixtures()
+            .default_path_cases
+            .into_iter()
+            .find(|c| c.case == name)
+            .unwrap_or_else(|| panic!("no default_path_cases entry named {name}"))
+    }
+
+    fn resolve_path_case(name: &str) -> ResolvePathCase {
+        load_socket_path_fixtures()
+            .resolve_path_cases
+            .into_iter()
+            .find(|c| c.case == name)
+            .unwrap_or_else(|| panic!("no resolve_path_cases entry named {name}"))
+    }
+
+    /// Clears the env vars `default_uds_socket_path`/
+    /// `resolve_uds_socket_path` read, then applies the case's `env`
+    /// map on top. Callers must hold `ENV_LOCK`.
+    fn apply_socket_path_env(env: &std::collections::HashMap<String, String>) {
+        for var in ["XDG_RUNTIME_DIR", "TMPDIR", "TYMUXD_SOCKET_PATH"] {
+            std::env::remove_var(var);
+        }
+        for (k, v) in env {
+            std::env::set_var(k, v);
+        }
+    }
+
+    fn clear_socket_path_env() {
+        for var in ["XDG_RUNTIME_DIR", "TMPDIR", "TYMUXD_SOCKET_PATH"] {
+            std::env::remove_var(var);
+        }
+    }
+
+    // --- default_uds_socket_path ---
+
+    #[test]
+    fn default_uds_socket_path_prefers_xdg_runtime_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = default_path_case("xdg_runtime_dir_set");
+        apply_socket_path_env(&case.env);
+        let resolved = default_uds_socket_path(case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn default_uds_socket_path_falls_back_to_tmpdir_when_xdg_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = default_path_case("xdg_unset_tmpdir_set");
+        apply_socket_path_env(&case.env);
+        let resolved = default_uds_socket_path(case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn default_uds_socket_path_falls_back_to_tmp_when_both_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = default_path_case("both_unset");
+        apply_socket_path_env(&case.env);
+        let resolved = default_uds_socket_path(case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn default_uds_socket_path_treats_empty_xdg_runtime_dir_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = default_path_case("xdg_empty_string_treated_as_unset");
+        apply_socket_path_env(&case.env);
+        let resolved = default_uds_socket_path(case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn default_uds_socket_path_scopes_by_uid_to_avoid_collision() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base_case = default_path_case("both_unset");
+        let other_case = default_path_case("uid_scoping_distinctness_1001");
+        apply_socket_path_env(&base_case.env);
+        let resolved_base = default_uds_socket_path(base_case.uid);
+        let resolved_other = default_uds_socket_path(other_case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved_base, PathBuf::from(base_case.expected));
+        assert_eq!(resolved_other, PathBuf::from(other_case.expected));
+        assert_ne!(resolved_base, resolved_other);
+    }
+
+    // --- resolve_uds_socket_path ---
+
+    #[test]
+    fn resolve_uds_socket_path_prefers_flag_over_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = resolve_path_case("flag_beats_env");
+        apply_socket_path_env(&case.env);
+        let args: Vec<String> = case.args.clone();
+        let resolved = resolve_uds_socket_path(&args, case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn resolve_uds_socket_path_supports_equals_joined_flag_form() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = resolve_path_case("equals_joined_flag_form");
+        apply_socket_path_env(&case.env);
+        let args: Vec<String> = case.args.clone();
+        let resolved = resolve_uds_socket_path(&args, case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn resolve_uds_socket_path_falls_back_to_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = resolve_path_case("env_alone");
+        apply_socket_path_env(&case.env);
+        let args: Vec<String> = case.args.clone();
+        let resolved = resolve_uds_socket_path(&args, case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn resolve_uds_socket_path_falls_back_to_default_when_neither_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = resolve_path_case("neither_present_falls_back_to_default");
+        apply_socket_path_env(&case.env);
+        let args: Vec<String> = case.args.clone();
+        let resolved = resolve_uds_socket_path(&args, case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    // --- resolve_socket_group_name / resolve_gid_by_name ---
+
+    #[test]
+    fn resolve_socket_group_name_prefers_flag_over_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TYMUXD_SOCKET_GROUP", "env-group");
+        let args: Vec<String> = vec!["tymuxd", "--socket-group", "flag-group"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let resolved = resolve_socket_group_name(&args);
+        std::env::remove_var("TYMUXD_SOCKET_GROUP");
+        assert_eq!(resolved, Some("flag-group".to_string()));
+    }
+
+    #[test]
+    fn resolve_socket_group_name_returns_none_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TYMUXD_SOCKET_GROUP");
+        let args: Vec<String> = vec!["tymuxd"].into_iter().map(String::from).collect();
+        let resolved = resolve_socket_group_name(&args);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_gid_by_name_resolves_root_to_gid_zero() {
+        assert_eq!(resolve_gid_by_name("root"), Some(0));
+    }
+
+    #[test]
+    fn resolve_gid_by_name_returns_none_for_unknown_group() {
+        assert_eq!(
+            resolve_gid_by_name("tymux-test-nonexistent-group-83f2"),
+            None
+        );
+    }
+
+    // --- resolve_tcp_disabled ---
+
+    #[test]
+    fn resolve_tcp_disabled_true_when_flag_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TYMUXD_DISABLE_TCP_LOOPBACK");
+        let args: Vec<String> = vec!["tymuxd", "--disable-tcp-loopback"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(resolve_tcp_disabled(&args));
+    }
+
+    #[test]
+    fn resolve_tcp_disabled_true_when_env_nonempty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TYMUXD_DISABLE_TCP_LOOPBACK", "1");
+        let args: Vec<String> = vec!["tymuxd"].into_iter().map(String::from).collect();
+        let resolved = resolve_tcp_disabled(&args);
+        std::env::remove_var("TYMUXD_DISABLE_TCP_LOOPBACK");
+        assert!(resolved);
+    }
+
+    #[test]
+    fn resolve_tcp_disabled_false_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TYMUXD_DISABLE_TCP_LOOPBACK");
+        let args: Vec<String> = vec!["tymuxd"].into_iter().map(String::from).collect();
+        assert!(!resolve_tcp_disabled(&args));
     }
 
     // --- check_non_loopback_requires_token ---

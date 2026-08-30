@@ -1,0 +1,15 @@
+{
+  "default_path_cases": [
+    {"case": "xdg_runtime_dir_set", "env": {"XDG_RUNTIME_DIR": "/run/user/1000"}, "uid": 1000, "expected": "/run/user/1000/tymuxd/tymuxd.sock"},
+    {"case": "xdg_unset_tmpdir_set", "env": {"TMPDIR": "/var/folders/xy/T"}, "uid": 1000, "expected": "/var/folders/xy/T/tymuxd-1000/tymuxd.sock"},
+    {"case": "both_unset", "env": {}, "uid": 1000, "expected": "/tmp/tymuxd-1000/tymuxd.sock"},
+    {"case": "xdg_empty_string_treated_as_unset", "env": {"XDG_RUNTIME_DIR": ""}, "uid": 1000, "expected": "/tmp/tymuxd-1000/tymuxd.sock"},
+    {"case": "uid_scoping_distinctness_1001", "env": {}, "uid": 1001, "expected": "/tmp/tymuxd-1001/tymuxd.sock"}
+  ],
+  "resolve_path_cases": [
+    {"case": "flag_beats_env", "args": ["--socket-path", "/custom/tymuxd.sock"], "env": {"TYMUXD_SOCKET_PATH": "/other/tymuxd.sock"}, "uid": 1000, "expected": "/custom/tymuxd.sock"},
+    {"case": "equals_joined_flag_form", "args": ["--socket-path=/custom/tymuxd.sock"], "env": {}, "uid": 1000, "expected": "/custom/tymuxd.sock"},
+    {"case": "env_alone", "args": [], "env": {"TYMUXD_SOCKET_PATH": "/other/tymuxd.sock"}, "uid": 1000, "expected": "/other/tymuxd.sock"},
+    {"case": "neither_present_falls_back_to_default", "args": [], "env": {}, "uid": 1000, "expected": "/tmp/tymuxd-1000/tymuxd.sock"}
+  ]
+}
