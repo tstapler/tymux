@@ -362,7 +362,29 @@ func ephemeralPort() int64 {
 // startDaemonOn spawns a real tymuxd bound to addr and waits for its "tymuxd
 // listening" stdout line, same signal daemon.ts waits on. token is set as
 // TYMUXD_TOKEN in the spawned process's env when non-empty.
-func startDaemonOn(t *testing.T, addr, token string) string {
+// startDaemonWithUDS spawns a real tymuxd on an ephemeral loopback TCP port
+// (tymuxd currently always needs a valid TYMUXD_ADDR to bind, even when the
+// caller only cares about its UDS listener) with TYMUXD_SOCKET_PATH set to
+// a fixed path under t.TempDir(), mirroring startDaemonWithToken's shape
+// (Task 7.2.1a). Returns the socket path (not an HTTP addr) for the caller
+// to dial via udsdialer.DialUnixHTTPClient.
+//
+// NOTE (as of this writing): crates/tymuxd's dual-listener wiring (Phase 4
+// — main.rs binding auth::bind_uds_listener alongside its existing TCP
+// listener) had not yet landed on this branch; that work is tracked
+// separately (project_plans/unix-socket-auth/implementation/plan.md Phase
+// 4) and is out of this package's scope. This helper is plumbing for Phase
+// 7.3's accept/reject tests (a later wave) to consume once Phase 4 lands —
+// no test in this file calls it yet, so a caller dialing the returned path
+// today gets ENOENT, not a live connection.
+func startDaemonWithUDS(t *testing.T, token string) string {
+	t.Helper()
+	socketPath := filepath.Join(t.TempDir(), "tymuxd.sock")
+	startDaemonOn(t, fmt.Sprintf("127.0.0.1:%d", ephemeralPort()), token, "TYMUXD_SOCKET_PATH="+socketPath)
+	return socketPath
+}
+
+func startDaemonOn(t *testing.T, addr, token string, extraEnv ...string) string {
 	t.Helper()
 
 	// The bind address (addr, e.g. "0.0.0.0:<port>" for the non-loopback
@@ -391,6 +413,7 @@ func startDaemonOn(t *testing.T, addr, token string) string {
 	if token != "" {
 		env = append(env, "TYMUXD_TOKEN="+token)
 	}
+	env = append(env, extraEnv...)
 	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
