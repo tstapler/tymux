@@ -2,6 +2,7 @@ import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import * as net from "node:net";
 import * as http2 from "node:http2";
+import { spawn } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -487,3 +488,90 @@ test("tymuxClient() rejects with a hard error on EACCES and never falls back to 
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+// --- Epic 8.3 Story 8.3.1: real tymuxd UDS accept/reject. tymuxd didn't
+// bind a real UDS listener when Epic 8.2's tests above were written, so
+// those stand up self-hosted stub servers instead; now that tymuxd binds a
+// real dual TCP+UDS listener (commit b44aae1) with peer-cred auth, these
+// dial an actual spawned daemon via tymuxClient() itself.
+
+// Task 8.3.1b: same-uid accept -- the only uid available to a Node test
+// process without root (pitfalls.md §7) -- proves the full UDS-first dial
+// path round-trips real RPCs against a real daemon, not just a stub.
+test("tymuxClient() dials a real tymuxd over UDS and round-trips a session (same-uid accept)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-accept-"));
+  const socketPath = join(stateDir, "tymuxd.sock");
+  const udsDaemon = await startDaemon({ socketPath });
+  try {
+    await withSocketPathEnv(socketPath, async () => {
+      const udsClient = await tymuxClient();
+      const created = await udsClient.createSession({ name: "ts-uds-accept-integration", command: "" });
+      const listed = await udsClient.listSessions({});
+      const found = listed.sessions.find((s) => s.id === created.id);
+      assert.ok(found, "a session created over the real UDS listener should appear in listSessions over the same socket");
+    });
+  } finally {
+    udsDaemon.stop();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// Task 8.3.1c: the true cross-uid reject proof. Requires root/CAP_SETUID to
+// spawn a child process under a genuinely different real OS uid
+// (`child_process.spawn`'s `uid` option) -- ships skipped by default on
+// this repo's actual CI (plain ubuntu-latest/macos-latest runners, no
+// root/CAP_SETUID; confirmed against .github/workflows/ci.yml at planning
+// time), mirroring Go's Task 7.3.1b and tymux-cli's Task 6.4.1c. See
+// plan.md's "Unresolved Questions" (resolved during planning) and
+// pitfalls.md §7. `peer_is_authorized`'s own unit tests
+// (crates/tymuxd/src/auth.rs) are the accepted substitute proof for the
+// authorization *decision*; this test only proves the real kernel-level
+// gate when it can actually run as root.
+test(
+  "a client connecting from a genuinely different OS uid is rejected",
+  { skip: process.getuid!() !== 0 ? "requires root/CAP_SETUID to spawn a child under a different uid" : false },
+  async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-cross-uid-"));
+    const socketPath = join(stateDir, "tymuxd.sock");
+    const udsDaemon = await startDaemon({ socketPath });
+    try {
+      // "nobody" -- present on essentially every Linux/macOS install, and
+      // guaranteed distinct from uid 0 (the daemon's own uid, since this
+      // test only runs at all when the test process itself is root).
+      const DIFFERENT_UID = 65534;
+
+      // A minimal standalone probe, not the full tymuxClient() stack:
+      // auth::bind_uds_listener binds tymuxd's UDS socket file mode 0600
+      // (owner-only) by default, so the OS itself denies connect() to any
+      // non-owning uid before the daemon's own peer_is_authorized ever
+      // runs -- the same EACCES branch examples/client.ts's probeUdsSocket
+      // already classifies as "not authorized" (see the EACCES test
+      // above). Spawning this probe under a genuinely different uid (via
+      // spawn's `uid` option) is what actually requires root, unlike that
+      // chmod-based test; a plain CJS `-e` script avoids needing tsx/ESM
+      // module resolution to succeed under the restricted child uid.
+      const probe = [
+        'const net = require("node:net");',
+        `const socket = net.connect({ path: ${JSON.stringify(socketPath)} });`,
+        'socket.once("connect", () => { console.log("CONNECTED"); socket.destroy(); process.exit(0); });',
+        'socket.once("error", (err) => { console.log("ERROR:" + err.code); process.exit(1); });',
+      ].join("\n");
+
+      const child = spawn(process.execPath, ["-e", probe], {
+        uid: DIFFERENT_UID,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      const exitCode = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+
+      assert.notEqual(exitCode, 0, "a genuinely different uid must not be able to connect to the daemon's UDS socket");
+      assert.match(stdout, /ERROR:EACCES/, "the kernel must deny connect() with EACCES for a non-owning uid");
+    } finally {
+      udsDaemon.stop();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  },
+);
