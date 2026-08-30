@@ -119,6 +119,12 @@ default. Read this before running it on a host other users can reach.
   `--disable-tcp-loopback` (or `TYMUXD_DISABLE_TCP_LOOPBACK=1`), which
   turns off the TCP listener entirely and leaves the Unix socket as the
   sole way in.
+- **The Unix socket lives at a per-user default path** (under
+  `$XDG_RUNTIME_DIR` or a `/tmp` fallback, scoped by uid) that only the
+  socket's owner can reach unless a group is configured (below).
+  Override it with `--socket-path` (or `TYMUXD_SOCKET_PATH`) if you're
+  running multiple `tymuxd` instances on one host or need a
+  non-default location.
 - **`--socket-group` (or `TYMUXD_SOCKET_GROUP`) grants full control, not
   a scoped subset.** Anyone in the configured group can create sessions
   (run arbitrary commands), attach to and read/write any pane, and kill
