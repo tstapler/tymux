@@ -153,13 +153,20 @@ fn spawn_daemon(cfg: DaemonConfig) -> TestDaemon {
 
     let mut child = command.spawn().expect("failed to spawn tymuxd binary");
     let stdout = child.stdout.take().expect("tymuxd stdout should be piped");
-    wait_for_daemon_ready(stdout);
-
-    TestDaemon {
+    // Wrap the child in its `Drop`-guarded struct *before* the panic-risking
+    // wait below — a `TestDaemon` already live in scope still gets dropped
+    // (killing the process) if `wait_for_daemon_ready` times out and panics.
+    // Confirmed the hard way: an earlier iteration called this wait before
+    // constructing `TestDaemon`, and a timeout there leaked the spawned
+    // `tymuxd` process — one such orphan was still holding port 7419 for a
+    // later, unrelated test run.
+    let daemon = TestDaemon {
         child,
         state_dir,
         socket_dir,
-    }
+    };
+    wait_for_daemon_ready(stdout);
+    daemon
 }
 
 /// Dials a real UDS peer directly — the same `tower::service_fn` +
