@@ -1359,6 +1359,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let daemon = TymuxDaemon::new(engine);
+
+    // Bind the TCP listener eagerly here, before the "tymuxd listening" log
+    // line below — `serve_with_shutdown(socket_addr, ...)` binds lazily
+    // inside the future, only once `tokio::join!` polls it, which raced a
+    // client dialing immediately after seeing this log line (found via
+    // clients/go's integration suite: the UDS listener binds synchronously
+    // above and never raced, but TCP intermittently returned connection
+    // refused under `startDaemonOn`-style readiness-log polling).
+    let tcp_listener = if tcp_disabled {
+        None
+    } else {
+        Some(
+            tokio::net::TcpListener::bind(socket_addr)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: failed to bind TCP listener at {socket_addr}: {e}");
+                    std::process::exit(1);
+                }),
+        )
+    };
+
     tracing::info!(%addr, uds_path = %socket_path.display(), "tymuxd listening");
 
     // Epic 4.3 / Story 4.3.1: the TCP-deprecation warning vs. the
@@ -1390,9 +1411,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
     let tcp_future = async {
-        if tcp_disabled {
+        let Some(tcp_listener) = tcp_listener else {
             return Ok(());
-        }
+        };
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
         if let Some(token) = configured_token {
             let rejection_count = Arc::new(AtomicI64::new(0));
             configured_server_builder()
@@ -1400,12 +1422,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     daemon,
                     auth::BearerAuthInterceptor::new(Arc::new(token), rejection_count),
                 ))
-                .serve_with_shutdown(socket_addr, shutdown_signal())
+                .serve_with_incoming_shutdown(incoming, shutdown_signal())
                 .await
         } else {
             configured_server_builder()
                 .add_service(TymuxServiceServer::new(daemon))
-                .serve_with_shutdown(socket_addr, shutdown_signal())
+                .serve_with_incoming_shutdown(incoming, shutdown_signal())
                 .await
         }
     };
