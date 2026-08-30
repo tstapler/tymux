@@ -46,7 +46,7 @@ interface AttachHandle {
   done: Promise<void>;
 }
 
-function openAttach(client: ReturnType<typeof tymuxClient>, paneId: string): AttachHandle {
+function openAttach(client: Awaited<ReturnType<typeof tymuxClient>>, paneId: string): AttachHandle {
   const controller = new AbortController();
   const start = performance.now();
   let resolveReady!: (elapsedMs: number) => void;
@@ -84,7 +84,7 @@ function openAttach(client: ReturnType<typeof tymuxClient>, paneId: string): Att
 }
 
 async function main() {
-  const client = tymuxClient();
+  const client = await tymuxClient();
 
   // Empty command -> daemon default ($SHELL): an idle shell, matching
   // scale-feasibility.md's methodology, so the pane stays alive to attach to.

@@ -28,7 +28,7 @@ function percentile(sorted: number[], p: number): number {
 }
 
 async function main() {
-  const client = tymuxClient();
+  const client = await tymuxClient();
 
   // Empty command -> daemon default ($SHELL), matching scale-feasibility.md's
   // methodology: an idle shell keeps the pane's reader thread alive, so the

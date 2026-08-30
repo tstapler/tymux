@@ -1,7 +1,7 @@
 import { tymuxClient } from "./client.js";
 
 export async function capturePane(paneId: string, baseUrl?: string) {
-  const client = tymuxClient(baseUrl);
+  const client = await tymuxClient(baseUrl);
   return client.capturePane({ paneId });
 }
 

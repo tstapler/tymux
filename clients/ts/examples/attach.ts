@@ -40,7 +40,7 @@ export interface AttachDemoResult {
 // the seq'd `output_chunk` field, letting a caller track how far it got.
 export async function runAttachDemo(paneId: string, options: AttachDemoOptions = {}): Promise<AttachDemoResult> {
   const { baseUrl, resumeFromSeq, token } = options;
-  const client = tymuxClient(baseUrl, token);
+  const client = await tymuxClient(baseUrl, token);
   const controller = new AbortController();
 
   async function* requests(): AsyncIterable<AttachRequest> {
