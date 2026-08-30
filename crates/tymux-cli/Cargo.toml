@@ -20,3 +20,9 @@ serde = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
 tracing = { workspace = true }
+libc = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

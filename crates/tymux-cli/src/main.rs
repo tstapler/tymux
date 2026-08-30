@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod config;
@@ -173,11 +174,154 @@ fn check_attach_liveness(pane: &ProtoPane, session_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mirrors `tymuxd`'s `auth::default_uds_socket_path` byte-for-byte — see
+/// plan.md Pattern Decisions row 10 for why this is duplicated rather than
+/// shared via `tymux-core`. Any change here must be mirrored in `tymuxd`,
+/// `clients/go`, and `clients/ts`.
+fn default_uds_socket_path(uid: u32) -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir).join("tymuxd").join("tymuxd.sock");
+    }
+    let base = std::env::var_os("TMPDIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join(format!("tymuxd-{uid}")).join("tymuxd.sock")
+}
+
+/// Distinguishes "no UDS daemon here" (legitimate, falls back to TCP) from
+/// "a UDS daemon is listening but rejected this peer at the OS level" (a
+/// security signal — must never silently retry over the unauthenticated
+/// TCP path). See pre-mortem.md P1 #1.
+enum UdsDialError {
+    PermissionDenied(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+async fn dial_uds(socket_path: &Path) -> Result<Channel, UdsDialError> {
+    let path = socket_path.to_path_buf();
+    let connector = tower::service_fn(move |_: tonic::transport::Uri| {
+        let path = path.clone();
+        async move {
+            let stream = tokio::net::UnixStream::connect(&path).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+        }
+    });
+    // Placeholder authority — the connector ignores it entirely and always
+    // dials socket_path; matches tonic's own documented `uds` client
+    // example pattern (ADR-003).
+    match tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(connector)
+        .await
+    {
+        Ok(channel) => Ok(channel),
+        Err(e) => {
+            // tonic::transport::Error's source chain, confirmed empirically
+            // against the pinned tonic 0.12.3 (a chmod(0)'d UDS socket, see
+            // `dial_channel_hard_errors_and_never_dials_tcp_when_uds_permission_denied`),
+            // is three levels deep: tonic::transport::Error ->
+            // (an internal, non-public) ConnectError -> the raw
+            // std::io::Error. Walk the whole chain rather than assuming a
+            // fixed depth, since that internal wrapper isn't part of
+            // tonic's public API and could change across patch releases.
+            let is_permission_denied = {
+                let mut cur: Option<&(dyn std::error::Error + 'static)> =
+                    std::error::Error::source(&e);
+                let mut found = false;
+                while let Some(err) = cur {
+                    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                        found = io_err.kind() == std::io::ErrorKind::PermissionDenied;
+                        break;
+                    }
+                    cur = err.source();
+                }
+                found
+            };
+            if is_permission_denied {
+                Err(UdsDialError::PermissionDenied(e.into()))
+            } else {
+                Err(UdsDialError::Other(e.into()))
+            }
+        }
+    }
+}
+
+/// Dials `tymuxd`: an explicit `--addr` is honored exactly (UDS is never
+/// touched), otherwise the resolved UDS socket path is tried first, falling
+/// back to TCP loopback with a single logged notice when no daemon is
+/// listening there. A UDS peer-cred rejection (`PermissionDenied` — a
+/// daemon *is* listening and denied the connect syscall) is a hard error
+/// and never falls back to TCP, since silently retrying over the
+/// unauthenticated TCP path would defeat this feature's isolation
+/// guarantee (pre-mortem.md P1 #1). Never gated on `isatty()`/
+/// `is_terminal` — identical behavior piped or interactive (ux.md Surfaces
+/// 6/7 cross-surface AC6).
+async fn dial_channel(explicit_addr: Option<String>, socket_path: &Path) -> Result<Channel> {
+    if let Some(addr) = explicit_addr {
+        return Ok(tonic::transport::Endpoint::from_shared(addr)?
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .connect()
+            .await?);
+    }
+    match dial_uds(socket_path).await {
+        Ok(channel) => Ok(channel),
+        Err(UdsDialError::PermissionDenied(source)) => {
+            // A daemon IS listening at socket_path and the kernel denied us
+            // the connect() itself — never fall back to the unauthenticated
+            // TCP path for this case (pre-mortem.md P1 #1). Reuses the same
+            // remedy text as the gRPC-level PermissionDenied case
+            // (`friendly_message`) so a peer denied at accept time and a
+            // peer denied by peer_is_authorized see one consistent message.
+            // The underlying transport error is logged at debug level only
+            // — the printed message itself stays short (ux.md Surface 9).
+            tracing::debug!(error = %source, "UDS connect() denied by the kernel");
+            anyhow::bail!(
+                "tymuxd rejected this connection: not authorized to access this daemon's \
+                 socket (ask the daemon's owner to add you to its configured \
+                 --socket-group, or run tymux-cli as the daemon's own OS user)"
+            )
+        }
+        Err(UdsDialError::Other(source)) => {
+            tracing::debug!(error = %source, "no reachable UDS socket, falling back to TCP");
+            eprintln!(
+                "tymux: no reachable Unix socket at {} — falling back to TCP loopback \
+                 (deprecated; make sure tymuxd is running)",
+                socket_path.display()
+            );
+            Ok(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:7419")
+                    .http2_keep_alive_interval(Duration::from_secs(30))
+                    .keep_alive_timeout(Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
+                    .connect()
+                    .await?,
+            )
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "tymux")]
 struct Cli {
-    #[arg(long, global = true, default_value = "http://127.0.0.1:7419")]
-    addr: String,
+    #[arg(long, global = true)]
+    addr: Option<String>,
+
+    /// Path to tymuxd's Unix domain socket. Defaults to the same path
+    /// tymuxd itself computes ($XDG_RUNTIME_DIR/tymuxd/tymuxd.sock, or a
+    /// uid-scoped fallback under $TMPDIR/tmp) — override only for
+    /// non-default deployments (multiple tymuxd instances, a custom
+    /// runtime dir). When overriding, prefer a tymuxd-owned subdirectory
+    /// (e.g. $XDG_RUNTIME_DIR/my-tymuxd/tymuxd.sock) rather than a shared
+    /// runtime directory directly, matching tymuxd's own default nesting.
+    /// Note: a socket reached through a bind-mounted path inside a
+    /// container may present a different uid than `id -u` shows locally —
+    /// see this repo's README, "Multi-user / shared-host deployment"
+    /// section (added by Task 9.1.1a), for the full caveat (Deployment
+    /// Guidance; ux.md Gap 1 fix).
+    #[arg(long, global = true, env = "TYMUXD_SOCKET_PATH")]
+    socket_path: Option<String>,
 
     /// Disable the status bar entirely — pure pty passthrough, no
     /// DECSTBM scroll-region reservation, zero added escape bytes
@@ -276,6 +420,21 @@ fn friendly_message(e: &anyhow::Error) -> String {
                 status.message()
             );
         }
+        // A UDS peer-cred rejection (`peer_is_authorized` on the daemon
+        // side) — distinct from the bearer-token `Unauthenticated` case
+        // above so a scripted caller can branch on the status code alone.
+        // Deliberately no mention of SO_PEERCRED/uid numbers in the
+        // printed message (ux.md Surface 9's "plain language over
+        // jargon"); note the one caveat this remedy doesn't cover: a
+        // containerized client sees its host-mapped uid, which may not
+        // match `id -u` inside the container (Deployment Guidance).
+        if status.code() == tonic::Code::PermissionDenied {
+            return format!(
+                "tymuxd rejected this connection: {} (ask the daemon's owner to add you to its \
+                 configured --socket-group, or run tymux-cli as the daemon's own OS user)",
+                status.message()
+            );
+        }
         return status.message().to_string();
     }
     e.to_string()
@@ -343,11 +502,12 @@ impl tonic::service::Interceptor for BearerAuth {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let endpoint = tonic::transport::Endpoint::from_shared(cli.addr)?
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_timeout(Duration::from_secs(10))
-        .keep_alive_while_idle(true);
-    let channel = endpoint.connect().await?;
+    let socket_path = cli
+        .socket_path
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_uds_socket_path(unsafe { libc::geteuid() }));
+    let channel = dial_channel(cli.addr, &socket_path).await?;
     let mut client = TymuxServiceClient::with_interceptor(
         channel,
         BearerAuth::new(cli.token.as_deref().and_then(BearerToken::parse))?,
@@ -1014,6 +1174,113 @@ mod tests {
     // touching TYMUXD_TOKEN must not run concurrently with each other.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    // --- socket-path-fixtures.json loading (shared with tymuxd, the Go
+    // and TS clients — see plan.md Task 1.1.1b / 6.1.1b) ---
+
+    #[derive(serde::Deserialize)]
+    struct DefaultPathCase {
+        case: String,
+        env: std::collections::HashMap<String, String>,
+        uid: u32,
+        expected: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SocketPathFixtures {
+        default_path_cases: Vec<DefaultPathCase>,
+    }
+
+    const SOCKET_PATH_FIXTURES_JSON: &str =
+        include_str!("../../../project_plans/unix-socket-auth/socket-path-fixtures.json");
+
+    fn load_socket_path_fixtures() -> SocketPathFixtures {
+        serde_json::from_str(SOCKET_PATH_FIXTURES_JSON)
+            .expect("socket-path-fixtures.json must be valid JSON matching the shared schema")
+    }
+
+    fn default_path_case(name: &str) -> DefaultPathCase {
+        load_socket_path_fixtures()
+            .default_path_cases
+            .into_iter()
+            .find(|c| c.case == name)
+            .unwrap_or_else(|| panic!("no default_path_cases entry named {name}"))
+    }
+
+    /// Clears the env vars `default_uds_socket_path` reads, then applies
+    /// the case's `env` map on top. Callers must hold `ENV_LOCK`.
+    fn apply_socket_path_env(env: &std::collections::HashMap<String, String>) {
+        for var in ["XDG_RUNTIME_DIR", "TMPDIR"] {
+            std::env::remove_var(var);
+        }
+        for (k, v) in env {
+            std::env::set_var(k, v);
+        }
+    }
+
+    fn clear_socket_path_env() {
+        for var in ["XDG_RUNTIME_DIR", "TMPDIR"] {
+            std::env::remove_var(var);
+        }
+    }
+
+    // --- default_uds_socket_path (Task 6.1.1a/b) — mirrors tymuxd's
+    // auth::default_uds_socket_path byte-for-byte; see plan.md Pattern
+    // Decisions row 10 ---
+
+    #[test]
+    fn default_uds_socket_path_prefers_xdg_runtime_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = default_path_case("xdg_runtime_dir_set");
+        apply_socket_path_env(&case.env);
+        let resolved = default_uds_socket_path(case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn default_uds_socket_path_falls_back_to_tmpdir_when_xdg_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = default_path_case("xdg_unset_tmpdir_set");
+        apply_socket_path_env(&case.env);
+        let resolved = default_uds_socket_path(case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn default_uds_socket_path_falls_back_to_tmp_when_both_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = default_path_case("both_unset");
+        apply_socket_path_env(&case.env);
+        let resolved = default_uds_socket_path(case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn default_uds_socket_path_treats_empty_xdg_runtime_dir_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let case = default_path_case("xdg_empty_string_treated_as_unset");
+        apply_socket_path_env(&case.env);
+        let resolved = default_uds_socket_path(case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved, PathBuf::from(case.expected));
+    }
+
+    #[test]
+    fn default_uds_socket_path_scopes_by_uid_to_avoid_collision() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base_case = default_path_case("both_unset");
+        let other_case = default_path_case("uid_scoping_distinctness_1001");
+        apply_socket_path_env(&base_case.env);
+        let resolved_base = default_uds_socket_path(base_case.uid);
+        let resolved_other = default_uds_socket_path(other_case.uid);
+        clear_socket_path_env();
+        assert_eq!(resolved_base, PathBuf::from(base_case.expected));
+        assert_eq!(resolved_other, PathBuf::from(other_case.expected));
+        assert_ne!(resolved_base, resolved_other);
+    }
+
     // ---- Task 2.1.2c/d: integration tests against a live, token-gated
     // tymuxd subprocess -----------------------------------------------
 
@@ -1470,6 +1737,22 @@ mod tests {
         assert_eq!(friendly_message(&err), "no such session: abc");
     }
 
+    /// Task 6.3.1b / R14: a `PermissionDenied` status (UDS peer-cred
+    /// rejection) gets its own remedy-naming message, distinct from the
+    /// `Unauthenticated` (bearer-token) branch above.
+    #[test]
+    fn friendly_message_names_the_remedy_for_permission_denied_status() {
+        let status =
+            tonic::Status::permission_denied("not authorized to access this daemon's socket");
+        let err: anyhow::Error = status.into();
+        assert_eq!(
+            friendly_message(&err),
+            "tymuxd rejected this connection: not authorized to access this daemon's socket \
+             (ask the daemon's owner to add you to its configured --socket-group, or run \
+             tymux-cli as the daemon's own OS user)"
+        );
+    }
+
     /// Task 2.1.1c: `--token s3cr3t` parses into `cli.token`.
     #[test]
     fn token_flag_parses() {
@@ -1514,16 +1797,180 @@ mod tests {
         );
     }
 
+    /// Task 6.1.2b: no `--addr` means "try UDS first" — `cli.addr` is
+    /// `None`, not a hardcoded TCP default.
     #[test]
-    fn default_addr_is_localhost() {
+    fn no_addr_flag_leaves_addr_none() {
         let cli = parse(&["ls"]);
-        assert_eq!(cli.addr, "http://127.0.0.1:7419");
+        assert_eq!(cli.addr, None);
     }
 
     #[test]
     fn addr_can_be_overridden() {
         let cli = parse(&["--addr", "http://example.com:1234", "ls"]);
-        assert_eq!(cli.addr, "http://example.com:1234");
+        assert_eq!(cli.addr, Some("http://example.com:1234".to_string()));
+    }
+
+    /// Task 6.1.1c: `--socket-path` parses into `cli.socket_path`.
+    #[test]
+    fn socket_path_flag_parses() {
+        let cli = parse(&["--socket-path", "/custom/tymuxd.sock", "ls"]);
+        assert_eq!(cli.socket_path, Some("/custom/tymuxd.sock".to_string()));
+    }
+
+    /// Task 6.1.1c AC: no `--socket-path` flag and no `TYMUXD_SOCKET_PATH`
+    /// env var leaves `cli.socket_path` `None`, so the caller falls back to
+    /// `default_uds_socket_path`.
+    #[test]
+    fn no_socket_path_flag_or_env_leaves_socket_path_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TYMUXD_SOCKET_PATH");
+        let cli = parse(&["ls"]);
+        assert_eq!(cli.socket_path, None);
+    }
+
+    /// Task 6.1.1d: `--socket-path` renders in `--help` with its env-var
+    /// annotation, matching `--token`'s existing discoverability precedent
+    /// (closes ux.md Gap 2).
+    #[test]
+    fn cli_help_output_lists_socket_path_flag_with_env_annotation() {
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("--socket-path"),
+            "--help must list --socket-path, got: {help}"
+        );
+        assert!(
+            help.contains("TYMUXD_SOCKET_PATH"),
+            "--help must show the TYMUXD_SOCKET_PATH env annotation, got: {help}"
+        );
+    }
+
+    // ---- Task 6.2.1c: dial_channel / dial_uds ------------------------
+
+    /// A unique-per-call temp path — avoids collisions between tests
+    /// running concurrently in the same process.
+    fn temp_socket_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tymux-cli-test-{label}-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Task 6.2.1c AC1 (unit-level): a real, HTTP/2-speaking peer bound at
+    /// the resolved UDS path is dialed successfully. Uses a bare
+    /// `tonic::transport::Server` with zero registered services — enough
+    /// to complete the HTTP/2 handshake `connect_with_connector` performs
+    /// eagerly, without needing a real `tymuxd` (out of scope per this
+    /// task's own instructions). The full "an actual RPC round-trips"
+    /// proof is deferred to Epic 6.4's `uds_integration.rs` against a real
+    /// daemon, per this task's own note.
+    #[tokio::test]
+    async fn dial_channel_uses_uds_when_reachable() {
+        let socket_path = temp_socket_path("reachable");
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let result = dial_uds(&socket_path).await;
+
+        server.abort();
+        let _ = std::fs::remove_file(&socket_path);
+        assert!(
+            result.is_ok(),
+            "expected a reachable UDS peer to dial successfully"
+        );
+    }
+
+    /// Task 6.2.1c AC2 (unit-level classification): no socket file at the
+    /// resolved path classifies as `UdsDialError::Other` (the "no daemon
+    /// listening here" case), which is what routes `dial_channel` to the
+    /// TCP fallback branch. The full live-daemon round trip plus the
+    /// exactly-one-fallback-line assertion are deferred to Epic 6.4's
+    /// `uds_integration.rs`, per this task's own note.
+    #[tokio::test]
+    async fn dial_channel_falls_back_to_tcp_with_notice_when_uds_unreachable() {
+        let socket_path = temp_socket_path("unreachable");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let result = dial_uds(&socket_path).await;
+
+        assert!(
+            matches!(result, Err(UdsDialError::Other(_))),
+            "expected a missing UDS socket to classify as UdsDialError::Other (falls back to TCP), not PermissionDenied"
+        );
+    }
+
+    /// Task 6.2.1c AC3 / pre-mortem.md P1 #1: a UDS socket that exists but
+    /// rejects the connect() syscall at the OS level (`PermissionDenied`)
+    /// is a hard error from `dial_channel` — never a TCP fallback. Denies
+    /// the calling uid via chmod(0) on the socket's own inode rather than
+    /// needing a second real uid (same technique Task 6.4.1d's setup
+    /// uses). Skipped when running as root, since root bypasses DAC
+    /// permission checks entirely and the chmod(0) trick wouldn't deny
+    /// the connect.
+    #[tokio::test]
+    async fn dial_channel_hard_errors_and_never_dials_tcp_when_uds_permission_denied() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, chmod(0) doesn't deny root's own connect()");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let socket_path = temp_socket_path("permission-denied");
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = dial_channel(None, &socket_path).await;
+
+        drop(listener);
+        let _ = std::fs::remove_file(&socket_path);
+
+        let err = result.expect_err("a PermissionDenied UDS dial must be a hard error");
+        assert_eq!(
+            err.to_string(),
+            "tymuxd rejected this connection: not authorized to access this daemon's socket \
+             (ask the daemon's owner to add you to its configured --socket-group, or run \
+             tymux-cli as the daemon's own OS user)"
+        );
+    }
+
+    /// Task 6.2.1c AC4 (structural, no UDS I/O of any kind): an explicit
+    /// `--addr` returns before any UDS logic runs at all — proven here by
+    /// pointing `socket_path` at a path with no listener and no permission
+    /// issue whatsoever, and asserting it's never touched (never created,
+    /// so `.exists()` staying false proves the UDS branch never ran — a
+    /// real `UnixStream::connect` attempt against a nonexistent path would
+    /// itself just fail, not create the file, so the meaningful proof is
+    /// structural rather than behavioral). The TCP side does perform a
+    /// real (fast-failing) dial against `127.0.0.1:0`, an always-refused
+    /// port, confirming `explicit_addr` — not the UDS path — is what got
+    /// dialed.
+    #[tokio::test]
+    async fn dial_channel_skips_uds_entirely_when_addr_explicit() {
+        let socket_path = temp_socket_path("skipped-because-addr-explicit");
+        let _ = std::fs::remove_file(&socket_path); // never created — must never be touched
+
+        let result = dial_channel(Some("http://127.0.0.1:0".to_string()), &socket_path).await;
+
+        // Port 0 / an unbound loopback port refuses the connection — this
+        // proves the TCP branch was taken (a real dial attempt was made
+        // against the explicit addr), not that the UDS branch silently
+        // succeeded some other way.
+        assert!(result.is_err());
+        assert!(
+            !socket_path.exists(),
+            "dial_channel must never touch the UDS path when --addr is explicit"
+        );
     }
 
     #[test]
