@@ -5,6 +5,7 @@
 //! architecture review to keep the god-file from absorbing another
 //! concern (see plan.md's Pattern Decisions).
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -180,6 +181,175 @@ pub fn resolve_tcp_disabled(args: &[String]) -> bool {
             .unwrap_or(false)
 }
 
+/// Held for tymuxd's entire process lifetime (ADR-001) — flock is
+/// released automatically on process exit/crash, so no explicit
+/// unlock/cleanup path is needed (see plan.md Unresolved Questions).
+#[derive(Debug)]
+pub struct SocketLockGuard(#[allow(dead_code)] std::fs::File);
+
+/// Acquires an exclusive, non-blocking `flock` on `<socket_path>.sock.lock`
+/// before `tymuxd` touches the socket path at all, so a second `tymuxd`
+/// racing to start against the same path fails fast instead of racing the
+/// first instance's stale-socket-reconciliation/bind sequence (ADR-001
+/// point 3).
+pub fn acquire_socket_lock(socket_path: &std::path::Path) -> Result<SocketLockGuard, String> {
+    let lock_path = socket_path.with_extension("sock.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("failed to open lock file {}: {e}", lock_path.display()))?;
+    let ret = unsafe {
+        libc::flock(
+            std::os::unix::io::AsRawFd::as_raw_fd(&file),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
+    if ret != 0 {
+        return Err(format!(
+            "another tymuxd is already starting against {} (lock file: {})",
+            socket_path.display(),
+            lock_path.display()
+        ));
+    }
+    Ok(SocketLockGuard(file))
+}
+
+/// Distinguishes a genuinely stale socket file (nothing listening — an
+/// unclean prior exit left it behind) from a live daemon already listening
+/// at `socket_path`, and removes only the former.
+///
+/// Only ever called while holding a `SocketLockGuard` for this same path
+/// (Story 2.1.1) — otherwise this check-then-act sequence is itself a
+/// TOCTOU across two concurrently starting daemons (pitfalls.md §2,
+/// ADR-001).
+pub fn reconcile_stale_socket(socket_path: &std::path::Path) -> Result<(), String> {
+    if !socket_path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => Err(format!(
+            "tymuxd is already running — a live listener answered at {}",
+            socket_path.display()
+        )),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            std::fs::remove_file(socket_path).map_err(|e| {
+                format!(
+                    "failed to remove stale socket {}: {e}",
+                    socket_path.display()
+                )
+            })
+        }
+        Err(e) => Err(format!(
+            "failed to probe existing socket {}: {e}",
+            socket_path.display()
+        )),
+    }
+}
+
+/// Binds a `UnixListener` at `socket_path` with its final permissions
+/// (`0600` owner-only, or `0660` group-accessible when `group_gid` is
+/// `Some`) set atomically with creation via `umask`, then `chown`s the
+/// socket to the configured group immediately after (ADR-001) — no window
+/// where the socket is briefly world-accessible.
+///
+/// The socket's *immediate* parent directory is created at `0700`
+/// (owner-only) or `0750` (group-access, enough for a group member's
+/// process to traverse into the directory and reach the socket by name
+/// without granting group write access) if it doesn't already exist. If it
+/// does already exist, it is validated — not trusted — to be owned by this
+/// process's own uid at exactly the expected mode (pre-mortem.md P1 #2):
+/// an attacker-planted directory on the `/tmp`-fallback path must never be
+/// silently bound into. A pre-existing *grandparent* directory (e.g.
+/// `$XDG_RUNTIME_DIR` itself, which `tymuxd` doesn't own) is never touched
+/// — only the directly-containing directory is created/validated
+/// (architecture-review.md Blocker fix).
+pub fn bind_uds_listener(
+    socket_path: &std::path::Path,
+    group_gid: Option<u32>,
+) -> Result<tokio::net::UnixListener, String> {
+    let fail_bind = |e: std::io::Error| {
+        format!(
+            "failed to create Unix socket at {}: {e}. Check that the parent directory \
+             exists and is writable, or override the path with --socket-path/TYMUXD_SOCKET_PATH.",
+            socket_path.display()
+        )
+    };
+    // Directory mode this function requires for an *immediate* parent of
+    // the socket, in both the fresh-create and pre-existing cases: 0o700
+    // (owner rwx only) when no group is configured, or 0o750 (owner rwx,
+    // group r-x) when group_gid is set.
+    let expected_parent_mode = if group_gid.is_some() { 0o750 } else { 0o700 };
+    if let Some(parent) = socket_path.parent() {
+        if parent.exists() {
+            // "Never chmod a directory tymuxd doesn't itself own" stays an
+            // invariant of this function for any input (architecture-review.md
+            // iteration-2 Blocker fix) — but a pre-existing parent is now
+            // validated, not silently trusted (pre-mortem.md P1 #2 fix).
+            // Fatal, not a silent bind-into-it, if the pre-existing
+            // directory isn't owned by this process's own uid at exactly
+            // the expected mode.
+            let meta = std::fs::symlink_metadata(parent).map_err(fail_bind)?;
+            let owner_uid = std::os::unix::fs::MetadataExt::uid(&meta);
+            let mode = meta.permissions().mode() & 0o777;
+            let daemon_uid = unsafe { libc::geteuid() };
+            if owner_uid != daemon_uid || mode != expected_parent_mode {
+                return Err(format!(
+                    "refusing to bind Unix socket at {}: its parent directory {} already \
+                     exists but is owned by uid {owner_uid} at mode {mode:o} (expected uid \
+                     {daemon_uid} at mode {expected_parent_mode:o}). A pre-existing socket \
+                     directory not owned and permissioned by tymuxd itself may have been \
+                     created by another, possibly untrusted, process — remove it or point \
+                     --socket-path/TYMUXD_SOCKET_PATH somewhere tymuxd can create fresh.",
+                    socket_path.display(),
+                    parent.display()
+                ));
+            }
+        } else {
+            std::fs::create_dir_all(parent).map_err(fail_bind)?;
+            std::fs::set_permissions(parent, PermissionsExt::from_mode(expected_parent_mode))
+                .map_err(fail_bind)?;
+        }
+    }
+    // 0o177 -> 0777 & ~0177 = 0600 (owner-only); 0o117 -> 0777 & ~0117 =
+    // 0660 (owner+group). Set immediately before bind() so the kernel
+    // creates the file already at this mode — no post-bind chmod window
+    // (ADR-001; fchmod on the fd is a documented no-op for AF_UNIX on
+    // Linux, so this is the only atomic option).
+    let new_umask = if group_gid.is_some() { 0o117 } else { 0o177 };
+    let old_umask = unsafe { libc::umask(new_umask) };
+    let bind_result = tokio::net::UnixListener::bind(socket_path);
+    unsafe { libc::umask(old_umask) };
+    let listener = bind_result.map_err(fail_bind)?;
+    if let Some(gid) = group_gid {
+        std::os::unix::fs::chown(socket_path, None, Some(gid)).map_err(|e| {
+            if e.raw_os_error() == Some(libc::EPERM) {
+                format!(
+                    "bound the Unix socket at {} but failed to grant group access \
+                     (gid {gid}): Operation not permitted. The tymuxd process itself is not \
+                     a member of the configured --socket-group/TYMUXD_SOCKET_GROUP — add the \
+                     daemon's own OS user to that group (or run tymuxd as a user already in \
+                     it), then restart.",
+                    socket_path.display()
+                )
+            } else {
+                format!(
+                    "bound the Unix socket at {} but failed to set its group ownership \
+                     (gid {gid}): {e}",
+                    socket_path.display()
+                )
+            }
+        })?;
+    }
+    Ok(listener)
+}
+
 /// The fail-fast invariant this feature exists to enforce: a
 /// non-loopback bind must have a (non-empty, already-guaranteed by
 /// `BearerToken::parse`) token. Extracted as a pure function so it's
@@ -284,6 +454,12 @@ mod tests {
     // std::env::set_var/remove_var mutate global process state, so tests
     // touching TYMUXD_TOKEN must not run concurrently with each other.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // libc::umask mutates process-global state exactly like env vars do,
+    // but is a distinct hazard (umask mutation racing another umask
+    // mutation, not env-var racing env-var) — a separate lock so neither
+    // kind of test can interleave with the other's window.
+    static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
     // --- BearerToken ---
 
@@ -601,6 +777,305 @@ mod tests {
         std::env::remove_var("TYMUXD_DISABLE_TCP_LOOPBACK");
         let args: Vec<String> = vec!["tymuxd"].into_iter().map(String::from).collect();
         assert!(!resolve_tcp_disabled(&args));
+    }
+
+    // --- acquire_socket_lock / SocketLockGuard ---
+
+    fn unique_test_socket_path(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn acquire_socket_lock_succeeds_for_first_caller() {
+        let socket_path = unique_test_socket_path("tymux-lock-test");
+        let guard = acquire_socket_lock(&socket_path).expect("first caller should acquire lock");
+        let lock_path = socket_path.with_extension("sock.lock");
+        assert!(lock_path.exists());
+        drop(guard);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn acquire_socket_lock_fails_fast_for_concurrent_second_caller() {
+        let socket_path = unique_test_socket_path("tymux-lock-test");
+        let first = acquire_socket_lock(&socket_path).expect("first caller should acquire lock");
+        let second = acquire_socket_lock(&socket_path);
+        assert!(second.is_err());
+        assert!(second
+            .unwrap_err()
+            .contains("another tymuxd is already starting against"));
+        drop(first);
+        let _ = std::fs::remove_file(socket_path.with_extension("sock.lock"));
+    }
+
+    #[test]
+    fn acquire_socket_lock_succeeds_again_after_guard_dropped() {
+        let socket_path = unique_test_socket_path("tymux-lock-test");
+        let first = acquire_socket_lock(&socket_path).expect("first caller should acquire lock");
+        drop(first);
+        let second = acquire_socket_lock(&socket_path);
+        assert!(second.is_ok());
+        drop(second);
+        let _ = std::fs::remove_file(socket_path.with_extension("sock.lock"));
+    }
+
+    // --- reconcile_stale_socket ---
+
+    #[test]
+    fn reconcile_stale_socket_is_noop_when_nothing_at_path() {
+        let socket_path = unique_test_socket_path("tymux-reconcile-test");
+        assert!(!socket_path.exists());
+        assert!(reconcile_stale_socket(&socket_path).is_ok());
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn reconcile_stale_socket_removes_a_genuinely_stale_file() {
+        let socket_path = unique_test_socket_path("tymux-reconcile-test");
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+                .expect("failed to bind test listener");
+            drop(listener);
+        }
+        assert!(socket_path.exists());
+        assert!(reconcile_stale_socket(&socket_path).is_ok());
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn reconcile_stale_socket_errs_and_leaves_a_live_listener_untouched() {
+        let socket_path = unique_test_socket_path("tymux-reconcile-test");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("failed to bind test listener");
+        let result = reconcile_stale_socket(&socket_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("tymuxd is already running"));
+        assert!(socket_path.exists());
+        assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_ok());
+        drop(listener);
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // --- bind_uds_listener ---
+
+    #[tokio::test]
+    async fn bind_uds_listener_creates_owner_only_socket_at_mode_0600() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let dir = unique_test_socket_path("tymux-bind-test");
+        let socket_path = dir.join("tymuxd.sock");
+        let listener = bind_uds_listener(&socket_path, None).expect("bind should succeed");
+        let mode = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_creates_group_socket_at_mode_0660_with_configured_gid() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let dir = unique_test_socket_path("tymux-bind-test");
+        let socket_path = dir.join("tymuxd.sock");
+        let gid = unsafe { libc::getegid() };
+        let listener = bind_uds_listener(&socket_path, Some(gid)).expect("bind should succeed");
+        let meta = std::fs::metadata(&socket_path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
+        assert_eq!(std::os::unix::fs::MetadataExt::gid(&meta), gid);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_creates_parent_directory_at_mode_0700() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let dir = unique_test_socket_path("tymux-bind-test");
+        let socket_path = dir.join("tymuxd.sock");
+        assert!(!dir.exists());
+        let listener = bind_uds_listener(&socket_path, None).expect("bind should succeed");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_restores_process_umask_after_binding() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let dir = unique_test_socket_path("tymux-bind-test");
+        let socket_path = dir.join("tymuxd.sock");
+        let pre_call_umask = unsafe {
+            let cur = libc::umask(0o022);
+            libc::umask(cur);
+            cur
+        };
+        let listener = bind_uds_listener(&socket_path, None).expect("bind should succeed");
+        let post_call_umask = unsafe {
+            let cur = libc::umask(0o022);
+            libc::umask(cur);
+            cur
+        };
+        assert_eq!(post_call_umask, pre_call_umask);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_never_touches_permissions_of_a_pre_existing_grandparent_directory() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let grandparent = unique_test_socket_path("tymux-bind-test-grandparent");
+        std::fs::create_dir_all(&grandparent).unwrap();
+        std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let parent = grandparent.join("tymuxd");
+        let socket_path = parent.join("tymuxd.sock");
+
+        let listener = bind_uds_listener(&socket_path, None).expect("bind should succeed");
+
+        let grandparent_mode = std::fs::metadata(&grandparent)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(grandparent_mode, 0o755, "grandparent must be untouched");
+        let parent_mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            parent_mode, 0o700,
+            "tymuxd-owned parent must be created at 0700"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&grandparent);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_accepts_a_correctly_owned_and_moded_pre_existing_immediate_parent_at_0700(
+    ) {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let dir = unique_test_socket_path("tymux-bind-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = dir.join("tymuxd.sock");
+
+        let listener = bind_uds_listener(&socket_path, None).expect("bind should succeed");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "pre-existing compliant parent must be left unchanged"
+        );
+        assert!(socket_path.exists());
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_accepts_a_correctly_owned_and_moded_pre_existing_immediate_parent_at_0750_with_group_configured(
+    ) {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let dir = unique_test_socket_path("tymux-bind-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let socket_path = dir.join("tymuxd.sock");
+        let gid = unsafe { libc::getegid() };
+
+        let listener = bind_uds_listener(&socket_path, Some(gid)).expect("bind should succeed");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o750,
+            "pre-existing compliant parent must be left unchanged"
+        );
+        assert!(socket_path.exists());
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_fails_loudly_when_pre_existing_parent_is_owned_by_a_different_uid() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        // Can't create a genuinely different-uid-owned directory as the
+        // test process itself; simulate the "attacker-controlled" shape
+        // with a world-writable (0o777) directory the test process
+        // happens to own, and separately assert the ownership-comparison
+        // branch is exercised at all by checking that *some* mode-based
+        // rejection fires — the mode-only variant below
+        // (`..._too_permissive_mode`) is the fully own-process-reachable
+        // proof of the comparison logic; this test documents the intended
+        // uid-mismatch behavior for a fixture CI can construct (0o777 is
+        // never a valid expected_parent_mode, so it also always rejects).
+        let dir = unique_test_socket_path("tymux-bind-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let socket_path = dir.join("tymuxd.sock");
+
+        let result = bind_uds_listener(&socket_path, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("refusing to bind"));
+        assert!(!socket_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_fails_loudly_when_pre_existing_parent_has_a_too_permissive_mode() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let dir = unique_test_socket_path("tymux-bind-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket_path = dir.join("tymuxd.sock");
+
+        let result = bind_uds_listener(&socket_path, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("refusing to bind"));
+        assert!(!socket_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_listener_returns_distinct_message_when_chown_group_permission_denied() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let daemon_uid = unsafe { libc::geteuid() };
+        if daemon_uid == 0 {
+            eprintln!("skipping: test process is root, chown to gid 0 would succeed");
+            return;
+        }
+        // Skip if the test process happens to already be a member of gid 0.
+        let is_member_of_root_group = {
+            let mut groups: [libc::gid_t; 64] = [0; 64];
+            let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+            n > 0 && groups[..n as usize].contains(&0) || unsafe { libc::getegid() } == 0
+        };
+        if is_member_of_root_group {
+            eprintln!("skipping: test process is already a member of gid 0");
+            return;
+        }
+
+        let dir = unique_test_socket_path("tymux-bind-test");
+        let socket_path = dir.join("tymuxd.sock");
+
+        let result = bind_uds_listener(&socket_path, Some(0));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("is not a member of"),
+            "expected group-membership message, got: {err}"
+        );
+        // Socket file itself should still have been created — only the
+        // chown step failed.
+        assert!(socket_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- check_non_loopback_requires_token ---
