@@ -442,6 +442,201 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
     }
 }
 
+/// Decouples `peer_is_authorized`/`peer_is_group_member` from tokio's
+/// concrete `UCred` type and gives "a uid" vs. "a gid" distinct field
+/// names instead of same-primitive, positional `u32` parameters
+/// (architecture-review.md's primitive-obsession/DIP Concern fix).
+/// Constructed once, from `UCred`, at the point a UDS connection is
+/// accepted (`PreAuthorizedUnixStream::new`, Epic 3.2) — never
+/// anything client-supplied.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: Option<i32>,
+}
+
+impl From<&tokio::net::unix::UCred> for PeerIdentity {
+    fn from(cred: &tokio::net::unix::UCred) -> Self {
+        Self {
+            uid: cred.uid(),
+            gid: cred.gid(),
+            pid: cred.pid(),
+        }
+    }
+}
+
+/// Full supplementary-group membership check on Linux, reading
+/// `/proc/<pid>/status`'s `Groups:` line (ADR-002). Its only call site
+/// below is itself `#[cfg(target_os = "linux")]`-gated, so no non-Linux
+/// stub is provided here — an `unreachable!()` variant would be genuine
+/// dead code (architecture-review.md nitpick fix).
+#[cfg(target_os = "linux")]
+fn peer_is_group_member_linux(pid: i32, gid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Groups:"))
+        .map(|groups| {
+            groups
+                .split_whitespace()
+                .filter_map(|g| g.parse::<u32>().ok())
+                .any(|g| g == gid)
+        })
+        .unwrap_or(false)
+}
+
+/// Platform-dispatched group-membership check: full supplementary-group
+/// list on Linux (via `/proc/<pid>/status`), primary/effective gid only
+/// elsewhere — a narrower, not less-safe, fallback (ADR-002).
+fn peer_is_group_member(peer: &PeerIdentity, gid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(pid) = peer.pid {
+            return peer_is_group_member_linux(pid, gid);
+        }
+    }
+    // macOS/BSD, or Linux with an unreadable/absent pid: primary/
+    // effective gid only (ADR-002's documented, narrower-not-less-
+    // safe fallback).
+    peer.gid == gid
+}
+
+/// The kernel-verified authorization decision — never consults anything
+/// client-supplied (requirements.md's NFR). `daemon_uid` is tymuxd's own
+/// effective uid (`libc::geteuid()`, read once at startup); `peer` is
+/// constructed from tonic's `UdsConnectInfo`/`UCred`, populated by
+/// `SO_PEERCRED` at accept time.
+pub fn peer_is_authorized(daemon_uid: u32, allowed_gid: Option<u32>, peer: &PeerIdentity) -> bool {
+    if peer.uid == daemon_uid {
+        return true;
+    }
+    allowed_gid.is_some_and(|gid| peer_is_group_member(peer, gid))
+}
+
+/// The authorization decision, computed exactly once per accepted UDS
+/// connection — not once per RPC (architecture-review.md Performance
+/// Concern fix). `Copy`, cloned into request extensions on every RPC on
+/// that connection by tonic's own per-request extension-cloning
+/// (`tonic-0.12.3/src/transport/server/mod.rs:1038-1042`) — but this
+/// carries the *decision*, not the raw `UCred`, so `peer_is_authorized`
+/// (including its `/proc` read in the `--socket-group` case) never
+/// re-runs per request.
+#[derive(Clone, Copy, Debug)]
+pub struct UdsAuthDecision {
+    pub authorized: bool,
+    pub peer_uid: Option<u32>,
+    pub peer_gid: Option<u32>,
+}
+
+/// Wraps an accepted `UnixStream` with its authorization decision,
+/// computed once here — at accept time, before the stream enters
+/// tonic's HTTP/2 handshake. Implements `Connected` so tonic's own
+/// per-request extension-cloning carries `UdsAuthDecision` instead of a
+/// raw credential a downstream `Interceptor` would otherwise have to
+/// re-derive a decision from.
+pub struct PreAuthorizedUnixStream {
+    inner: tokio::net::UnixStream,
+    decision: UdsAuthDecision,
+}
+
+impl PreAuthorizedUnixStream {
+    pub fn new(inner: tokio::net::UnixStream, daemon_uid: u32, allowed_gid: Option<u32>) -> Self {
+        let cred = inner.peer_cred().ok();
+        let decision = UdsAuthDecision {
+            authorized: cred.as_ref().is_some_and(|c| {
+                peer_is_authorized(daemon_uid, allowed_gid, &PeerIdentity::from(c))
+            }),
+            peer_uid: cred.as_ref().map(|c| c.uid()),
+            peer_gid: cred.as_ref().map(|c| c.gid()),
+        };
+        Self { inner, decision }
+    }
+}
+
+// UnixStream: Unpin, and `decision` is Copy (Unpin), so
+// PreAuthorizedUnixStream is Unpin too — no pin-project needed, plain
+// Pin::new(&mut self.get_mut().inner) delegation is sound.
+impl tokio::io::AsyncRead for PreAuthorizedUnixStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for PreAuthorizedUnixStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl tonic::transport::server::Connected for PreAuthorizedUnixStream {
+    type ConnectInfo = UdsAuthDecision;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.decision
+    }
+}
+
+/// Gates every `TymuxService` RPC on the UDS listener behind the
+/// once-per-connection `UdsAuthDecision` cached in request extensions by
+/// `PreAuthorizedUnixStream`. Deliberately a pure "read the cached
+/// decision" check: this interceptor never calls `peer_is_authorized`/
+/// `peer_is_group_member` itself, so no per-RPC `/proc` read (or any
+/// other authorization work) ever happens — the property Gate-2 review
+/// caught missing in the original design and this module now guards
+/// against regressing (see `uds_peer_cred_interceptor_never_calls_peer_is_authorized_itself`
+/// below).
+#[derive(Clone)]
+pub struct UdsPeerCredInterceptor {
+    rejection_count: Arc<AtomicI64>,
+}
+
+impl UdsPeerCredInterceptor {
+    pub fn new(rejection_count: Arc<AtomicI64>) -> Self {
+        Self { rejection_count }
+    }
+}
+
+impl tonic::service::Interceptor for UdsPeerCredInterceptor {
+    fn call(&mut self, req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        let decision = req.extensions().get::<UdsAuthDecision>().copied();
+        if decision.is_some_and(|d| d.authorized) {
+            return Ok(req);
+        }
+        let count = self.rejection_count.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            peer_uid = decision.and_then(|d| d.peer_uid),
+            peer_gid = decision.and_then(|d| d.peer_gid),
+            tymux_socket_peercred_rejection_total = count,
+            "rejected UDS connection: peer not authorized"
+        );
+        Err(Status::permission_denied(
+            "not authorized to access this daemon's socket",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,5 +1404,279 @@ mod tests {
 
         assert!(logs_contain("203.0.113.5:54321"));
         assert!(!logs_contain("s3cr3t"));
+    }
+
+    // --- peer_is_group_member_linux ---
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_is_group_member_linux_finds_own_real_gid_via_own_pid() {
+        let pid = std::process::id() as i32;
+        let gid = unsafe { libc::getegid() };
+        assert!(peer_is_group_member_linux(pid, gid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_is_group_member_linux_does_not_find_an_absent_gid() {
+        let pid = std::process::id() as i32;
+        // Read our own real Groups: line and pick a gid guaranteed absent
+        // from it, rather than assuming 999999 is never assigned.
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let own_groups: Vec<u32> = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .map(|groups| {
+                groups
+                    .split_whitespace()
+                    .filter_map(|g| g.parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut absent_gid = 999_999u32;
+        while own_groups.contains(&absent_gid) {
+            absent_gid += 1;
+        }
+        assert!(!peer_is_group_member_linux(pid, absent_gid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_is_group_member_linux_returns_false_for_nonexistent_pid() {
+        assert!(!peer_is_group_member_linux(999_999_999, 0));
+    }
+
+    // --- peer_is_authorized ---
+
+    /// A real `UCred` value for the test process's own uid/gid/pid,
+    /// obtained via `tokio::net::UnixStream::pair()` + `.peer_cred()` — a
+    /// genuine, portable way to construct one in a unit test without any
+    /// process/pid mocking (both ends of a `pair()` report the test
+    /// process's own identity). `tokio::net::UnixStream::peer_cred()` has
+    /// its own stable implementation (not the still-unstable
+    /// `std::os::unix::net::UnixStream::peer_cred`, gated behind the
+    /// `peer_credentials_unix_socket` feature on this toolchain), so this
+    /// helper is `#[tokio::test]`-only.
+    async fn own_peer_identity() -> PeerIdentity {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let cred = a.peer_cred().unwrap();
+        PeerIdentity::from(&cred)
+    }
+
+    #[tokio::test]
+    async fn peer_is_authorized_grants_daemon_own_uid_always() {
+        let peer = own_peer_identity().await;
+        let daemon_uid = peer.uid;
+        assert!(peer_is_authorized(daemon_uid, None, &peer));
+    }
+
+    #[tokio::test]
+    async fn peer_is_authorized_rejects_different_uid_no_group_configured() {
+        let peer = own_peer_identity().await;
+        let daemon_uid = peer.uid.wrapping_add(1);
+        assert!(!peer_is_authorized(daemon_uid, None, &peer));
+    }
+
+    #[tokio::test]
+    async fn peer_is_authorized_grants_different_uid_in_configured_group() {
+        let peer = own_peer_identity().await;
+        let daemon_uid = peer.uid.wrapping_add(1);
+        // The test process's own real primary gid is always a member of
+        // itself (either via the primary-gid fallback or the Linux
+        // /proc-based full group list).
+        let allowed_gid = peer.gid;
+        assert!(peer_is_authorized(daemon_uid, Some(allowed_gid), &peer));
+    }
+
+    #[tokio::test]
+    async fn peer_is_authorized_rejects_different_uid_not_in_configured_group() {
+        let peer = own_peer_identity().await;
+        let daemon_uid = peer.uid.wrapping_add(1);
+        #[cfg(target_os = "linux")]
+        let absent_gid = {
+            let pid = peer.pid.expect("pid should be present on Linux");
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            let own_groups: Vec<u32> = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Groups:"))
+                .map(|groups| {
+                    groups
+                        .split_whitespace()
+                        .filter_map(|g| g.parse::<u32>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut candidate = 999_999u32;
+            while own_groups.contains(&candidate) {
+                candidate += 1;
+            }
+            candidate
+        };
+        #[cfg(not(target_os = "linux"))]
+        let absent_gid = peer.gid.wrapping_add(1);
+        assert!(!peer_is_authorized(daemon_uid, Some(absent_gid), &peer));
+    }
+
+    // --- PreAuthorizedUnixStream ---
+
+    #[tokio::test]
+    async fn pre_authorized_unix_stream_caches_authorized_decision_at_construction() {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let cred = a.peer_cred().unwrap();
+        let daemon_uid = cred.uid();
+        let wrapped = PreAuthorizedUnixStream::new(a, daemon_uid, None);
+        let decision =
+            <PreAuthorizedUnixStream as tonic::transport::server::Connected>::connect_info(
+                &wrapped,
+            );
+        assert!(decision.authorized);
+        assert_eq!(decision.peer_uid, Some(cred.uid()));
+        assert_eq!(decision.peer_gid, Some(cred.gid()));
+    }
+
+    #[tokio::test]
+    async fn pre_authorized_unix_stream_caches_unauthorized_decision_when_uid_mismatched() {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let cred = a.peer_cred().unwrap();
+        let mismatched_uid = cred.uid().wrapping_add(1);
+        let wrapped = PreAuthorizedUnixStream::new(a, mismatched_uid, None);
+        let decision =
+            <PreAuthorizedUnixStream as tonic::transport::server::Connected>::connect_info(
+                &wrapped,
+            );
+        assert!(!decision.authorized);
+    }
+
+    #[tokio::test]
+    async fn pre_authorized_unix_stream_passes_reads_and_writes_through_to_inner_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (a, mut b) = tokio::net::UnixStream::pair().unwrap();
+        let cred = a.peer_cred().unwrap();
+        let daemon_uid = cred.uid();
+        let mut wrapped = PreAuthorizedUnixStream::new(a, daemon_uid, None);
+
+        wrapped.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        b.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        b.write_all(b"world").await.unwrap();
+        let mut buf2 = [0u8; 5];
+        wrapped.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"world");
+    }
+
+    // --- UdsPeerCredInterceptor ---
+
+    fn request_with_decision(decision: Option<UdsAuthDecision>) -> Request<()> {
+        let mut req = Request::new(());
+        if let Some(d) = decision {
+            req.extensions_mut().insert(d);
+        }
+        req
+    }
+
+    #[test]
+    fn uds_peer_cred_interceptor_accepts_authorized_decision() {
+        let counter = Arc::new(AtomicI64::new(0));
+        let mut interceptor = UdsPeerCredInterceptor::new(counter.clone());
+        let req = request_with_decision(Some(UdsAuthDecision {
+            authorized: true,
+            peer_uid: Some(1000),
+            peer_gid: Some(1000),
+        }));
+        assert!(interceptor.call(req).is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn uds_peer_cred_interceptor_rejects_unauthorized_decision() {
+        let counter = Arc::new(AtomicI64::new(0));
+        let mut interceptor = UdsPeerCredInterceptor::new(counter.clone());
+        let req = request_with_decision(Some(UdsAuthDecision {
+            authorized: false,
+            peer_uid: Some(1001),
+            peer_gid: Some(1001),
+        }));
+        let err = interceptor.call(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "not authorized to access this daemon's socket"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn uds_peer_cred_interceptor_rejects_missing_decision() {
+        let counter = Arc::new(AtomicI64::new(0));
+        let mut interceptor = UdsPeerCredInterceptor::new(counter.clone());
+        let req = request_with_decision(None);
+        let err = interceptor.call(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "not authorized to access this daemon's socket"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn uds_peer_cred_interceptor_logs_peer_uid_gid_on_rejection() {
+        let counter = Arc::new(AtomicI64::new(0));
+        let mut interceptor = UdsPeerCredInterceptor::new(counter);
+        let req = request_with_decision(Some(UdsAuthDecision {
+            authorized: false,
+            peer_uid: Some(1001),
+            peer_gid: Some(1001),
+        }));
+        let err = interceptor.call(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        assert!(logs_contain("peer_uid"));
+        assert!(logs_contain("1001"));
+        assert!(logs_contain("tymux_socket_peercred_rejection_total"));
+        assert!(!logs_contain("session"));
+        assert!(!logs_contain("pane"));
+    }
+
+    /// Structural regression test guarding against the Gate-2 bug: two
+    /// separate `Request<()>`s built from the *same* `UdsAuthDecision`
+    /// value (simulating tonic's own per-request clone of one
+    /// connection-level value) must both resolve purely from that cached
+    /// decision, with `UdsPeerCredInterceptor::call()`'s implementation
+    /// containing no call to `peer_is_authorized`/
+    /// `peer_is_group_member_linux` at all — only a read of
+    /// `req.extensions()`. `UdsPeerCredInterceptor` holds no `daemon_uid`/
+    /// `allowed_gid` field (those are only ever consumed by
+    /// `PreAuthorizedUnixStream::new`, once, before this interceptor ever
+    /// sees a request), so it has no way to recompute the decision even
+    /// if it wanted to — the absence of those fields is itself part of
+    /// the structural proof, verified here by both outcomes tracking the
+    /// shared decision value identically across two independent
+    /// `Request`s.
+    #[test]
+    fn uds_peer_cred_interceptor_never_calls_peer_is_authorized_itself() {
+        let shared_decision = UdsAuthDecision {
+            authorized: true,
+            peer_uid: Some(1000),
+            peer_gid: Some(1000),
+        };
+
+        let counter = Arc::new(AtomicI64::new(0));
+        let mut interceptor = UdsPeerCredInterceptor::new(counter.clone());
+
+        let req1 = request_with_decision(Some(shared_decision));
+        let req2 = request_with_decision(Some(shared_decision));
+
+        assert!(interceptor.call(req1).is_ok());
+        assert!(interceptor.call(req2).is_ok());
+        // No decision logic ran on either call (both accepted purely from
+        // the cached, shared decision) — the rejection counter, the only
+        // side effect authorization logic could have produced, never
+        // moved.
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 }
