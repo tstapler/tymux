@@ -13,6 +13,7 @@ import { runAttachDemo } from "../examples/attach.js";
 import { tymuxClient } from "../examples/client.js";
 import { capturePane } from "../examples/capture-pane.js";
 import { startDaemon, type TestDaemon } from "./daemon.js";
+import { attachListeningDiagnostic, diagLog, diagLogPaths, logListenError, startListenHeartbeat } from "./listen-diagnostics.js";
 
 let daemon: TestDaemon;
 let client: ReturnType<typeof createClient<typeof TymuxService>>;
@@ -395,13 +396,28 @@ async function withSocketPathEnv<T>(value: string, fn: () => Promise<T>): Promis
 }
 
 test("tymuxClient() dials the resolved Unix socket first when it's reachable", async () => {
+  const DIAG = "integration:uds-first";
   const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-first-"));
   const socketPath = join(stateDir, "tymuxd.sock");
+  diagLogPaths(DIAG, stateDir, socketPath);
   const udsServer = http2.createServer(connectNodeAdapter({ routes: stubTymuxServer() }));
-  await new Promise<void>((resolve, reject) => {
-    udsServer.once("error", reject);
-    udsServer.listen(socketPath, resolve);
-  });
+  attachListeningDiagnostic(udsServer, DIAG);
+  const stopHeartbeat = startListenHeartbeat(DIAG);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      udsServer.once("error", (err: NodeJS.ErrnoException) => {
+        logListenError(DIAG, err);
+        reject(err);
+      });
+      diagLog(DIAG, `calling .listen(${JSON.stringify(socketPath)}, callback)`);
+      udsServer.listen(socketPath, () => {
+        diagLog(DIAG, "listen() callback fired");
+        resolve();
+      });
+    });
+  } finally {
+    stopHeartbeat();
+  }
 
   const originalError = console.error;
   const errors: unknown[] = [];
