@@ -1175,7 +1175,9 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // --- socket-path-fixtures.json loading (shared with tymuxd, the Go
-    // and TS clients — see plan.md Task 1.1.1b / 6.1.1b) ---
+    // and TS clients — see plan.md Task 1.1.1b / 6.1.1b; lives in testdata/
+    // at the repo root, not project_plans/, since two of the four consumers
+    // read it via include_str! at compile time) ---
 
     #[derive(serde::Deserialize)]
     struct DefaultPathCase {
@@ -1191,7 +1193,7 @@ mod tests {
     }
 
     const SOCKET_PATH_FIXTURES_JSON: &str =
-        include_str!("../../../project_plans/unix-socket-auth/socket-path-fixtures.json");
+        include_str!("../../../testdata/unix-socket-auth/socket-path-fixtures.json");
 
     fn load_socket_path_fixtures() -> SocketPathFixtures {
         serde_json::from_str(SOCKET_PATH_FIXTURES_JSON)

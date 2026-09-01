@@ -20,8 +20,10 @@ import (
 // fixturesPath is the shared, language-agnostic fixture file every
 // implementation's test suite reads from rather than hand-typing its own
 // table (architecture-review.md's test-duplication-drift Concern fix; see
-// plan.md Pattern Decisions row 10 and validation.md row R2).
-const fixturesPath = "../../../project_plans/unix-socket-auth/socket-path-fixtures.json"
+// plan.md Pattern Decisions row 10 and validation.md row R2). It lives in
+// testdata/ at the repo root, not project_plans/, since two of the four
+// consumers read it via include_str! at Rust compile time.
+const fixturesPath = "../../../testdata/unix-socket-auth/socket-path-fixtures.json"
 
 type socketPathFixtures struct {
 	DefaultPathCases []struct {

@@ -7,9 +7,11 @@ import { defaultSocketPath, resolveSocketPath } from "../examples/client.js";
 // Shared cross-language fixture (Phase 1, commit 5537fa6) — see
 // architecture-review.md's test-duplication-drift Concern fix: every
 // implementation's test suite reads this one file rather than
-// independently hand-typing the same Given/When/Then cases.
+// independently hand-typing the same Given/When/Then cases. It lives in
+// testdata/ at the repo root, not project_plans/, since two of the four
+// consumers read it via include_str! at Rust compile time.
 const FIXTURES_PATH = fileURLToPath(
-  new URL("../../../project_plans/unix-socket-auth/socket-path-fixtures.json", import.meta.url),
+  new URL("../../../testdata/unix-socket-auth/socket-path-fixtures.json", import.meta.url),
 );
 
 interface DefaultPathCase {
