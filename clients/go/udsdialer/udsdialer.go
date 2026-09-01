@@ -81,7 +81,7 @@ func newTCPClient(baseURL, token string) tymuxv1connect.TymuxServiceClient {
 		Transport: &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				return net.Dial(network, addr)
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
 			},
 		},
 	}

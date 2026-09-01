@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -158,4 +159,60 @@ func TestDialUnixHTTPClientRoundTripsListSessions(t *testing.T) {
 	if got := len(resp.Msg.GetSessions()); got != 0 {
 		t.Fatalf("expected 0 sessions from the fake service, got %d", got)
 	}
+}
+
+// TestDialWithFallback covers DialWithFallback's two branches, most
+// importantly the security-critical one: a syscall.EACCES probe-dial error
+// (a daemon IS listening but the kernel denied this connect()) must hard-fail
+// and never fall back to the unauthenticated TCP path. This is the Go
+// sibling of tymux-cli's dial_channel_hard_errors_and_never_dials_tcp_when_uds_permission_denied
+// (crates/tymux-cli/src/main.rs) and clients/ts's equivalent coverage in
+// test/integration.test.ts — DialWithFallback itself had zero test coverage
+// before this (code-review CRITICAL finding on PR #44).
+func TestDialWithFallback(t *testing.T) {
+	t.Run("EACCES hard-fails and never falls back to TCP", func(t *testing.T) {
+		socketPath := filepath.Join(t.TempDir(), "tymuxd.sock")
+		listener, err := net.Listen("unix", socketPath)
+		if err != nil {
+			t.Fatalf("net.Listen(unix, %s): %v", socketPath, err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+
+		if err := os.Chmod(socketPath, 0o000); err != nil {
+			t.Fatalf("chmod %s 0o000: %v", socketPath, err)
+		}
+
+		t.Setenv("TYMUXD_SOCKET_PATH", socketPath)
+
+		client, err := DialWithFallback("test-token")
+		if err == nil {
+			t.Fatal("DialWithFallback returned nil error for a permission-denied socket; " +
+				"want a hard failure, never a silent TCP fallback")
+		}
+		if client != nil {
+			t.Fatalf("DialWithFallback returned a non-nil client alongside an error: %v", client)
+		}
+
+		const wantRemedy = "not authorized to access this daemon's socket"
+		if !strings.Contains(err.Error(), wantRemedy) {
+			t.Fatalf("DialWithFallback error = %q, want it to contain the documented remedy %q "+
+				"(proving this is the EACCES hard-fail path, not a fallback)", err.Error(), wantRemedy)
+		}
+		if !strings.Contains(err.Error(), "--socket-group") {
+			t.Fatalf("DialWithFallback error = %q, want it to mention --socket-group", err.Error())
+		}
+	})
+
+	t.Run("missing socket falls back to TCP client", func(t *testing.T) {
+		socketPath := filepath.Join(t.TempDir(), "does-not-exist.sock")
+		t.Setenv("TYMUXD_SOCKET_PATH", socketPath)
+
+		client, err := DialWithFallback("test-token")
+		if err != nil {
+			t.Fatalf("DialWithFallback with no socket present: unexpected error: %v", err)
+		}
+		if client == nil {
+			t.Fatal("DialWithFallback with no socket present returned a nil client")
+		}
+	})
 }
