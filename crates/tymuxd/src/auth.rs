@@ -1010,7 +1010,23 @@ mod tests {
 
     #[test]
     fn resolve_gid_by_name_resolves_root_to_gid_zero() {
-        assert_eq!(resolve_gid_by_name("root"), Some(0));
+        // gid 0 always exists on POSIX, but its group name isn't portable:
+        // Linux names it "root", macOS/BSD name it "wheel". Resolve the
+        // real name for gid 0 on this platform via getgrgid(3) rather than
+        // hardcoding "root" (confirmed via CI: this hardcoded assumption
+        // failed on macos-latest with a None result).
+        let gid0_name = unsafe {
+            let grp = libc::getgrgid(0);
+            assert!(
+                !grp.is_null(),
+                "gid 0 must resolve to some group on any POSIX system"
+            );
+            std::ffi::CStr::from_ptr((*grp).gr_name)
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(resolve_gid_by_name(&gid0_name), Some(0));
     }
 
     #[test]
@@ -1054,8 +1070,19 @@ mod tests {
 
     // --- acquire_socket_lock / SocketLockGuard ---
 
+    // Built directly under /tmp with a short pid+counter suffix, not
+    // std::env::temp_dir()+a full UUID -- macOS's SUN_LEN (~104 bytes) is
+    // shorter than Linux's, and macOS CI runners' actual $TMPDIR
+    // (/var/folders/<hash>/T/) combined with a 36-character UUID reliably
+    // overflowed it, causing every test using this helper to fail with an
+    // opaque bind/connect error (confirmed via CI: 15 tests across this
+    // file and main.rs failed simultaneously on macos-latest until this
+    // fix landed). Matches tymux-cli's own `temp_socket_path` fix for the
+    // identical bug.
     fn unique_test_socket_path(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::path::PathBuf::from(format!("/tmp/{prefix}-{}-{n}", std::process::id()))
     }
 
     #[test]

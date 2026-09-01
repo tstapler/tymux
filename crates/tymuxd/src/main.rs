@@ -1725,8 +1725,17 @@ mod tests {
         daemon_uid: u32,
         allowed_gid: Option<u32>,
     ) -> TymuxServiceClient<tonic::transport::Channel> {
-        let socket_path =
-            std::env::temp_dir().join(format!("tymux-uds-test-{}.sock", Uuid::new_v4()));
+        // Built directly under /tmp with a short pid+counter suffix, not
+        // std::env::temp_dir()+a UUID -- macOS's shorter SUN_LEN overflows
+        // when combined with a long $TMPDIR + a 36-character UUID (matches
+        // the same fix already applied to auth.rs's unique_test_socket_path
+        // and tymux-cli's temp_socket_path for the identical bug).
+        static SOCKET_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SOCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/tymux-uds-test-{}-{n}.sock",
+            std::process::id()
+        ));
         let listener = tokio::net::UnixListener::bind(&socket_path)
             .expect("should bind a fresh temp UDS path");
         let rejection_count = Arc::new(AtomicI64::new(0));
