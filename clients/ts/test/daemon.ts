@@ -23,8 +23,16 @@ function resolveBinary(): string {
 
 export interface TestDaemon {
   addr: string;
-  stop(): void;
+  stop(): Promise<void>;
 }
+
+// Bounded wait for stop() below: long enough to cover the daemon's own
+// graceful-shutdown drain (flushing session state, releasing its socket
+// lock -- see the Rust lifecycle tests' comments on that path), short
+// enough that a genuinely hung daemon doesn't turn into a full test-runner
+// timeout on top of its real failure. Mirrors clients/go's startDaemonOn
+// t.Cleanup (10s wait then SIGKILL) and Rust's Drop impl (child.wait()).
+const STOP_TIMEOUT_MS = 5_000;
 
 export interface StartDaemonOptions {
   // When set, binds tymuxd to 0.0.0.0 on an ephemeral port instead of the
@@ -108,8 +116,27 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Tes
 
   return {
     addr: `http://${connectHost}:${port}`,
-    stop() {
+    async stop() {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        rmSync(stateDir, { recursive: true, force: true });
+        return;
+      }
+
+      const exited = new Promise<void>((resolve) => {
+        child.once("exit", () => resolve());
+      });
+
       child.kill("SIGTERM");
+
+      const timedOut = await Promise.race([
+        exited.then(() => false),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(true), STOP_TIMEOUT_MS)),
+      ]);
+      if (timedOut) {
+        child.kill("SIGKILL");
+        await exited;
+      }
+
       rmSync(stateDir, { recursive: true, force: true });
     },
   };

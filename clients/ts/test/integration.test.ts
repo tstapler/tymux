@@ -22,8 +22,8 @@ before(async () => {
   client = createClient(TymuxService, createGrpcTransport({ baseUrl: daemon.addr }));
 });
 
-after(() => {
-  daemon.stop();
+after(async () => {
+  await daemon.stop();
 });
 
 // Story 7.2 AC1: unary RPC round-trip end-to-end through the generated client.
@@ -83,7 +83,7 @@ test("listSessions rejects a missing/wrong token", async () => {
     const unauthedClient = await tymuxClient(tokenDaemon.addr);
     await assert.rejects(() => unauthedClient.listSessions({}), assertUnauthenticated);
   } finally {
-    tokenDaemon.stop();
+    await tokenDaemon.stop();
   }
 });
 
@@ -95,7 +95,7 @@ test("listSessions succeeds with the correct token", async () => {
     const listed = await authedClient.listSessions({});
     assert.ok(Array.isArray(listed.sessions), "listSessions should succeed and return a sessions array");
   } finally {
-    tokenDaemon.stop();
+    await tokenDaemon.stop();
   }
 });
 
@@ -116,7 +116,7 @@ test("attach rejects a missing/wrong token", async () => {
       assertUnauthenticated,
     );
   } finally {
-    tokenDaemon.stop();
+    await tokenDaemon.stop();
   }
 });
 
@@ -135,7 +135,7 @@ test("attach succeeds with the correct token", async () => {
     const { output } = await runAttachDemo(paneId, { baseUrl: tokenDaemon.addr, token: AUTH_TOKEN });
     assert.ok(output.includes("tymux-ts-marker-output"), "attach should observe the command's real output");
   } finally {
-    tokenDaemon.stop();
+    await tokenDaemon.stop();
   }
 });
 
@@ -511,7 +511,7 @@ test("tymuxClient() dials a real tymuxd over UDS and round-trips a session (same
       assert.ok(found, "a session created over the real UDS listener should appear in listSessions over the same socket");
     });
   } finally {
-    udsDaemon.stop();
+    await udsDaemon.stop();
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
@@ -570,7 +570,7 @@ test(
       assert.notEqual(exitCode, 0, "a genuinely different uid must not be able to connect to the daemon's UDS socket");
       assert.match(stdout, /ERROR:EACCES/, "the kernel must deny connect() with EACCES for a non-owning uid");
     } finally {
-      udsDaemon.stop();
+      await udsDaemon.stop();
       rmSync(stateDir, { recursive: true, force: true });
     }
   },
