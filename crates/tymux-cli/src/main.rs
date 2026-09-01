@@ -1338,6 +1338,7 @@ mod tests {
     struct TokenGatedDaemon {
         child: std::process::Child,
         state_dir: std::path::PathBuf,
+        socket_dir: std::path::PathBuf,
         addr: String,
     }
 
@@ -1346,6 +1347,7 @@ mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
             std::fs::remove_dir_all(&self.state_dir).ok();
+            std::fs::remove_dir_all(&self.socket_dir).ok();
         }
     }
 
@@ -1368,11 +1370,45 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&state_dir).unwrap();
+        // Every other real-subprocess test helper in this workspace
+        // (`daemon_startup.rs`'s `short_unique_socket_path`,
+        // `uds_socket_lifecycle.rs`, `uds_integration.rs`) gives its spawned
+        // `tymuxd` a unique `TYMUXD_SOCKET_PATH`. This helper didn't — so
+        // every concurrently-spawned instance fell back to the same
+        // uid-scoped *default* UDS socket path (`default_uds_socket_path`,
+        // `crates/tymuxd/src/auth.rs`), and `acquire_socket_lock`'s flock
+        // guarantees only one of them can ever win it. Confirmed directly
+        // (not guessed): spawning 10 `tymuxd` processes concurrently without
+        // this env var reproduced 9/10 dying immediately with "another
+        // tymuxd is already starting against .../tymuxd.sock" — this is the
+        // dominant, near-deterministic cause of this suite's CI flake, far
+        // more so than the (also real, and separately guarded against by
+        // `spawn_token_gated_daemon_and_wait`'s retry) ephemeral-TCP-port
+        // TOCTOU race from the probe above.
+        //
+        // The socket's parent directory deliberately does NOT already
+        // exist (and is NOT nested under `state_dir`, which this test
+        // already pre-created at a default, non-0700 mode): `tymuxd`'s own
+        // `ensure_socket_parent_dir` refuses to bind into a pre-existing
+        // parent directory unless it's already owned by the daemon's own
+        // uid at exactly mode 0700 (`crates/tymuxd/src/auth.rs`) — a
+        // pre-created directory at the wrong mode is fatal, not silently
+        // reused. Confirmed the hard way: nesting the socket inside
+        // `state_dir` made every single spawn fail deterministically with
+        // "refusing to bind Unix socket ... expected mode 700". Leaving
+        // this directory unmade lets `bind_uds_listener` create it itself
+        // at the correct mode.
+        let socket_dir = std::env::temp_dir().join(format!(
+            "tymux-cli-bearer-auth-sock-{}-{port}",
+            std::process::id()
+        ));
+        let socket_path = socket_dir.join("s.sock");
 
         let child = std::process::Command::new(workspace_bin("tymuxd"))
             .env("TYMUXD_ADDR", &bind_addr)
             .env("TYMUXD_TOKEN", token)
             .env("XDG_STATE_HOME", &state_dir)
+            .env("TYMUXD_SOCKET_PATH", &socket_path)
             .env("RUST_LOG", "warn")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1382,6 +1418,7 @@ mod tests {
         TokenGatedDaemon {
             child,
             state_dir,
+            socket_dir,
             addr: connect_addr,
         }
     }
@@ -1408,6 +1445,82 @@ mod tests {
         }
     }
 
+    /// Like `wait_for_daemon`, but also watches `daemon`'s child process:
+    /// if it exits before ever becoming reachable, returns `Err(())`
+    /// immediately instead of spinning out the rest of the deadline. A
+    /// one-shot check right after spawning isn't enough — under the CPU
+    /// contention of several tests spawning real `tymuxd` subprocesses at
+    /// once, a doomed child can easily take longer than a short grace
+    /// period to even attempt its bind and die (confirmed empirically: an
+    /// earlier version of this helper checked `try_wait` once after a
+    /// fixed 300ms pause, and still reliably hit the 30s panic below under
+    /// `cargo test`'s default parallelism, because the child hadn't died
+    /// yet at the 300ms mark). Checking on every poll tick instead catches
+    /// the death as soon as it's observable.
+    async fn wait_for_daemon_or_exit(daemon: &mut TokenGatedDaemon) -> Result<Channel, ()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(channel) =
+                tonic::transport::Endpoint::from_shared(format!("http://{}", daemon.addr))
+                    .unwrap()
+                    .connect()
+                    .await
+            {
+                return Ok(channel);
+            }
+            if matches!(daemon.child.try_wait(), Ok(Some(_))) {
+                return Err(());
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("tymuxd did not become reachable within 30s");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// `spawn_token_gated_daemon`'s ephemeral-port probe is inherently
+    /// TOCTOU-racy: the probe listener that picks the port is dropped
+    /// before the real `tymuxd` child binds it, so any other process
+    /// (including another concurrently-spawning test in this same `cargo
+    /// test` run) can grab that exact port first. When that happens,
+    /// `tymuxd`'s own bind fails and it's fatal by this daemon's design —
+    /// the child exits immediately, and `wait_for_daemon` would otherwise
+    /// spin uselessly against a dead, unreachable process for its whole
+    /// 30s deadline before panicking (confirmed as the actual cause of this
+    /// suite's CI flake: a prior fix that only bumped the timeout 10s->30s
+    /// still failed at the new deadline, on different tests each time — the
+    /// signature of a resource collision, not slowness).
+    ///
+    /// Retries the *entire* spawn (fresh port probe + fresh child) up to
+    /// `MAX_ATTEMPTS` times, but only when the child exits before ever
+    /// becoming reachable — that's the reliable signal of a lost port
+    /// race, as opposed to a daemon that's merely slow to start. The final
+    /// attempt uses plain `wait_for_daemon` with no early-exit check, so a
+    /// genuine failure unrelated to the port race still fails loudly with
+    /// a clear diagnostic rather than being retried forever.
+    async fn spawn_token_gated_daemon_and_wait(token: &str) -> (TokenGatedDaemon, Channel) {
+        const MAX_ATTEMPTS: u32 = 3;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut daemon = spawn_token_gated_daemon(token);
+
+            if attempt < MAX_ATTEMPTS {
+                match wait_for_daemon_or_exit(&mut daemon).await {
+                    Ok(channel) => return (daemon, channel),
+                    // Child exited before becoming reachable: almost
+                    // certainly lost the ephemeral-port race against
+                    // another process. Drop this daemon (kills the
+                    // already-dead child, cleans up its state dir) and
+                    // retry with a fresh port.
+                    Err(()) => continue,
+                }
+            }
+
+            let channel = wait_for_daemon(&daemon.addr).await;
+            return (daemon, channel);
+        }
+        unreachable!("the final attempt always returns instead of retrying")
+    }
+
     /// Task 2.1.2c (plan.md Story 2.1.2 AC1/AC2): a `BearerAuth`-wrapped
     /// client constructed exactly like `run()` constructs its own (Task
     /// 2.1.2b) authenticates successfully against a real, non-loopback,
@@ -1416,8 +1529,8 @@ mod tests {
     /// all.
     #[tokio::test]
     async fn run_lists_sessions_successfully_against_token_gated_daemon_with_correct_token() {
-        let daemon = spawn_token_gated_daemon("s3cr3t-integration-token");
-        let channel = wait_for_daemon(&daemon.addr).await;
+        let (_daemon, channel) =
+            spawn_token_gated_daemon_and_wait("s3cr3t-integration-token").await;
 
         let mut authed_client = TymuxServiceClient::with_interceptor(
             channel.clone(),
@@ -1444,8 +1557,7 @@ mod tests {
     /// Snapshot rather than being rejected or hanging.
     #[tokio::test]
     async fn attach_succeeds_against_token_gated_daemon_with_correct_token() {
-        let daemon = spawn_token_gated_daemon("s3cr3t-attach-token");
-        let channel = wait_for_daemon(&daemon.addr).await;
+        let (_daemon, channel) = spawn_token_gated_daemon_and_wait("s3cr3t-attach-token").await;
 
         let mut client = TymuxServiceClient::with_interceptor(
             channel,
@@ -1496,8 +1608,8 @@ mod tests {
     /// hang risk if rejection ever stopped happening promptly.
     #[tokio::test]
     async fn attach_rejected_against_token_gated_daemon_with_missing_token() {
-        let daemon = spawn_token_gated_daemon("s3cr3t-attach-reject-token");
-        let channel = wait_for_daemon(&daemon.addr).await;
+        let (_daemon, channel) =
+            spawn_token_gated_daemon_and_wait("s3cr3t-attach-reject-token").await;
 
         let mut client =
             TymuxServiceClient::with_interceptor(channel, BearerAuth::new(None).unwrap());
