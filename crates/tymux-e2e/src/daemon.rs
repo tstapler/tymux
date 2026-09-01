@@ -84,10 +84,27 @@ pub fn spawn(tymuxd_bin: &std::path::Path) -> TestDaemon {
         std::process::id()
     ));
     std::fs::create_dir_all(&state_dir).unwrap();
+    // tymuxd unconditionally binds a UDS listener alongside TCP (commit
+    // b44aae1). Without an explicit TYMUXD_SOCKET_PATH, every daemon this
+    // function spawns falls back to the same ambient, uid-scoped default
+    // socket path -- two tests spawning daemons concurrently (this crate's
+    // tests run in parallel by default) then race for the same
+    // acquire_socket_lock flock, and the loser exits immediately, never
+    // becoming reachable. Scope each spawn's socket path inside its own
+    // subdirectory, matching clients/ts's and tymux-cli's own test
+    // harnesses' fix for the identical bug -- nested one level below
+    // state_dir specifically (not placed directly inside it), since
+    // state_dir is already created above via plain create_dir_all (default
+    // mode), and tymuxd's own ensure_socket_parent_dir fatally refuses a
+    // pre-existing socket parent that isn't already at exactly 0700/0750;
+    // a not-yet-existing subdirectory lets tymuxd create it fresh at the
+    // right mode itself.
+    let socket_path = state_dir.join("uds").join("tymuxd.sock");
 
     let child = Command::new(tymuxd_bin)
         .env("TYMUXD_ADDR", &internal_addr)
         .env("XDG_STATE_HOME", &state_dir)
+        .env("TYMUXD_SOCKET_PATH", &socket_path)
         .env("RUST_LOG", "warn")
         // A deterministic prompt for any pane spawning /bin/sh — real
         // terminals never inherit a custom PS1 through tymuxd, but this
@@ -212,7 +229,7 @@ impl TestDaemon {
     /// backend and back, which only succeeds once `tymuxd` is genuinely
     /// serving.
     pub async fn wait_ready(&self) -> TymuxServiceClient<Channel> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(mut client) =
                 TymuxServiceClient::connect(format!("http://{}", self.addr)).await
@@ -226,7 +243,7 @@ impl TestDaemon {
                 }
             }
             if Instant::now() > deadline {
-                panic!("tymuxd did not become reachable within 10s");
+                panic!("tymuxd did not become reachable within 30s");
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
