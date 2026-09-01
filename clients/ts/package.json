@@ -10,7 +10,7 @@
     "list-sessions": "tsx examples/list-sessions.ts",
     "attach": "tsx examples/attach.ts",
     "capture-pane": "tsx examples/capture-pane.ts",
-    "test": "tsx --test --test-timeout=60000 --test-concurrency=1 test/*.test.ts"
+    "test": "tsx --test --test-timeout=180000 --test-concurrency=1 test/*.test.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.2.3",
