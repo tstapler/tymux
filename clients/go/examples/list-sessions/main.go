@@ -7,38 +7,14 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 
 	"connectrpc.com/connect"
-	"golang.org/x/net/http2"
 
-	"github.com/tstapler/tymux/clients/go/authinterceptor"
 	tymuxv1 "github.com/tstapler/tymux/clients/go/gen/tymux/v1"
-	"github.com/tstapler/tymux/clients/go/gen/tymux/v1/tymuxv1connect"
+	"github.com/tstapler/tymux/clients/go/udsdialer"
 )
-
-// tymuxd listens on loopback-only plain HTTP/2 (h2c, no TLS — see the
-// loopback-trust security model ADR), and is a strict gRPC server (tonic),
-// so the client needs an h2c-capable transport and connect.WithGRPC(). token
-// is attached via authinterceptor.Interceptor on every outgoing call; an
-// empty token is a no-op, so this example still works unmodified against a
-// loopback, non-token-gated daemon.
-func newClient(baseURL, token string) tymuxv1connect.TymuxServiceClient {
-	httpClient := &http.Client{
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				return net.Dial(network, addr)
-			},
-		},
-	}
-	return tymuxv1connect.NewTymuxServiceClient(httpClient, baseURL, connect.WithGRPC(),
-		connect.WithInterceptors(authinterceptor.Interceptor{Token: token}))
-}
 
 // flattenPaneIDs walks a window's layout tree in tree order, returning
 // every leaf pane_id — same traversal as list-sessions.ts's flattenPaneIds.
@@ -61,7 +37,11 @@ func flattenPaneIDs(layout *tymuxv1.Layout) []string {
 }
 
 func main() {
-	client := newClient("http://127.0.0.1:7419", os.Getenv("TYMUXD_TOKEN"))
+	client, err := udsdialer.DialWithFallback(os.Getenv("TYMUXD_TOKEN"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	resp, err := client.ListSessions(context.Background(), connect.NewRequest(&tymuxv1.ListSessionsRequest{}))
 	if err != nil {

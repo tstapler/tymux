@@ -23,8 +23,16 @@ function resolveBinary(): string {
 
 export interface TestDaemon {
   addr: string;
-  stop(): void;
+  stop(): Promise<void>;
 }
+
+// Bounded wait for stop() below: long enough to cover the daemon's own
+// graceful-shutdown drain (flushing session state, releasing its socket
+// lock -- see the Rust lifecycle tests' comments on that path), short
+// enough that a genuinely hung daemon doesn't turn into a full test-runner
+// timeout on top of its real failure. Mirrors clients/go's startDaemonOn
+// t.Cleanup (10s wait then SIGKILL) and Rust's Drop impl (child.wait()).
+const STOP_TIMEOUT_MS = 5_000;
 
 export interface StartDaemonOptions {
   // When set, binds tymuxd to 0.0.0.0 on an ephemeral port instead of the
@@ -33,20 +41,45 @@ export interface StartDaemonOptions {
   // 1.2.2b) non-loopback test harnesses. Omit to keep today's
   // loopback/no-token default behavior unchanged.
   token?: string;
+  // Epic 8.3 Task 8.3.1a: when set, sets TYMUXD_SOCKET_PATH in the spawned
+  // process's env so tymuxd binds its UDS listener at a known, caller-
+  // controlled path — mirroring clients/go's `startDaemonWithUDS` (Task
+  // 7.2.1a). When omitted, a path scoped to this call's own stateDir is
+  // used instead of leaving TYMUXD_SOCKET_PATH unset: tymuxd now always
+  // binds a UDS listener alongside TCP (commit b44aae1), so an unset
+  // TYMUXD_SOCKET_PATH would resolve to the ambient, uid-derived default
+  // (auth::default_uds_socket_path) — colliding with a real tymuxd this
+  // machine may already have running, or with a stale socket dir left
+  // behind by one (confirmed: this repo's dev sandbox had exactly such a
+  // leftover /run/user/<uid>/tymuxd/ at test-writing time, which made
+  // every pre-existing integration test fail with tymuxd's own
+  // ensure_socket_parent_dir ownership/mode guard, not a bug in this
+  // feature). Every daemon this harness spawns must be as isolated for
+  // UDS as it already is for TCP (ephemeral port) and state (XDG_STATE_HOME
+  // stateDir).
+  socketPath?: string;
 }
 
 // Spawns a real tymuxd on an ephemeral loopback port, per this repo's own
 // `restart_persistence.rs` pattern of testing against the real binary
 // rather than mocking the daemon. Pass `{ token }` to instead bind
-// non-loopback with bearer-token auth enforced.
+// non-loopback with bearer-token auth enforced. Pass `{ socketPath }` to
+// pin its UDS listener at a known path (Task 8.3.1a); otherwise one is
+// generated inside this call's own isolated stateDir.
 export async function startDaemon(options: StartDaemonOptions = {}): Promise<TestDaemon> {
   const { token } = options;
   const port = 20000 + Math.floor(Math.random() * 20000);
   const bindHost = token ? "0.0.0.0" : "127.0.0.1";
   const addr = `${bindHost}:${port}`;
   const stateDir = mkdtempSync(join(tmpdir(), "tymuxd-ts-test-"));
+  const socketPath = options.socketPath ?? join(stateDir, "tymuxd.sock");
 
-  const env: NodeJS.ProcessEnv = { ...process.env, TYMUXD_ADDR: addr, XDG_STATE_HOME: stateDir };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    TYMUXD_ADDR: addr,
+    XDG_STATE_HOME: stateDir,
+    TYMUXD_SOCKET_PATH: socketPath,
+  };
   if (token) {
     env.TYMUXD_TOKEN = token;
   } else {
@@ -83,8 +116,27 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Tes
 
   return {
     addr: `http://${connectHost}:${port}`,
-    stop() {
+    async stop() {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        rmSync(stateDir, { recursive: true, force: true });
+        return;
+      }
+
+      const exited = new Promise<void>((resolve) => {
+        child.once("exit", () => resolve());
+      });
+
       child.kill("SIGTERM");
+
+      const timedOut = await Promise.race([
+        exited.then(() => false),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(true), STOP_TIMEOUT_MS)),
+      ]);
+      if (timedOut) {
+        child.kill("SIGKILL");
+        await exited;
+      }
+
       rmSync(stateDir, { recursive: true, force: true });
     },
   };

@@ -15,7 +15,7 @@ function flattenPaneIds(layout: Layout | undefined): string[] {
   return [];
 }
 
-const client = tymuxClient();
+const client = await tymuxClient();
 const response = await client.listSessions({});
 for (const session of response.sessions) {
   console.log(`${session.id}\t${session.name}\t${session.liveness}`);

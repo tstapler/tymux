@@ -52,6 +52,7 @@ const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(60);
 /// wait — see `test_daemon_with_intervals`.
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
+#[derive(Clone)]
 pub struct TymuxDaemon {
     engine: Arc<Engine>,
     /// pane_id -> instant its last known `Attach` stream ended without a
@@ -1272,6 +1273,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Unix-socket auth (Epic 4.2): resolve socket path/group/tcp-disable
+    // config and perform the lock -> stale-check -> bind sequence
+    // synchronously, before the TCP listener or Engine/persistence are
+    // ever touched — a UDS bind failure must be fatal to the whole
+    // process, never a silent downgrade to TCP-only (Story 4.2.1). This
+    // block's blocking syscalls (flock, UnixStream::connect probe, umask)
+    // are safe to run inline in this async fn only because nothing has
+    // been tokio::spawn'd yet at this point in startup — no other task
+    // exists on the runtime for them to starve. Revisit with
+    // spawn_blocking if this sequence is ever reused from a live-reload
+    // path or moved after other tasks are running.
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let socket_group_name = auth::resolve_socket_group_name(&args);
+    let allowed_gid = socket_group_name.as_deref().map(|name| {
+        auth::resolve_gid_by_name(name).unwrap_or_else(|| {
+            eprintln!("Error: --socket-group/TYMUXD_SOCKET_GROUP names an unknown group: {name}");
+            std::process::exit(1);
+        })
+    });
+    let socket_path = auth::resolve_uds_socket_path(&args, uid);
+    let tcp_disabled = auth::resolve_tcp_disabled(&args);
+
+    // Story 4.3.2 / Task 4.3.2a: log the "full daemon control, not scoped"
+    // (and, off-Linux, the primary-gid-only) caveat once at startup,
+    // conditioned on --socket-group actually being configured — closes
+    // ux.md's Gap 1 for these two of its three deployment caveats (see
+    // Deployment Guidance in project_plans/unix-socket-auth/implementation/plan.md).
+    log_socket_group_caveat(allowed_gid, socket_group_name.as_deref());
+
+    // Root-cause fix: the lock file lives alongside the socket, so on a
+    // genuinely fresh $XDG_RUNTIME_DIR/tmp-fallback path (nothing has
+    // ever created tymuxd/ there yet), acquiring the lock before this
+    // directory exists fails with ENOENT — breaking the very first cold
+    // start on a machine. Must run before acquire_socket_lock, not only
+    // inside bind_uds_listener (which also calls it, idempotently, for
+    // its own direct callers/tests).
+    if let Err(e) = auth::ensure_socket_parent_dir(&socket_path, allowed_gid) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+    let _socket_lock = auth::acquire_socket_lock(&socket_path).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = auth::reconcile_stale_socket(&socket_path) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+    let uds_listener = auth::bind_uds_listener(&socket_path, allowed_gid).unwrap_or_else(|e| {
+        // bind_uds_listener returns Result<_, String> and formats its own
+        // distinct message per failure mode (bind failure vs. the
+        // group-chown-EPERM case) — main() just relays it, rather than
+        // wrapping every failure in one generic template.
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
     // Story 4.3: reconcile persisted session records before serving any
     // RPC — every session loads dead-flagged (ADR-002: never auto-revived
     // on daemon start); a file that fails to parse or fails structural
@@ -1308,28 +1367,189 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let daemon = TymuxDaemon::new(engine);
 
-    tracing::info!(%addr, "tymuxd listening");
-    if let Some(token) = configured_token {
-        let rejection_count = Arc::new(AtomicI64::new(0));
-        Server::builder()
-            .http2_keepalive_interval(Some(Duration::from_secs(30)))
-            .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-            .add_service(TymuxServiceServer::with_interceptor(
-                daemon,
-                auth::BearerAuthInterceptor::new(Arc::new(token), rejection_count),
-            ))
-            .serve_with_shutdown(socket_addr, shutdown_signal())
-            .await?;
+    // Bind the TCP listener eagerly here, before the "tymuxd listening" log
+    // line below — `serve_with_shutdown(socket_addr, ...)` binds lazily
+    // inside the future, only once `tokio::join!` polls it, which raced a
+    // client dialing immediately after seeing this log line (found via
+    // clients/go's integration suite: the UDS listener binds synchronously
+    // above and never raced, but TCP intermittently returned connection
+    // refused under `startDaemonOn`-style readiness-log polling).
+    let tcp_listener = if tcp_disabled {
+        None
     } else {
-        Server::builder()
-            .http2_keepalive_interval(Some(Duration::from_secs(30)))
-            .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-            .add_service(TymuxServiceServer::new(daemon))
-            .serve_with_shutdown(socket_addr, shutdown_signal())
-            .await?;
-    }
+        Some(
+            tokio::net::TcpListener::bind(socket_addr)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: failed to bind TCP listener at {socket_addr}: {e}");
+                    std::process::exit(1);
+                }),
+        )
+    };
+
+    tracing::info!(%addr, uds_path = %socket_path.display(), "tymuxd listening");
+
+    // Epic 4.3 / Story 4.3.1: the TCP-deprecation warning vs. the
+    // TCP-disabled info notice are mutually exclusive — never both.
+    log_tcp_listener_status(
+        tcp_disabled,
+        configured_token.is_some(),
+        socket_addr,
+        &socket_path,
+    );
+
+    let uds_rejection_count = Arc::new(AtomicI64::new(0));
+    let uds_daemon = daemon.clone();
+    let uds_future = async {
+        let res = configured_server_builder()
+            .add_service(TymuxServiceServer::with_interceptor(
+                uds_daemon,
+                auth::UdsPeerCredInterceptor::new(uds_rejection_count),
+            ))
+            .serve_with_incoming_shutdown(
+                // PreAuthorizedUnixStream computes the authorization decision
+                // once per accepted connection, here, before tonic's HTTP/2
+                // handshake — not once per RPC (Epic 3.2 performance
+                // requirement).
+                futures::TryStreamExt::map_ok(
+                    tokio_stream::wrappers::UnixListenerStream::new(uds_listener),
+                    move |stream| auth::PreAuthorizedUnixStream::new(stream, uid, allowed_gid),
+                ),
+                shutdown_signal(),
+            )
+            .await;
+        // Logged here, not just left to surface via `uds_res?` after
+        // `tokio::join!` returns below: if this future ends early for a
+        // reason other than the shutdown signal (fatal accept-loop IO
+        // error, fd exhaustion, etc.), the other listener keeps serving
+        // and an operator needs to see the failure at the moment it
+        // happens, not only once the whole daemon eventually shuts down.
+        if let Err(ref e) = res {
+            tracing::error!(listener = "uds", error = %e, "uds listener exited before shutdown");
+        }
+        res
+    };
+
+    let tcp_future = async {
+        let Some(tcp_listener) = tcp_listener else {
+            return Ok(());
+        };
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
+        let res = if let Some(token) = configured_token {
+            let rejection_count = Arc::new(AtomicI64::new(0));
+            configured_server_builder()
+                .add_service(TymuxServiceServer::with_interceptor(
+                    daemon,
+                    auth::BearerAuthInterceptor::new(Arc::new(token), rejection_count),
+                ))
+                .serve_with_incoming_shutdown(incoming, shutdown_signal())
+                .await
+        } else {
+            configured_server_builder()
+                .add_service(TymuxServiceServer::new(daemon))
+                .serve_with_incoming_shutdown(incoming, shutdown_signal())
+                .await
+        };
+        // See the matching comment on uds_future above: log the moment
+        // this listener exits abnormally rather than only via `tcp_res?`
+        // after `tokio::join!` returns.
+        if let Err(ref e) = res {
+            tracing::error!(listener = "tcp", error = %e, "tcp listener exited before shutdown");
+        }
+        res
+    };
+
+    // tokio::join!, not select!/try_join! — a disabled TCP branch resolves
+    // immediately via the `if tcp_disabled { return Ok(()) }` short-circuit
+    // rather than hanging forever, and both listeners always fully drain
+    // on shutdown rather than one being dropped mid-drain the instant the
+    // other resolves first. An early, non-shutdown exit from either future
+    // is logged immediately inside it (above), not just relayed silently
+    // via `uds_res?`/`tcp_res?` once join! returns. (No dedicated test for
+    // that early-failure path: deterministically forcing a fatal
+    // accept-loop IO error is disproportionate to this fix's scope; the
+    // existing uds_socket_lifecycle.rs tests cover the join wiring itself.)
+    let (uds_res, tcp_res) = tokio::join!(uds_future, tcp_future);
+    uds_res?;
+    tcp_res?;
     tracing::info!("tymuxd shut down");
     Ok(())
+}
+
+/// Shared `tonic::transport::Server` keepalive configuration for both the
+/// TCP and UDS listeners (previously three independent copies of this
+/// same pair of calls; consolidated into one definition).
+fn configured_server_builder() -> Server {
+    Server::builder()
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+}
+
+/// Epic 4.3 / Story 4.3.1 + Task 4.2.2d: logs exactly one of the
+/// TCP-deprecation `warn` or the TCP-disabled `info` notice (never both —
+/// Surface 2's mutual-exclusivity AC), and, only when TCP is disabled AND
+/// a bearer token is configured, an additional `warn` naming the token as
+/// now-inert (Task 4.2.2d) — a configured token is only ever checked on
+/// the TCP listener, so disabling TCP silently makes it dead weight
+/// unless this fires. Extracted from `main()`'s inline branch so it's
+/// testable via `#[tracing_test::traced_test]` without driving a full
+/// daemon startup, matching this file's/`auth.rs`'s established
+/// extract-a-pure-testable-function pattern.
+fn log_tcp_listener_status(
+    tcp_disabled: bool,
+    token_configured: bool,
+    socket_addr: std::net::SocketAddr,
+    uds_path: &std::path::Path,
+) {
+    if tcp_disabled {
+        tracing::info!(
+            "TCP loopback listener disabled via --disable-tcp-loopback/TYMUXD_DISABLE_TCP_LOOPBACK"
+        );
+        if token_configured {
+            tracing::warn!(
+                "a bearer token is configured (--token/TYMUXD_TOKEN) but \
+                 --disable-tcp-loopback/TYMUXD_DISABLE_TCP_LOOPBACK is also set — the token is now \
+                 unused, since it is only ever checked on the TCP listener, which is disabled."
+            );
+        }
+    } else {
+        tracing::warn!(
+            %socket_addr,
+            uds_path = %uds_path.display(),
+            "tymuxd's TCP listener ({socket_addr}) is deprecated and will be removed in a future \
+             release; it accepts connections from any local process with no credential check, \
+             regardless of the new Unix-socket listener at {}. Other local users are isolated only \
+             if nothing on this host still connects over TCP — set \
+             --disable-tcp-loopback/TYMUXD_DISABLE_TCP_LOOPBACK=1 once your clients have migrated \
+             to the Unix socket.",
+            uds_path.display(),
+        );
+    }
+}
+
+/// Story 4.3.2 / Task 4.3.2a: logs the "full daemon control, not scoped"
+/// (and, off-Linux, primary-gid-only) `--socket-group` caveat exactly
+/// once at startup, only when a group is actually configured. Extracted
+/// for the same testability reason as `log_tcp_listener_status` above.
+fn log_socket_group_caveat(allowed_gid: Option<u32>, socket_group_name: Option<&str>) {
+    if let (Some(gid), Some(name)) = (allowed_gid, socket_group_name) {
+        let platform_note = if cfg!(target_os = "linux") {
+            ""
+        } else {
+            " on this platform, membership is checked via the connecting \
+             process's primary group only (not full supplementary-group \
+             parity, which is Linux-only per ADR-002) — a teammate whose \
+             primary group isn't `teammates` may be denied even if listed \
+             as a supplementary member;"
+        };
+        tracing::info!(
+            socket_group = %name, socket_group_gid = gid,
+            "--socket-group/TYMUXD_SOCKET_GROUP is configured: members of this group get \
+             full daemon control (CreateSession, Attach/CapturePane, KillSession — identical \
+             to the socket owner), not a scoped per-user subset;{platform_note} see Deployment \
+             Guidance in project_plans/unix-socket-auth/implementation/plan.md for the full caveat."
+        );
+    }
 }
 
 /// Resolves on Ctrl-C or SIGTERM, whichever comes first — so tonic stops
@@ -1480,6 +1700,74 @@ mod tests {
         TymuxServiceClient::connect(format!("http://127.0.0.1:{}", addr.port()))
             .await
             .expect("client should connect to the just-bound listener")
+    }
+
+    /// Epic 5.1 / Task 5.1.1a: UDS counterpart to `spawn_test_server`/
+    /// `spawn_non_loopback_test_server` — binds a real
+    /// `tokio::net::UnixListener` at a fresh temp path (bypassing
+    /// `bind_uds_listener`'s lock/stale-check/chown machinery, which is
+    /// already independently tested in Phase 2; this harness only needs a
+    /// bound listener), wires it with the same
+    /// `PreAuthorizedUnixStream` + `UdsPeerCredInterceptor` pairing
+    /// `main()` uses, and returns a client dialed over the real socket
+    /// via the same `tower::service_fn` + `hyper_util::rt::TokioIo`
+    /// connector `tymux-cli`'s `dial_uds` uses (duplicated here rather
+    /// than shared — this repo has no test-utility crate to place it in
+    /// without a larger restructure out of Epic 5.1's scope).
+    ///
+    /// `daemon_uid`/`allowed_gid` are caller-supplied so tests can lie to
+    /// the harness about the daemon's own configured identity (Story
+    /// 5.1.1's mismatched-uid case, Story 5.1.2's group case) without
+    /// requiring root/CAP_SETUID to fabricate a genuinely different
+    /// *peer* uid.
+    async fn spawn_uds_test_server(
+        daemon: TymuxDaemon,
+        daemon_uid: u32,
+        allowed_gid: Option<u32>,
+    ) -> TymuxServiceClient<tonic::transport::Channel> {
+        // Built directly under /tmp with a short pid+counter suffix, not
+        // std::env::temp_dir()+a UUID -- macOS's shorter SUN_LEN overflows
+        // when combined with a long $TMPDIR + a 36-character UUID (matches
+        // the same fix already applied to auth.rs's unique_test_socket_path
+        // and tymux-cli's temp_socket_path for the identical bug).
+        static SOCKET_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SOCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/tymux-uds-test-{}-{n}.sock",
+            std::process::id()
+        ));
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .expect("should bind a fresh temp UDS path");
+        let rejection_count = Arc::new(AtomicI64::new(0));
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TymuxServiceServer::with_interceptor(
+                    daemon,
+                    auth::UdsPeerCredInterceptor::new(rejection_count),
+                ))
+                .serve_with_incoming(futures::TryStreamExt::map_ok(
+                    tokio_stream::wrappers::UnixListenerStream::new(listener),
+                    move |stream| {
+                        auth::PreAuthorizedUnixStream::new(stream, daemon_uid, allowed_gid)
+                    },
+                ))
+                .await
+                .unwrap();
+        });
+
+        let connect_path = socket_path.clone();
+        let connector = tower::service_fn(move |_: tonic::transport::Uri| {
+            let path = connect_path.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(&path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        });
+        let channel = tonic::transport::Endpoint::from_static("http://localhost")
+            .connect_with_connector(connector)
+            .await
+            .expect("client should connect to the just-bound uds listener");
+        TymuxServiceClient::new(channel)
     }
 
     async fn wait_for_pane_exit(pane: &Arc<tymux_core::Pane>) {
@@ -4631,5 +4919,243 @@ mod tests {
 
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    // --- Epic 4.1: TymuxDaemon: Clone ---
+
+    /// Task 4.1.1b: proves a clone isn't an independent copy — an
+    /// operation driven through the *clone* (registered on a real test
+    /// server; `Streaming<AttachRequest>` can't be constructed without a
+    /// real gRPC transport, so this goes over the existing
+    /// `spawn_test_server` network harness rather than calling
+    /// `attach()` in-process) increments `attached_sessions_gauge`
+    /// synchronously before returning — that increment must be visible
+    /// by reading the *original* daemon's field, since both share the
+    /// same underlying `Arc<AtomicI64>`.
+    #[tokio::test]
+    async fn cloned_daemon_shares_attached_sessions_gauge_with_original() {
+        let daemon = test_daemon();
+        let cloned = daemon.clone();
+        let mut client = spawn_test_server(cloned).await;
+
+        let resp = client
+            .create_session(Request::new(create_req("clone-share-test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&resp.windows[0]).id.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
+        })
+        .await
+        .unwrap();
+        let _stream = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .expect("attach through the clone should succeed");
+
+        assert_eq!(
+            daemon.attached_sessions_gauge.load(Ordering::SeqCst),
+            1,
+            "the original daemon should observe the gauge increment driven through the clone \
+             — proving they share one Arc<AtomicI64>, not two independent counters"
+        );
+    }
+
+    // --- Epic 4.3: TCP-deprecation warning / --socket-group caveat ---
+
+    fn test_socket_addr() -> std::net::SocketAddr {
+        "127.0.0.1:7419".parse().unwrap()
+    }
+
+    fn test_uds_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/tymuxd-test/tymuxd.sock")
+    }
+
+    /// R10 / Task 4.3.1a: default config (TCP enabled) logs the
+    /// deprecation warning at `warn`, naming the socket address, the
+    /// resolved uds_path, and the `--disable-tcp-loopback` off-switch.
+    #[test]
+    #[tracing_test::traced_test]
+    fn tcp_deprecation_warning_fires_at_warn_level_with_disable_flag_named() {
+        log_tcp_listener_status(false, false, test_socket_addr(), &test_uds_path());
+
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("--disable-tcp-loopback"));
+        assert!(logs_contain("127.0.0.1:7419"));
+        assert!(logs_contain("tymuxd-test/tymuxd.sock"));
+    }
+
+    /// R10 / Task 4.3.1a: with TCP disabled, the `warn` is replaced by an
+    /// `info` — the two notices are mutually exclusive (Surface 2 AC2).
+    #[test]
+    #[tracing_test::traced_test]
+    fn tcp_deprecation_warning_skipped_and_info_logged_when_tcp_disabled() {
+        log_tcp_listener_status(true, false, test_socket_addr(), &test_uds_path());
+
+        assert!(logs_contain("INFO"));
+        assert!(logs_contain("TCP loopback listener disabled"));
+        assert!(!logs_contain("is deprecated"));
+    }
+
+    /// Task 4.2.2d: a configured bearer token becomes inert when TCP is
+    /// disabled (the token is only ever checked on the TCP listener) —
+    /// this must fail loud, not silently, so the warning fires only when
+    /// *both* conditions hold.
+    #[test]
+    #[tracing_test::traced_test]
+    fn tcp_disabled_and_token_configured_logs_warning_naming_token_unused() {
+        log_tcp_listener_status(true, true, test_socket_addr(), &test_uds_path());
+
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("is now unused"));
+        assert!(logs_contain("--token"));
+    }
+
+    /// Negative case for Task 4.2.2d: TCP disabled but no token configured
+    /// — the token-unused warning must not fire.
+    #[test]
+    #[tracing_test::traced_test]
+    fn tcp_disabled_without_token_does_not_log_token_unused_warning() {
+        log_tcp_listener_status(true, false, test_socket_addr(), &test_uds_path());
+
+        assert!(!logs_contain("is now unused"));
+    }
+
+    /// Negative case for Task 4.2.2d: token configured but TCP still
+    /// enabled — the token is in active use, so no "unused" warning.
+    #[test]
+    #[tracing_test::traced_test]
+    fn tcp_enabled_with_token_configured_does_not_log_token_unused_warning() {
+        log_tcp_listener_status(false, true, test_socket_addr(), &test_uds_path());
+
+        assert!(!logs_contain("is now unused"));
+    }
+
+    /// Story 4.3.2 / Task 4.3.2b: a configured `--socket-group` logs the
+    /// "full daemon control, not scoped" caveat once at startup, naming
+    /// the configured group.
+    #[test]
+    #[tracing_test::traced_test]
+    fn socket_group_caveat_logged_once_at_startup_when_group_configured() {
+        log_socket_group_caveat(Some(1000), Some("teammates"));
+
+        assert!(logs_contain("full daemon control"));
+        assert!(logs_contain("teammates"));
+    }
+
+    /// Story 4.3.2 / Task 4.3.2b: no `--socket-group` configured means no
+    /// new log line at all — this notice is conditional, unlike the
+    /// unconditional TCP-deprecation warning.
+    #[test]
+    #[tracing_test::traced_test]
+    fn socket_group_caveat_absent_when_no_group_configured() {
+        log_socket_group_caveat(None, None);
+
+        assert!(!logs_contain("full daemon control"));
+    }
+
+    // --- Epic 5.1: accept/reject over a real UDS connection ---
+    //
+    // These three tests exercise the full UDS request path end-to-end —
+    // bind, connect, peer-cred extraction (via a real `SO_PEERCRED`
+    // syscall on a real accepted `tokio::net::UnixStream`), the
+    // `PreAuthorizedUnixStream`/`UdsPeerCredInterceptor` wiring, and an
+    // actual RPC — rather than only the pure `peer_is_authorized`/
+    // `peer_is_group_member` functions Epic 3's unit tests already cover
+    // in isolation. Per pitfalls.md §7 and the plan's own Unresolved
+    // Questions, none of them attempt a genuine cross-uid connection
+    // (that requires `CAP_SETUID`/root, unavailable in this repo's CI);
+    // instead each one lies to the *harness* about the daemon's own
+    // configured uid/gid, which forces the real acceptance path down the
+    // reject/group branch even though the connecting peer's own identity
+    // never changes. See each test's doc comment for exactly what it
+    // proves vs. what it approximates.
+
+    /// Task 5.1.1b (accept case): a client connecting as the daemon's own
+    /// uid succeeds. In a non-root test process this test's own real uid
+    /// always "matches the daemon's own uid" (both are the same OS
+    /// process), so this proves the wiring accepts the ordinary case —
+    /// not a distinguishing cross-identity proof (see the reject test
+    /// below for that half).
+    #[tokio::test]
+    async fn uds_server_accepts_matching_uid_client() {
+        let real_uid = unsafe { libc::geteuid() };
+        let mut client = spawn_uds_test_server(test_daemon(), real_uid, None).await;
+
+        let response = client
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await;
+
+        assert!(
+            response.is_ok(),
+            "expected success when the harness's configured daemon_uid matches this test \
+             process's real uid, got {response:?}"
+        );
+    }
+
+    /// Task 5.1.1b (reject case): proves the *server-side wiring* — real
+    /// accept, real `SO_PEERCRED` read, `PreAuthorizedUnixStream`'s cached
+    /// decision, `UdsPeerCredInterceptor`'s read of it — rejects a real
+    /// connection end-to-end, over and above Story 3.2.1b's unit-level
+    /// proof of `peer_is_authorized` alone.
+    ///
+    /// What this does NOT prove: a genuine cross-uid connection. The
+    /// connecting peer here is still this same test process (its real
+    /// uid never changes); what's fabricated is the harness's
+    /// `daemon_uid` configuration (`real_uid + 1`), which is enough to
+    /// force `peer_is_authorized` to evaluate false down the real
+    /// accept-and-reject path without root/`CAP_SETUID`. A true
+    /// cross-process, cross-uid reject is out of reach on this repo's CI
+    /// per pitfalls.md §7 / plan.md's Unresolved Questions.
+    #[tokio::test]
+    async fn uds_server_rejects_when_daemon_uid_does_not_match_wiring() {
+        let real_uid = unsafe { libc::geteuid() };
+        let mismatched_uid = real_uid.wrapping_add(1);
+        let mut client = spawn_uds_test_server(test_daemon(), mismatched_uid, None).await;
+
+        let status = client
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// Task 5.1.2a: proves the group-relaxation path (`peer_is_group_member`'s
+    /// genuine Linux `/proc`-based check from Story 3.1.1) against a real
+    /// accepted connection, not just as an isolated unit test.
+    ///
+    /// What this does NOT prove: a genuine cross-uid, cross-gid
+    /// connection. As with the reject test above, the connecting peer is
+    /// still this same test process — what's fabricated is the harness's
+    /// `daemon_uid` (`real_uid + 1`, forcing the uid check to fail and
+    /// fall through to the group check), while `allowed_gid` is set to
+    /// this test process's own real egid, which it is trivially (and
+    /// genuinely) a member of. That's enough to exercise the real
+    /// `/proc/<pid>/status` read against this process's own real pid and
+    /// gid over a real accepted socket; it doesn't prove the daemon
+    /// correctly reads a *different* process's `/proc` entry, which
+    /// would require a second uid/gid unavailable without root.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uds_server_accepts_group_member_when_uid_differs_but_gid_matches() {
+        let real_uid = unsafe { libc::geteuid() };
+        let mismatched_uid = real_uid.wrapping_add(1);
+        let real_gid = unsafe { libc::getegid() };
+        let mut client = spawn_uds_test_server(test_daemon(), mismatched_uid, Some(real_gid)).await;
+
+        let response = client
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await;
+
+        assert!(
+            response.is_ok(),
+            "expected success via the group path when uid is mismatched but the configured \
+             allowed_gid matches this test process's own real egid, got {response:?}"
+        );
     }
 }

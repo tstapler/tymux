@@ -1,12 +1,19 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { Code, ConnectError, createClient } from "@connectrpc/connect";
-import { createGrpcTransport } from "@connectrpc/connect-node";
+import * as net from "node:net";
+import * as http2 from "node:http2";
+import { spawn } from "node:child_process";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Code, ConnectError, createClient, type ConnectRouter } from "@connectrpc/connect";
+import { connectNodeAdapter, createGrpcTransport } from "@connectrpc/connect-node";
 import { TymuxService, type AttachRequest } from "../gen/tymux/v1/tymux_pb.js";
 import { runAttachDemo } from "../examples/attach.js";
 import { tymuxClient } from "../examples/client.js";
 import { capturePane } from "../examples/capture-pane.js";
 import { startDaemon, type TestDaemon } from "./daemon.js";
+import { closeHttp2Server, trackHttp2Sessions } from "./http2-test-utils.js";
 
 let daemon: TestDaemon;
 let client: ReturnType<typeof createClient<typeof TymuxService>>;
@@ -16,8 +23,8 @@ before(async () => {
   client = createClient(TymuxService, createGrpcTransport({ baseUrl: daemon.addr }));
 });
 
-after(() => {
-  daemon.stop();
+after(async () => {
+  await daemon.stop();
 });
 
 // Story 7.2 AC1: unary RPC round-trip end-to-end through the generated client.
@@ -74,10 +81,10 @@ function assertUnauthenticated(err: unknown) {
 test("listSessions rejects a missing/wrong token", async () => {
   const tokenDaemon = await startDaemon({ token: AUTH_TOKEN });
   try {
-    const unauthedClient = tymuxClient(tokenDaemon.addr);
+    const unauthedClient = await tymuxClient(tokenDaemon.addr);
     await assert.rejects(() => unauthedClient.listSessions({}), assertUnauthenticated);
   } finally {
-    tokenDaemon.stop();
+    await tokenDaemon.stop();
   }
 });
 
@@ -85,11 +92,11 @@ test("listSessions rejects a missing/wrong token", async () => {
 test("listSessions succeeds with the correct token", async () => {
   const tokenDaemon = await startDaemon({ token: AUTH_TOKEN });
   try {
-    const authedClient = tymuxClient(tokenDaemon.addr, AUTH_TOKEN);
+    const authedClient = await tymuxClient(tokenDaemon.addr, AUTH_TOKEN);
     const listed = await authedClient.listSessions({});
     assert.ok(Array.isArray(listed.sessions), "listSessions should succeed and return a sessions array");
   } finally {
-    tokenDaemon.stop();
+    await tokenDaemon.stop();
   }
 });
 
@@ -110,7 +117,7 @@ test("attach rejects a missing/wrong token", async () => {
       assertUnauthenticated,
     );
   } finally {
-    tokenDaemon.stop();
+    await tokenDaemon.stop();
   }
 });
 
@@ -119,7 +126,7 @@ test("attach rejects a missing/wrong token", async () => {
 test("attach succeeds with the correct token", async () => {
   const tokenDaemon = await startDaemon({ token: AUTH_TOKEN });
   try {
-    const authedClient = tymuxClient(tokenDaemon.addr, AUTH_TOKEN);
+    const authedClient = await tymuxClient(tokenDaemon.addr, AUTH_TOKEN);
     const session = await authedClient.createSession({ name: "ts-auth-attach-integration", command: "" });
     const node = session.windows[0]?.layout?.node;
     assert.equal(node?.case, "pane", "a fresh session's window should be a single-pane leaf");
@@ -129,7 +136,7 @@ test("attach succeeds with the correct token", async () => {
     const { output } = await runAttachDemo(paneId, { baseUrl: tokenDaemon.addr, token: AUTH_TOKEN });
     assert.ok(output.includes("tymux-ts-marker-output"), "attach should observe the command's real output");
   } finally {
-    tokenDaemon.stop();
+    await tokenDaemon.stop();
   }
 });
 
@@ -361,3 +368,219 @@ test("attach receives gapExceeded then snapshot when resumeFromSeq is stale and 
     // Expected: the abort cancels the underlying stream.
   }
 });
+
+// --- Epic 8.2 Story 8.2.2 / Task 8.2.2b: tymuxClient()'s UDS-first dial
+// order, logged TCP fallback, and EACCES hard-error handling. These stand
+// up their own minimal connect-node servers (a real UDS-bound h2c server /
+// a real TCP-bound h2c server) rather than using startDaemon() -- what's
+// under test here is tymuxClient()'s own dial-order logic in
+// examples/client.ts, not tymuxd's UDS support (crates/tymuxd's Epic 2.2
+// UDS-listener wiring is landing concurrently on this branch and this
+// phase's TS work does not depend on it).
+
+function stubTymuxServer(): (router: ConnectRouter) => void {
+  return (router) => {
+    router.service(TymuxService, { listSessions: () => ({ sessions: [] }) });
+  };
+}
+
+async function withSocketPathEnv<T>(value: string, fn: () => Promise<T>): Promise<T> {
+  const saved = process.env.TYMUXD_SOCKET_PATH;
+  process.env.TYMUXD_SOCKET_PATH = value;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.TYMUXD_SOCKET_PATH;
+    else process.env.TYMUXD_SOCKET_PATH = saved;
+  }
+}
+
+test("tymuxClient() dials the resolved Unix socket first when it's reachable", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-first-"));
+  const socketPath = join(stateDir, "tymuxd.sock");
+  const udsServer = http2.createServer(connectNodeAdapter({ routes: stubTymuxServer() }));
+  const sessions = trackHttp2Sessions(udsServer);
+  await new Promise<void>((resolve, reject) => {
+    udsServer.once("error", reject);
+    udsServer.listen(socketPath, resolve);
+  });
+
+  const originalError = console.error;
+  const errors: unknown[] = [];
+  console.error = (...args: unknown[]) => errors.push(args);
+  try {
+    await withSocketPathEnv(socketPath, async () => {
+      const udsClient = await tymuxClient();
+      const response = await udsClient.listSessions({});
+      assert.deepEqual(response.sessions, []);
+    });
+  } finally {
+    console.error = originalError;
+    await closeHttp2Server(udsServer, sessions);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+  assert.equal(errors.length, 0, "no fallback notice should be printed when UDS is reachable");
+});
+
+// The TCP fallback target is a fixed address (DEFAULT_TCP_FALLBACK_URL,
+// matching tymux-cli's/clients/go's default), so this test binds that
+// exact port itself rather than spawning startDaemon() (which uses
+// ephemeral ports for isolation). Skips gracefully if something else on
+// the machine already holds that port -- e.g. a real tymuxd -- rather than
+// failing on an environmental conflict outside this test's control.
+test("tymuxClient() falls back to TCP loopback with exactly one notice when the Unix socket is unreachable", async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-fallback-"));
+  const missingSocketPath = join(stateDir, "does-not-exist.sock");
+  const tcpServer = http2.createServer(connectNodeAdapter({ routes: stubTymuxServer() }));
+  const sessions = trackHttp2Sessions(tcpServer);
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      tcpServer.once("error", reject);
+      tcpServer.listen(7419, "127.0.0.1", resolve);
+    });
+  } catch (err) {
+    rmSync(stateDir, { recursive: true, force: true });
+    if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") {
+      t.skip("port 7419 already in use on this machine -- cannot exercise the fixed TCP fallback address");
+      return;
+    }
+    throw err;
+  }
+
+  const originalError = console.error;
+  const errors: string[] = [];
+  console.error = (...args: unknown[]) => errors.push(args.join(" "));
+  try {
+    await withSocketPathEnv(missingSocketPath, async () => {
+      const fallbackClient = await tymuxClient();
+      const response = await fallbackClient.listSessions({});
+      assert.deepEqual(response.sessions, []);
+    });
+  } finally {
+    console.error = originalError;
+    await closeHttp2Server(tcpServer, sessions);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+  assert.equal(errors.length, 1, "exactly one fallback notice should be printed");
+  assert.match(errors[0], /falling back to TCP loopback/);
+});
+
+// pre-mortem.md P1 #1: a daemon IS listening at socketPath and the kernel
+// denied the connect() itself -- this must never fall back to the
+// unauthenticated TCP path. No TCP listener is started in this test, so a
+// wrongly-attempted fallback would surface as ECONNREFUSED instead of this
+// asserted message.
+test("tymuxClient() rejects with a hard error on EACCES and never falls back to TCP", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-eacces-"));
+  const socketPath = join(stateDir, "tymuxd.sock");
+  const guardServer = net.createServer(() => {});
+  await new Promise<void>((resolve, reject) => {
+    guardServer.once("error", reject);
+    guardServer.listen(socketPath, resolve);
+  });
+  chmodSync(socketPath, 0o000);
+
+  try {
+    await withSocketPathEnv(socketPath, async () => {
+      await assert.rejects(
+        () => tymuxClient(),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.match(err.message, /not authorized to access this daemon's socket/);
+          return true;
+        },
+      );
+    });
+  } finally {
+    guardServer.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// --- Epic 8.3 Story 8.3.1: real tymuxd UDS accept/reject. tymuxd didn't
+// bind a real UDS listener when Epic 8.2's tests above were written, so
+// those stand up self-hosted stub servers instead; now that tymuxd binds a
+// real dual TCP+UDS listener (commit b44aae1) with peer-cred auth, these
+// dial an actual spawned daemon via tymuxClient() itself.
+
+// Task 8.3.1b: same-uid accept -- the only uid available to a Node test
+// process without root (pitfalls.md §7) -- proves the full UDS-first dial
+// path round-trips real RPCs against a real daemon, not just a stub.
+test("tymuxClient() dials a real tymuxd over UDS and round-trips a session (same-uid accept)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-accept-"));
+  const socketPath = join(stateDir, "tymuxd.sock");
+  const udsDaemon = await startDaemon({ socketPath });
+  try {
+    await withSocketPathEnv(socketPath, async () => {
+      const udsClient = await tymuxClient();
+      const created = await udsClient.createSession({ name: "ts-uds-accept-integration", command: "" });
+      const listed = await udsClient.listSessions({});
+      const found = listed.sessions.find((s) => s.id === created.id);
+      assert.ok(found, "a session created over the real UDS listener should appear in listSessions over the same socket");
+    });
+  } finally {
+    await udsDaemon.stop();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// Task 8.3.1c: the true cross-uid reject proof. Requires root/CAP_SETUID to
+// spawn a child process under a genuinely different real OS uid
+// (`child_process.spawn`'s `uid` option) -- ships skipped by default on
+// this repo's actual CI (plain ubuntu-latest/macos-latest runners, no
+// root/CAP_SETUID; confirmed against .github/workflows/ci.yml at planning
+// time), mirroring Go's Task 7.3.1b and tymux-cli's Task 6.4.1c. See
+// plan.md's "Unresolved Questions" (resolved during planning) and
+// pitfalls.md §7. `peer_is_authorized`'s own unit tests
+// (crates/tymuxd/src/auth.rs) are the accepted substitute proof for the
+// authorization *decision*; this test only proves the real kernel-level
+// gate when it can actually run as root.
+test(
+  "a client connecting from a genuinely different OS uid is rejected",
+  { skip: process.getuid!() !== 0 ? "requires root/CAP_SETUID to spawn a child under a different uid" : false },
+  async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-cross-uid-"));
+    const socketPath = join(stateDir, "tymuxd.sock");
+    const udsDaemon = await startDaemon({ socketPath });
+    try {
+      // "nobody" -- present on essentially every Linux/macOS install, and
+      // guaranteed distinct from uid 0 (the daemon's own uid, since this
+      // test only runs at all when the test process itself is root).
+      const DIFFERENT_UID = 65534;
+
+      // A minimal standalone probe, not the full tymuxClient() stack:
+      // auth::bind_uds_listener binds tymuxd's UDS socket file mode 0600
+      // (owner-only) by default, so the OS itself denies connect() to any
+      // non-owning uid before the daemon's own peer_is_authorized ever
+      // runs -- the same EACCES branch examples/client.ts's probeUdsSocket
+      // already classifies as "not authorized" (see the EACCES test
+      // above). Spawning this probe under a genuinely different uid (via
+      // spawn's `uid` option) is what actually requires root, unlike that
+      // chmod-based test; a plain CJS `-e` script avoids needing tsx/ESM
+      // module resolution to succeed under the restricted child uid.
+      const probe = [
+        'const net = require("node:net");',
+        `const socket = net.connect({ path: ${JSON.stringify(socketPath)} });`,
+        'socket.once("connect", () => { console.log("CONNECTED"); socket.destroy(); process.exit(0); });',
+        'socket.once("error", (err) => { console.log("ERROR:" + err.code); process.exit(1); });',
+      ].join("\n");
+
+      const child = spawn(process.execPath, ["-e", probe], {
+        uid: DIFFERENT_UID,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      const exitCode = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+
+      assert.notEqual(exitCode, 0, "a genuinely different uid must not be able to connect to the daemon's UDS socket");
+      assert.match(stdout, /ERROR:EACCES/, "the kernel must deny connect() with EACCES for a non-owning uid");
+    } finally {
+      await udsDaemon.stop();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  },
+);
