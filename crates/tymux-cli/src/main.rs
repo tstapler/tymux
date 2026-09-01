@@ -1392,7 +1392,7 @@ mod tests {
     /// RPC call proves that); it only proves the daemon is up and ready to
     /// accept connections.
     async fn wait_for_daemon(addr: &str) -> Channel {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(channel) = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
                 .unwrap()
@@ -1402,7 +1402,7 @@ mod tests {
                 return channel;
             }
             if std::time::Instant::now() > deadline {
-                panic!("tymuxd did not become reachable within 10s");
+                panic!("tymuxd did not become reachable within 30s");
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

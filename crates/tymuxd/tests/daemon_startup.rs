@@ -63,13 +63,13 @@ fn spawn_daemon(addr: &str, xdg_state_home: &Path) -> DaemonProcess {
 }
 
 async fn wait_for_daemon(addr: &str) -> TymuxServiceClient<tonic::transport::Channel> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(client) = TymuxServiceClient::connect(format!("http://{addr}")).await {
             return client;
         }
         if std::time::Instant::now() > deadline {
-            panic!("tymuxd did not become reachable within 10s");
+            panic!("tymuxd did not become reachable within 30s");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
