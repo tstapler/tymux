@@ -1850,15 +1850,19 @@ mod tests {
     // ---- Task 6.2.1c: dial_channel / dial_uds ------------------------
 
     /// A unique-per-call temp path — avoids collisions between tests
-    /// running concurrently in the same process.
+    /// running concurrently in the same process. Built directly under
+    /// `/tmp`, bypassing `$TMPDIR`: macOS CI's default `$TMPDIR`
+    /// (`/var/folders/<random>/T/`) combined with a descriptive label and
+    /// a deep runner checkout path can push the full socket path past
+    /// `SUN_LEN`, the ~104-byte kernel limit on `AF_UNIX` paths on macOS
+    /// (~108 on Linux) — this matches the `short_unique_socket_path`
+    /// pattern used by `crates/tymuxd/tests/*.rs`.
     fn temp_socket_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "tymux-cli-test-{label}-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::path::PathBuf::from(format!(
+            "/tmp/tymux-cli-{label}-{}-{n}.sock",
+            std::process::id()
         ))
     }
 

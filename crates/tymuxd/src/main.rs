@@ -1502,7 +1502,9 @@ fn log_tcp_listener_status(
     uds_path: &std::path::Path,
 ) {
     if tcp_disabled {
-        tracing::info!("TCP loopback listener disabled via --disable-tcp-loopback/TYMUXD_DISABLE_TCP_LOOPBACK");
+        tracing::info!(
+            "TCP loopback listener disabled via --disable-tcp-loopback/TYMUXD_DISABLE_TCP_LOOPBACK"
+        );
         if token_configured {
             tracing::warn!(
                 "a bearer token is configured (--token/TYMUXD_TOKEN) but \

@@ -317,8 +317,8 @@ pub fn ensure_socket_parent_dir(
         // Fatal, not a silent bind-into-it, if the pre-existing
         // directory isn't owned by this process's own uid at exactly
         // the expected mode.
-        let meta = std::fs::symlink_metadata(parent)
-            .map_err(|e| socket_creation_error(socket_path, e))?;
+        let meta =
+            std::fs::symlink_metadata(parent).map_err(|e| socket_creation_error(socket_path, e))?;
         let owner_uid = std::os::unix::fs::MetadataExt::uid(&meta);
         let mode = meta.permissions().mode() & 0o777;
         // SAFETY: geteuid takes no arguments and cannot fail.
