@@ -1277,7 +1277,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // config and perform the lock -> stale-check -> bind sequence
     // synchronously, before the TCP listener or Engine/persistence are
     // ever touched — a UDS bind failure must be fatal to the whole
-    // process, never a silent downgrade to TCP-only (Story 4.2.1).
+    // process, never a silent downgrade to TCP-only (Story 4.2.1). This
+    // block's blocking syscalls (flock, UnixStream::connect probe, umask)
+    // are safe to run inline in this async fn only because nothing has
+    // been tokio::spawn'd yet at this point in startup — no other task
+    // exists on the runtime for them to starve. Revisit with
+    // spawn_blocking if this sequence is ever reused from a live-reload
+    // path or moved after other tasks are running.
+    // SAFETY: geteuid takes no arguments and cannot fail.
     let uid = unsafe { libc::geteuid() };
     let socket_group_name = auth::resolve_socket_group_name(&args);
     let allowed_gid = socket_group_name.as_deref().map(|name| {

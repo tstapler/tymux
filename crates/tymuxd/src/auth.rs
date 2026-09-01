@@ -161,10 +161,17 @@ pub fn resolve_socket_group_name(args: &[String]) -> Option<String> {
 /// dependency).
 pub fn resolve_gid_by_name(name: &str) -> Option<u32> {
     let cname = std::ffi::CString::new(name).ok()?;
+    // SAFETY: cname is a valid, NUL-terminated C string for the duration of
+    // this call. getgrnam's returned pointer is into a non-thread-safe
+    // static buffer, but this function runs exactly once, synchronously,
+    // during single-threaded daemon startup before any listener task is
+    // spawned.
     let grp = unsafe { libc::getgrnam(cname.as_ptr()) };
     if grp.is_null() {
         None
     } else {
+        // SAFETY: grp was just checked non-null above and points at the
+        // same static buffer getgrnam populated on this call.
         Some(unsafe { (*grp).gr_gid })
     }
 }
@@ -200,6 +207,9 @@ pub fn acquire_socket_lock(socket_path: &std::path::Path) -> Result<SocketLockGu
         .write(true)
         .open(&lock_path)
         .map_err(|e| format!("failed to open lock file {}: {e}", lock_path.display()))?;
+    // SAFETY: file's fd is valid and owned by this scope for the duration
+    // of the call; flock takes no pointer/buffer argument that could be
+    // misused.
     let ret = unsafe {
         libc::flock(
             std::os::unix::io::AsRawFd::as_raw_fd(&file),
@@ -311,6 +321,7 @@ pub fn ensure_socket_parent_dir(
             .map_err(|e| socket_creation_error(socket_path, e))?;
         let owner_uid = std::os::unix::fs::MetadataExt::uid(&meta);
         let mode = meta.permissions().mode() & 0o777;
+        // SAFETY: geteuid takes no arguments and cannot fail.
         let daemon_uid = unsafe { libc::geteuid() };
         if owner_uid != daemon_uid || mode != expected_parent_mode {
             return Err(format!(
@@ -332,6 +343,36 @@ pub fn ensure_socket_parent_dir(
     }
 }
 
+/// RAII guard for the process-global `umask`: restores the previous value
+/// on drop, including on an unwind, so a panic between changing the umask
+/// and restoring it (e.g. inside `UnixListener::bind`) can never leave the
+/// process running under the wrong umask for the rest of its life — same
+/// "always undone" shape as `SocketLockGuard` above, for a different
+/// process-global resource.
+struct UmaskGuard(libc::mode_t);
+
+impl UmaskGuard {
+    /// SAFETY: `umask` takes a single `mode_t` value and returns the
+    /// previous one — no pointer/buffer argument, no aliasing hazard. The
+    /// only hazard is the process-global state itself, which this guard's
+    /// `Drop` impl restores; per `bind_uds_listener`'s doc comment, this
+    /// must not be called concurrently with another `umask` call from a
+    /// different thread.
+    fn set(new_umask: libc::mode_t) -> Self {
+        UmaskGuard(unsafe { libc::umask(new_umask) })
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: same shape as `set` above — restores the previously-saved
+        // process umask.
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
+}
+
 /// Binds a `UnixListener` at `socket_path` with its final permissions
 /// (`0600` owner-only, or `0660` group-accessible when `group_gid` is
 /// `Some`) set atomically with creation via `umask`, then `chown`s the
@@ -340,6 +381,12 @@ pub fn ensure_socket_parent_dir(
 /// immediate parent directory exists first via `ensure_socket_parent_dir`
 /// (see that function's doc comment for the pre-existing-directory
 /// validation invariant).
+///
+/// `umask` is process-global state: this function must be called exactly
+/// once, synchronously, from a single thread (today: daemon startup,
+/// before any listener task is spawned) — never concurrently with another
+/// caller mutating the umask, which would race an unrelated thread's file
+/// creation onto this function's temporarily-narrowed umask.
 pub fn bind_uds_listener(
     socket_path: &std::path::Path,
     group_gid: Option<u32>,
@@ -352,9 +399,9 @@ pub fn bind_uds_listener(
     // (ADR-001; fchmod on the fd is a documented no-op for AF_UNIX on
     // Linux, so this is the only atomic option).
     let new_umask = if group_gid.is_some() { 0o117 } else { 0o177 };
-    let old_umask = unsafe { libc::umask(new_umask) };
+    let umask_guard = UmaskGuard::set(new_umask);
     let bind_result = tokio::net::UnixListener::bind(socket_path);
-    unsafe { libc::umask(old_umask) };
+    drop(umask_guard);
     let listener = bind_result.map_err(fail_bind)?;
     if let Some(gid) = group_gid {
         std::os::unix::fs::chown(socket_path, None, Some(gid)).map_err(|e| {
