@@ -1400,29 +1400,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let uds_rejection_count = Arc::new(AtomicI64::new(0));
     let uds_daemon = daemon.clone();
-    let uds_future = configured_server_builder()
-        .add_service(TymuxServiceServer::with_interceptor(
-            uds_daemon,
-            auth::UdsPeerCredInterceptor::new(uds_rejection_count),
-        ))
-        .serve_with_incoming_shutdown(
-            // PreAuthorizedUnixStream computes the authorization decision
-            // once per accepted connection, here, before tonic's HTTP/2
-            // handshake — not once per RPC (Epic 3.2 performance
-            // requirement).
-            futures::TryStreamExt::map_ok(
-                tokio_stream::wrappers::UnixListenerStream::new(uds_listener),
-                move |stream| auth::PreAuthorizedUnixStream::new(stream, uid, allowed_gid),
-            ),
-            shutdown_signal(),
-        );
+    let uds_future = async {
+        let res = configured_server_builder()
+            .add_service(TymuxServiceServer::with_interceptor(
+                uds_daemon,
+                auth::UdsPeerCredInterceptor::new(uds_rejection_count),
+            ))
+            .serve_with_incoming_shutdown(
+                // PreAuthorizedUnixStream computes the authorization decision
+                // once per accepted connection, here, before tonic's HTTP/2
+                // handshake — not once per RPC (Epic 3.2 performance
+                // requirement).
+                futures::TryStreamExt::map_ok(
+                    tokio_stream::wrappers::UnixListenerStream::new(uds_listener),
+                    move |stream| auth::PreAuthorizedUnixStream::new(stream, uid, allowed_gid),
+                ),
+                shutdown_signal(),
+            )
+            .await;
+        // Logged here, not just left to surface via `uds_res?` after
+        // `tokio::join!` returns below: if this future ends early for a
+        // reason other than the shutdown signal (fatal accept-loop IO
+        // error, fd exhaustion, etc.), the other listener keeps serving
+        // and an operator needs to see the failure at the moment it
+        // happens, not only once the whole daemon eventually shuts down.
+        if let Err(ref e) = res {
+            tracing::error!(listener = "uds", error = %e, "uds listener exited before shutdown");
+        }
+        res
+    };
 
     let tcp_future = async {
         let Some(tcp_listener) = tcp_listener else {
             return Ok(());
         };
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
-        if let Some(token) = configured_token {
+        let res = if let Some(token) = configured_token {
             let rejection_count = Arc::new(AtomicI64::new(0));
             configured_server_builder()
                 .add_service(TymuxServiceServer::with_interceptor(
@@ -1436,14 +1449,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .add_service(TymuxServiceServer::new(daemon))
                 .serve_with_incoming_shutdown(incoming, shutdown_signal())
                 .await
+        };
+        // See the matching comment on uds_future above: log the moment
+        // this listener exits abnormally rather than only via `tcp_res?`
+        // after `tokio::join!` returns.
+        if let Err(ref e) = res {
+            tracing::error!(listener = "tcp", error = %e, "tcp listener exited before shutdown");
         }
+        res
     };
 
     // tokio::join!, not select!/try_join! — a disabled TCP branch resolves
     // immediately via the `if tcp_disabled { return Ok(()) }` short-circuit
     // rather than hanging forever, and both listeners always fully drain
     // on shutdown rather than one being dropped mid-drain the instant the
-    // other resolves first.
+    // other resolves first. An early, non-shutdown exit from either future
+    // is logged immediately inside it (above), not just relayed silently
+    // via `uds_res?`/`tcp_res?` once join! returns. (No dedicated test for
+    // that early-failure path: deterministically forcing a fatal
+    // accept-loop IO error is disproportionate to this fix's scope; the
+    // existing uds_socket_lifecycle.rs tests cover the join wiring itself.)
     let (uds_res, tcp_res) = tokio::join!(uds_future, tcp_future);
     uds_res?;
     tcp_res?;
