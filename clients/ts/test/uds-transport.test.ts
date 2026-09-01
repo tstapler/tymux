@@ -8,7 +8,7 @@ import type { ConnectRouter } from "@connectrpc/connect";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import { TymuxService } from "../gen/tymux/v1/tymux_pb.js";
 import { createUdsGrpcTransport } from "../examples/client.js";
-import { attachListeningDiagnostic, diagLog, diagLogPaths, logListenError, startListenHeartbeat } from "./listen-diagnostics.js";
+import { closeHttp2Server, trackHttp2Sessions } from "./http2-test-utils.js";
 
 // Epic 8.1 Story 8.1.1's spike, kept as an automated test rather than a
 // throwaway script (plan.md explicitly allows either): confirms
@@ -32,41 +32,28 @@ import { attachListeningDiagnostic, diagLog, diagLogPaths, logListenError, start
 // in build-vs-buy.md §4 was not needed.
 
 let server: http2.Http2Server;
+let sessions: Set<http2.Http2Session>;
 let socketPath: string;
 let stateDir: string;
 
 before(async () => {
-  const DIAG = "uds-transport:before";
   stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-spike-"));
   socketPath = join(stateDir, "spike.sock");
-  diagLogPaths(DIAG, stateDir, socketPath);
   const routes = (router: ConnectRouter) => {
     router.service(TymuxService, {
       listSessions: () => ({ sessions: [] }),
     });
   };
   server = http2.createServer(connectNodeAdapter({ routes }));
-  attachListeningDiagnostic(server, DIAG);
-  const stopHeartbeat = startListenHeartbeat(DIAG);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", (err: NodeJS.ErrnoException) => {
-        logListenError(DIAG, err);
-        reject(err);
-      });
-      diagLog(DIAG, `calling .listen(${JSON.stringify(socketPath)}, callback)`);
-      server.listen(socketPath, () => {
-        diagLog(DIAG, "listen() callback fired");
-        resolve();
-      });
-    });
-  } finally {
-    stopHeartbeat();
-  }
+  sessions = trackHttp2Sessions(server);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
 });
 
 after(async () => {
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await closeHttp2Server(server, sessions);
   rmSync(stateDir, { recursive: true, force: true });
 });
 

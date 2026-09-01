@@ -13,7 +13,7 @@ import { runAttachDemo } from "../examples/attach.js";
 import { tymuxClient } from "../examples/client.js";
 import { capturePane } from "../examples/capture-pane.js";
 import { startDaemon, type TestDaemon } from "./daemon.js";
-import { attachListeningDiagnostic, diagLog, diagLogPaths, logListenError, startListenHeartbeat } from "./listen-diagnostics.js";
+import { closeHttp2Server, trackHttp2Sessions } from "./http2-test-utils.js";
 
 let daemon: TestDaemon;
 let client: ReturnType<typeof createClient<typeof TymuxService>>;
@@ -396,28 +396,14 @@ async function withSocketPathEnv<T>(value: string, fn: () => Promise<T>): Promis
 }
 
 test("tymuxClient() dials the resolved Unix socket first when it's reachable", async () => {
-  const DIAG = "integration:uds-first";
   const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-first-"));
   const socketPath = join(stateDir, "tymuxd.sock");
-  diagLogPaths(DIAG, stateDir, socketPath);
   const udsServer = http2.createServer(connectNodeAdapter({ routes: stubTymuxServer() }));
-  attachListeningDiagnostic(udsServer, DIAG);
-  const stopHeartbeat = startListenHeartbeat(DIAG);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      udsServer.once("error", (err: NodeJS.ErrnoException) => {
-        logListenError(DIAG, err);
-        reject(err);
-      });
-      diagLog(DIAG, `calling .listen(${JSON.stringify(socketPath)}, callback)`);
-      udsServer.listen(socketPath, () => {
-        diagLog(DIAG, "listen() callback fired");
-        resolve();
-      });
-    });
-  } finally {
-    stopHeartbeat();
-  }
+  const sessions = trackHttp2Sessions(udsServer);
+  await new Promise<void>((resolve, reject) => {
+    udsServer.once("error", reject);
+    udsServer.listen(socketPath, resolve);
+  });
 
   const originalError = console.error;
   const errors: unknown[] = [];
@@ -430,7 +416,7 @@ test("tymuxClient() dials the resolved Unix socket first when it's reachable", a
     });
   } finally {
     console.error = originalError;
-    await new Promise<void>((resolve) => udsServer.close(() => resolve()));
+    await closeHttp2Server(udsServer, sessions);
     rmSync(stateDir, { recursive: true, force: true });
   }
   assert.equal(errors.length, 0, "no fallback notice should be printed when UDS is reachable");
@@ -446,6 +432,7 @@ test("tymuxClient() falls back to TCP loopback with exactly one notice when the 
   const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-fallback-"));
   const missingSocketPath = join(stateDir, "does-not-exist.sock");
   const tcpServer = http2.createServer(connectNodeAdapter({ routes: stubTymuxServer() }));
+  const sessions = trackHttp2Sessions(tcpServer);
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -472,7 +459,7 @@ test("tymuxClient() falls back to TCP loopback with exactly one notice when the 
     });
   } finally {
     console.error = originalError;
-    await new Promise<void>((resolve) => tcpServer.close(() => resolve()));
+    await closeHttp2Server(tcpServer, sessions);
     rmSync(stateDir, { recursive: true, force: true });
   }
   assert.equal(errors.length, 1, "exactly one fallback notice should be printed");
