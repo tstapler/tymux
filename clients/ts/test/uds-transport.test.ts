@@ -43,7 +43,10 @@ before(async () => {
     });
   };
   server = http2.createServer(connectNodeAdapter({ routes }));
-  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
 });
 
 after(async () => {

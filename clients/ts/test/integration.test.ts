@@ -398,7 +398,10 @@ test("tymuxClient() dials the resolved Unix socket first when it's reachable", a
   const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-first-"));
   const socketPath = join(stateDir, "tymuxd.sock");
   const udsServer = http2.createServer(connectNodeAdapter({ routes: stubTymuxServer() }));
-  await new Promise<void>((resolve) => udsServer.listen(socketPath, resolve));
+  await new Promise<void>((resolve, reject) => {
+    udsServer.once("error", reject);
+    udsServer.listen(socketPath, resolve);
+  });
 
   const originalError = console.error;
   const errors: unknown[] = [];
@@ -469,7 +472,10 @@ test("tymuxClient() rejects with a hard error on EACCES and never falls back to 
   const stateDir = mkdtempSync(join(tmpdir(), "tymux-ts-uds-eacces-"));
   const socketPath = join(stateDir, "tymuxd.sock");
   const guardServer = net.createServer(() => {});
-  await new Promise<void>((resolve) => guardServer.listen(socketPath, resolve));
+  await new Promise<void>((resolve, reject) => {
+    guardServer.once("error", reject);
+    guardServer.listen(socketPath, resolve);
+  });
   chmodSync(socketPath, 0o000);
 
   try {
