@@ -164,22 +164,161 @@ async fn pane_survives_graceful_detach() {
 ///   forensics were attempted this pass for the same reason it was
 ///   abandoned then.
 ///
-/// **Conclusion**: the `setsid()` fix (Story 1.1.2 / ADR-002) is
-/// implemented and kept — it's safe, low-risk, and matches real tmux's own
-/// daemon design — but it remains **unverified against the actual bug**.
-/// No real, non-sandboxed hardware and no systemd-managed host were
-/// available in this session, so Story 1.1.2's pre-mortem P1 #1
-/// second-environment requirement is **not met**, and this test is
-/// deliberately left `#[ignore]`d rather than un-ignored on sandbox
-/// evidence that can't actually distinguish "fixed" from "environment
-/// can't reproduce the precondition." A human with access to real
-/// hardware (and ideally a systemd-managed host, to exercise the
-/// `EPERM`-already-session-leader tolerance path from Task 1.1.2b for
-/// real) needs to re-run this exact repro — capturing the same `ps`
-/// columns — before this test can be un-ignored and Epic 1.1 considered
-/// fully done per Story 1.1.3.
+/// **Conclusion (superseded for environment 1 — see 2026-09-04 below)**:
+/// the `setsid()` fix (Story 1.1.2 / ADR-002) is implemented and kept —
+/// it's safe, low-risk, and matches real tmux's own daemon design — but at
+/// the time this paragraph was written it remained **unverified against
+/// the actual bug**. No real, non-sandboxed hardware and no systemd-managed
+/// host were available in that session, so Story 1.1.2's pre-mortem P1 #1
+/// second-environment requirement was **not met**.
+///
+/// **2026-09-04 (bare-metal, environment 1 of pre-mortem P1 #1)** — run on
+/// `onyx`, a bare-metal Manjaro Linux workstation (`systemd-detect-virt`
+/// reports `none`; kernel 6.6.128-1-MANJARO), not a container or VM. One
+/// wrinkle specific to running this from an agent session: commands
+/// executed through the Claude Code Bash tool are themselves spawned into
+/// a *new, ctty-less session* (`SID=PGID=<own PID>`, `TT=?`) regardless of
+/// the underlying machine being bare metal — structurally identical to the
+/// 2026-08-21 sandbox finding, just for a harness reason instead of a
+/// container reason. Verified directly: a plain `ps -o pid,ppid,pgid,sid,tty
+/// -p $$` from a Bash-tool-spawned shell shows `SID=PGID=<own PID>`,
+/// `TT=?`, while the `claude` process itself (this session's parent) is
+/// attached to a real `pts/5`.
+///
+/// To get a genuine controlling terminal in the loop despite that, `tymuxd`
+/// was launched via `script -qc "bash -c './tymuxd &...'" logfile`, so that
+/// `script`'s forkpty makes the intermediate `bash` (not `tymuxd`) the
+/// session leader of a fresh pty, and `tymuxd` is exec'd as an ordinary
+/// background child of that `bash` — matching how a human's `./tymuxd &`
+/// at a real interactive shell prompt actually looks (a plain child
+/// process, not itself a session leader, inheriting the shell's real
+/// ctty). This is *not* the same as wrapping `script` directly around
+/// `tymuxd` (tried first, then discarded) — `script`'s forkpty'd child
+/// becomes session leader *before* exec, so a direct `script -qc tymuxd`
+/// puts `tymuxd` in the already-session-leader/EPERM branch (environment
+/// 2's shape, not environment 1's). State was isolated from any real
+/// `tymuxd` instance via `XDG_STATE_HOME`, `TYMUXD_SOCKET_PATH`, and a
+/// non-default `TYMUXD_ADDR` (127.0.0.1:17419) pointed at scratch
+/// directories — no production session data was touched.
+///
+/// `ps` output, before `setsid()` runs vs. after:
+/// - Intermediate `bash` (the pty's actual session leader):
+///   `PID=1087124 PGID=1087124 SID=1087124 TT=pts/13`.
+/// - `tymuxd` (PID 1087126), immediately after `setsid()` executes at the
+///   top of `main()`: `PGID=1087126 SID=1087126 TT=?` — it left `bash`'s
+///   session and controlling terminal entirely, confirming the fix's
+///   primary code path (a non-EPERM `setsid()` call) actually engages and
+///   changes observable state on this environment, unlike the 2026-08-21
+///   sandbox where `tymuxd` already had `TT=?` before `setsid()` ran at
+///   all.
+///
+/// Manual repro (this runbook's Step 3, run 10 times — not the automated
+/// `#[ignore]`d test below, which was not un-ignored/run directly this
+/// pass): for each run, `tymux new --name verify-disconnect-N` was
+/// attached inside its own `script`-allocated pty (own real `pts/N`,
+/// client itself as session leader of that pty — the exec-optimization
+/// case for a single `bash -c` command), then the abrupt disconnect was
+/// simulated by `kill -9` on the **script process holding the pty
+/// master** (never the client process directly — killing the client
+/// itself doesn't reproduce the bug, consistent with the 2026-07-17
+/// isolating experiments above). Baseline vs. post-disconnect `ps` for one
+/// representative run:
+/// - Pane child baseline: `PID=1097854 PPID=1087126(tymuxd) PGID=SID=1097854
+///   TT=pts/24 CMD=/bin/zsh`.
+/// - Client killed via its pty-master `script` process (PID 1097826).
+/// - Pane child post-disconnect: **identical row**, still alive
+///   (`PID=1097854 ... TT=pts/24`), not `<defunct>`.
+/// - Confirmed via the real gRPC API, not just `ps`: `tymux ls
+///   --socket-path <scratch>` reported `verify-disconnect-N [live]` after
+///   every one of 10 consecutive runs (10/10 pass, 0 fail) — matching this
+///   test's own `Liveness::Live` assertion below.
+///
+/// **What environment 1 alone did and didn't close**: it satisfied
+/// environment 1 of pre-mortem P1 #1 (a real, non-containerized machine,
+/// `tymuxd` as an ordinary child of an interactive-shell session with a
+/// genuine controlling terminal) — a real result, not a structural no-op
+/// like 2026-08-21. It did not, by itself, satisfy environment 2 (a
+/// systemd-managed host, exercising the `EPERM`-already-session-leader
+/// tolerance path from Task 1.1.2b). It also used a `script`/Bash-tool-
+/// driven pty rather than a human typing at a literal terminal emulator, a
+/// narrower substitute for "a human with real hardware access" than Task
+/// 1.1.3's original design intent, even though the resulting process/
+/// session shape is the real one.
+///
+/// **2026-09-04, same day, environment 2 (systemd-managed host)** — same
+/// bare-metal `onyx` machine (real systemd, PID 1 is `systemd 259`, not a
+/// container's init), but this time `tymuxd` was launched via `systemd-run
+/// --user --unit=tymuxd-verify --collect ... target/release/tymuxd`, a
+/// genuine transient systemd unit (`systemctl --user status` confirmed
+/// `Active: active (running)`, real `CGroup=.../tymuxd-verify.service`),
+/// not a simulation of one. State was isolated the same way as environment
+/// 1 (`XDG_STATE_HOME`, `TYMUXD_SOCKET_PATH`, non-default `TYMUXD_ADDR`
+/// under `--setenv`) — `tymuxd`'s own startup log confirmed `no orphaned-
+/// process candidates found ... count=0`, i.e. it never touched the real
+/// state dir with its 4000+ persisted sessions.
+///
+/// `ps` on the running unit, immediately confirms the precondition Task
+/// 1.1.2b's tolerance path exists for: `PID=2318086 PGID=2318086
+/// SID=2318086 TT=? STAT=Ssl` — systemd starts every service as its own
+/// session leader from the moment of `exec`, *before* `tymuxd`'s own
+/// `setsid()` call even runs. That means `setsid()` here necessarily
+/// returns `EPERM` (already session leader) and Task 1.1.2b's tolerance
+/// path is what keeps the daemon running instead of crashing — confirmed
+/// by the unit simply staying `active (running)` rather than failing to
+/// start.
+///
+/// Manual repro (this runbook's Step 3 pattern, run 10 times): for each
+/// run, `tymux new --name sysd-verify-N --socket-path <scratch>` was
+/// attached inside its own `script`-allocated pty, then abruptly killed by
+/// `kill -9` on the pty-master-owning `script` process (never the client
+/// itself). Baseline for run 1's pane child: `PID=2320119
+/// PPID=2318086(tymuxd) PGID=SID=2320119 TT=pts/5 CMD=/bin/zsh`. Result
+/// across all 10 runs: **10/10 pass, 0 fail** — `tymux ls --socket-path
+/// <scratch>` reported `sysd-verify-N [live]` every time, and a final
+/// `pgrep -P <tymuxd-pid>` after all 10 disconnects showed all 10 pane
+/// shells still present and running, none `<defunct>`.
+///
+/// Cleanup: `systemctl --user stop tymuxd-verify` (the `--collect` flag
+/// means the transient unit unloads on its own once stopped — confirmed
+/// via `systemctl --user list-units 'tymuxd*'` returning 0 units
+/// afterward), plus removal of the scratch socket/state directories. No
+/// systemd unit files or state were left behind.
+///
+/// **Both environments required by pre-mortem P1 #1 are now confirmed on
+/// real hardware**, by manual repro: environment 1 (ordinary interactive-
+/// shell child, real ctty to detach from) 2026-09-04 above, and environment
+/// 2 (systemd-managed, `EPERM` tolerance path) this entry. Both used a
+/// `script`/`systemd-run`-driven repro from an agent session rather than a
+/// human directly typing at a terminal emulator — the process/session
+/// shapes produced are the real ones the fix targets (confirmed via `ps`,
+/// not assumed), but this is narrower than Task 1.1.3's original "a human
+/// runs this" design intent, noted here for the record rather than
+/// silently upgraded.
+///
+/// **This automated test stays `#[ignore]`d regardless** — tried un-
+/// ignoring and running it directly this same session
+/// (`cargo test --release -p tymux-e2e --test disconnect_survival_e2e
+/// pane_survives_abrupt_disconnect -- --exact --nocapture`) and it
+/// **failed**: `daemon::spawn()` launches `tymuxd` via a plain
+/// `std::process::Command`, inheriting whatever session the test process
+/// itself runs in — and a `cargo test` invoked from this agent session's
+/// own shell is itself ctty-less (`SID=PGID=<own PID>`, `TT=?`, same
+/// signature as the 2026-08-21 sandbox), so `tymuxd` never gets the real
+/// controlling terminal the manual repro above deliberately engineered via
+/// `script`/`systemd-run`. That reproduces the exact structural no-op the
+/// 2026-08-21 entry already documented — the pane died
+/// (`FailedPrecondition: pane exited`), not because the fix doesn't work
+/// (the manual repro just proved it does, twice), but because this test's
+/// harness can't give `tymuxd` a controlling terminal in an ordinary
+/// CI/agent shell. Un-ignoring on that failure would just break CI on a
+/// harness gap, not a real regression. **Follow-up needed before this can
+/// be un-ignored for real**: give `daemon::spawn()` a way to launch
+/// `tymuxd` with a genuine controlling terminal (e.g. a pty via
+/// `portable_pty`, mirroring what `CliHarness` already does for the CLI
+/// side) — out of scope for this pass, flagged here rather than attempted
+/// silently.
 #[tokio::test]
-#[ignore = "known bug: abrupt client disconnect currently kills the pane — setsid() fix (ADR-002) implemented but unverified on real hardware, see doc comment"]
+#[ignore = "known bug's setsid() fix is now confirmed on real hardware (see 2026-09-04 entries above, both pre-mortem P1 #1 environments) — but the automated harness can't yet give tymuxd a real controlling terminal in CI/agent shells, so this still fails there on a harness gap, not a regression; needs daemon::spawn() to grow pty support before un-ignoring"]
 async fn pane_survives_abrupt_disconnect() {
     let tymuxd_bin = workspace_bin("tymuxd");
     let tymux_bin = workspace_bin("tymux");
