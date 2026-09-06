@@ -318,7 +318,9 @@ async fn pane_survives_graceful_detach() {
 /// side) — out of scope for this pass, flagged here rather than attempted
 /// silently.
 #[tokio::test]
-#[ignore = "known bug's setsid() fix is now confirmed on real hardware (see 2026-09-04 entries above, both pre-mortem P1 #1 environments) — but the automated harness can't yet give tymuxd a real controlling terminal in CI/agent shells, so this still fails there on a harness gap, not a regression; needs daemon::spawn() to grow pty support before un-ignoring"]
+#[ignore = "known bug's setsid() fix is now confirmed on real hardware (see 2026-09-04 entries above, both pre-mortem P1 #1 environments) — \
+           but the automated harness can't yet give tymuxd a real controlling terminal in CI/agent shells, so this still fails there on a harness gap, not a regression; \
+           needs daemon::spawn() to grow pty support before un-ignoring"]
 async fn pane_survives_abrupt_disconnect() {
     let tymuxd_bin = workspace_bin("tymuxd");
     let tymux_bin = workspace_bin("tymux");
