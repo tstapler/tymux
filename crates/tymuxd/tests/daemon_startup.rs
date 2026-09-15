@@ -9,7 +9,7 @@
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tymux_core::{
     Orientation as CoreOrientation, PersistedLayoutNode, PersistedPaneRecord,
@@ -267,6 +267,54 @@ async fn daemon_startup_should_start_successfully_and_report_exactly_two_session
         list.sessions.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains("good-one"));
     assert!(names.contains("good-two"));
+
+    std::fs::remove_dir_all(&xdg_state_home).ok();
+}
+
+/// Guards the ordering `main()` depends on: `prune_stale` must run before
+/// `load_all`, so a stale record is neither restored into `Engine` nor
+/// counted toward startup work — the pure `prune_stale` unit tests (in
+/// `crates/tymux-core/src/persistence.rs`) prove the function itself is
+/// correct, but nothing else proves `tymuxd` actually calls it, in the
+/// right order, on a real boot. A regression reordering or dropping that
+/// call would pass every other test in this file.
+#[tokio::test]
+async fn daemon_startup_should_prune_stale_session_file_before_restoring_and_not_list_it() {
+    let addr = "127.0.0.1:17434";
+    let xdg_state_home = temp_xdg_state_home("stale-plus-fresh");
+    let dir = sessions_dir(&xdg_state_home);
+
+    let stale = valid_record("stale-should-be-pruned");
+    let fresh = valid_record("fresh-should-survive");
+    write_record(&dir, &stale);
+    write_record(&dir, &fresh);
+    let stale_path = dir.join(format!("{}.json", stale.session_id));
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&stale_path)
+        .unwrap();
+    file.set_modified(SystemTime::now() - Duration::from_secs(31 * 86400))
+        .unwrap();
+
+    let _daemon = spawn_daemon(addr, &xdg_state_home);
+    let mut client = wait_for_daemon(addr).await;
+
+    let list = client
+        .list_sessions(ListSessionsRequest {})
+        .await
+        .expect("daemon should start successfully")
+        .into_inner();
+
+    assert_eq!(
+        list.sessions.len(),
+        1,
+        "the stale record must never be restored, not just eventually deleted"
+    );
+    assert_eq!(list.sessions[0].name, "fresh-should-survive");
+    assert!(
+        !stale_path.exists(),
+        "prune_stale should have deleted the stale file from disk"
+    );
 
     std::fs::remove_dir_all(&xdg_state_home).ok();
 }

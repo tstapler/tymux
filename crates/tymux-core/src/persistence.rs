@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -313,6 +314,70 @@ impl PersistenceBackend for FsPersistenceBackend {
     }
 }
 
+/// Age past which a dead-flagged session's on-disk record is pruned. A
+/// record's file mtime is only ever touched by `save` — while a session is
+/// live it keeps getting re-saved on every structural mutation, so this
+/// only ever catches records nothing has touched (including via `tymux
+/// revive`) in a long time, never an active session. Nothing else on disk
+/// ever removes these, so left unpruned they accumulate forever (issue:
+/// 4400+ observed on one machine after about a month).
+pub const STALE_SESSION_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+impl FsPersistenceBackend {
+    /// Deletes session record files whose mtime is older than `max_age`.
+    /// Meant to run once at startup, before `load_all`, so a stale record
+    /// is neither restored nor counted — best-effort: a file that can't be
+    /// stat'd or removed is logged and left in place, never fatal. Returns
+    /// the number of files removed.
+    pub fn prune_stale(&self, max_age: Duration) -> usize {
+        self.prune_stale_at(max_age, SystemTime::now())
+    }
+
+    /// `prune_stale`'s real work, with `now` injected so a test can compare
+    /// a file it just backdated against the exact same instant rather than
+    /// two independent `SystemTime::now()` calls a few microseconds apart —
+    /// which, right at the `max_age` boundary, is the difference between a
+    /// deterministic test and a flaky one.
+    fn prune_stale_at(&self, max_age: Duration, now: SystemTime) -> usize {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            Err(_) => return 0, // load_all logs this same condition right after
+        };
+        let mut pruned = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let modified = match entry.metadata().and_then(|m| m.modified()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "could not stat persisted session file, skipping prune check");
+                    continue;
+                }
+            };
+            // Err means `modified` is in the future (clock skew) — treat as
+            // not-yet-stale rather than guessing at an age.
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age <= max_age {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    pruned += 1;
+                    tracing::info!(path = %path.display(), age_days = age.as_secs() / 86400, "pruned stale dead-flagged session record");
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to prune stale session record file");
+                }
+            }
+        }
+        pruned
+    }
+}
+
 /// Resolves the directory persisted session records live in:
 /// `$XDG_STATE_HOME/tymux/sessions` if that env var is set — checked
 /// explicitly rather than relying solely on `dirs::state_dir()`, which
@@ -518,6 +583,94 @@ mod tests {
 
         backend.delete(record.session_id);
         assert_eq!(backend.load_all().len(), 0);
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    /// Sets a record's file mtime to an absolute instant — `save` always
+    /// sets mtime to "now", so this is the only way to exercise an aged
+    /// file without a real 30-day wait.
+    fn backdate_to(backend: &FsPersistenceBackend, session_id: Uuid, modified: SystemTime) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(backend.final_path(session_id))
+            .unwrap();
+        file.set_modified(modified).unwrap();
+    }
+
+    fn backdate(backend: &FsPersistenceBackend, session_id: Uuid, age: Duration) {
+        backdate_to(backend, session_id, SystemTime::now() - age);
+    }
+
+    #[test]
+    fn fs_persistence_backend_prune_stale_should_remove_only_files_older_than_max_age() {
+        let tmp_dir = std::env::temp_dir().join(format!("tymux-test-{}", Uuid::new_v4()));
+        let backend = FsPersistenceBackend::new(tmp_dir.clone()).unwrap();
+        let stale = sample_record();
+        let fresh = sample_record();
+        backend.save(&stale).unwrap();
+        backend.save(&fresh).unwrap();
+        backdate(&backend, stale.session_id, Duration::from_secs(31 * 86400));
+        backdate(&backend, fresh.session_id, Duration::from_secs(29 * 86400));
+
+        let pruned = backend.prune_stale(STALE_SESSION_MAX_AGE);
+
+        assert_eq!(pruned, 1);
+        let remaining = backend.load_all();
+        assert_eq!(remaining, vec![fresh]);
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    #[test]
+    fn fs_persistence_backend_prune_stale_should_leave_everything_when_nothing_exceeds_max_age() {
+        let tmp_dir = std::env::temp_dir().join(format!("tymux-test-{}", Uuid::new_v4()));
+        let backend = FsPersistenceBackend::new(tmp_dir.clone()).unwrap();
+        backend.save(&sample_record()).unwrap();
+
+        let pruned = backend.prune_stale(STALE_SESSION_MAX_AGE);
+
+        assert_eq!(pruned, 0);
+        assert_eq!(backend.load_all().len(), 1);
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    #[test]
+    fn fs_persistence_backend_prune_stale_should_ignore_non_json_files() {
+        let tmp_dir = std::env::temp_dir().join(format!("tymux-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let stray = tmp_dir.join("README.txt");
+        std::fs::write(&stray, b"not a session record").unwrap();
+        let file = std::fs::File::options().write(true).open(&stray).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(60 * 86400))
+            .unwrap();
+        let backend = FsPersistenceBackend::new(tmp_dir.clone()).unwrap();
+
+        let pruned = backend.prune_stale(STALE_SESSION_MAX_AGE);
+
+        assert_eq!(pruned, 0);
+        assert!(stray.exists());
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    #[test]
+    fn fs_persistence_backend_prune_stale_should_keep_file_exactly_at_max_age_boundary() {
+        let tmp_dir = std::env::temp_dir().join(format!("tymux-test-{}", Uuid::new_v4()));
+        let backend = FsPersistenceBackend::new(tmp_dir.clone()).unwrap();
+        let record = sample_record();
+        backend.save(&record).unwrap();
+        let now = SystemTime::now();
+        backdate_to(&backend, record.session_id, now - STALE_SESSION_MAX_AGE);
+
+        // Same `now` the file was backdated against — not two independent
+        // `SystemTime::now()` calls — so `age == max_age` exactly, proving
+        // the `<=` (not `<`) comparison keeps a file right at the boundary.
+        let pruned = backend.prune_stale_at(STALE_SESSION_MAX_AGE, now);
+
+        assert_eq!(pruned, 0, "exactly at max_age is not yet stale");
+        assert_eq!(backend.load_all().len(), 1);
 
         std::fs::remove_dir_all(&tmp_dir).ok();
     }

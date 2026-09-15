@@ -16,6 +16,6 @@ pub use pane::{CellSnapshot, Pane, PaneSnapshot};
 pub use persistence::{
     default_sessions_dir, FsPersistenceBackend, NullPersistenceBackend, PersistedLayoutNode,
     PersistedPaneRecord, PersistedSessionRecord, PersistedWindowRecord, PersistenceBackend,
-    CURRENT_SCHEMA_VERSION,
+    CURRENT_SCHEMA_VERSION, STALE_SESSION_MAX_AGE,
 };
 pub use replay_buffer::ReplayOutcome;
