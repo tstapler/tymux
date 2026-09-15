@@ -1563,16 +1563,32 @@ fn tcp_health_probe_transition(
 /// healthy" without having to infer it from a pattern of external
 /// connection failures first.
 async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
+    // Frequent enough to catch a wedged listener well before an operator
+    // would notice from external symptoms alone, without adding meaningful
+    // load.
     const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+    // Generous relative to a loopback connect (normally sub-millisecond) so
+    // host scheduling jitter alone can't manufacture a false failure.
     const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
     let mut interval = tokio::time::interval(PROBE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consecutive_failures = 0u32;
+
+    // Pinned once and reused across iterations, unlike a `shutdown_signal()`
+    // call made fresh inside `select!` each time: this task also awaits the
+    // probe's own connect/timeout (up to PROBE_TIMEOUT) *outside* `select!`,
+    // and a per-iteration signal future has no registration during that
+    // window — a SIGTERM delivered then would be missed entirely, hanging
+    // this task and, with it, the `tokio::join!` in `main()` that waits on
+    // it alongside the UDS/TCP listeners.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     loop {
         tokio::select! {
             _ = interval.tick() => {}
-            _ = shutdown_signal() => return,
+            _ = &mut shutdown => return,
         }
         let outcome = match tokio::time::timeout(
             PROBE_TIMEOUT,
@@ -5247,6 +5263,35 @@ mod tests {
         );
         assert_eq!(next, 0);
         assert_eq!(action, TcpHealthProbeLog::Recovered);
+    }
+
+    /// The unit tests above only cover `tcp_health_probe_transition`'s pure
+    /// decision logic, fed synthetic `TcpProbeOutcome` values — they never
+    /// exercise the real `TcpStream::connect`/`timeout` call in
+    /// `tcp_health_probe` that actually classifies those outcomes. Drives
+    /// the real function against a real (bound-then-dropped, so it refuses
+    /// instantly) loopback listener, with the clock paused so the test
+    /// doesn't block real wall-clock time waiting out `PROBE_INTERVAL`.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn tcp_health_probe_logs_failing_after_sustained_real_refusal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // now refuses every connection
+
+        tokio::spawn(tcp_health_probe(addr));
+
+        // A few extra advances beyond the bare warn threshold, each
+        // followed by a yield so the probe task is actually polled before
+        // the next one lands — a couple of ticks get consumed by task
+        // scheduling/registration overhead around the spawn itself, so the
+        // exact threshold count alone isn't reliably enough real polls.
+        for _ in 0..(TCP_HEALTH_PROBE_WARN_THRESHOLD + 2) {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(logs_contain("tcp listener health probe failed repeatedly"));
     }
 
     // --- Epic 5.1: accept/reject over a real UDS connection ---

@@ -27,6 +27,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing-test = { workspace = true }
 prost = { workspace = true }
+# test-only: lets tests pause/advance the tokio clock (used by
+# tcp_health_probe's paused-clock test) without pulling test-util into the
+# daemon binary itself.
+tokio = { workspace = true, features = ["test-util"] }
 # Epic 5.1: spawn_uds_test_server dials its harness the same way
 # tymux-cli's dial_uds does (tower::service_fn + hyper_util::rt::TokioIo
 # wrapping a real tokio::net::UnixStream) — test-only, not needed by the
