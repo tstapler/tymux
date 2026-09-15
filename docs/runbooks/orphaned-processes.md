@@ -24,6 +24,11 @@ possible orphaned processes from prior tymuxd instance count=<N>
 exited cleanly before the restart. Treat a nonzero count as "worth
 checking," not as "N processes definitely leaked."
 
+`tymuxd` also prunes session records nothing has touched in 30 days
+(`TYMUXD_STALE_SESSION_MAX_AGE_DAYS`, 0 to disable) before this count is
+even computed — if you're investigating a crash from a while back, do it
+before that record ages out, or set the override first.
+
 ## Finding an actual orphan
 
 1. Note the `count` from the startup log line, and the persisted sessions
