@@ -1342,13 +1342,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sessions_dir.display()
         )
     })?;
-    let pruned_stale_count = backend.prune_stale(tymux_core::STALE_SESSION_MAX_AGE);
-    if pruned_stale_count > 0 {
-        tracing::info!(
-            count = pruned_stale_count,
-            max_age_days = tymux_core::STALE_SESSION_MAX_AGE.as_secs() / 86400,
-            "pruned stale dead-flagged session records nothing had touched in over max_age_days"
+    // Overridable, unlike most of this file's one-shot startup constants,
+    // because pruning is irreversible (a deleted record can never be
+    // revived) and this is the one behavior in this codebase's startup
+    // sequence with that property — see
+    // docs/runbooks/orphaned-processes.md, which relies on old records
+    // staying around to investigate a crash after the fact. 0 disables
+    // pruning entirely.
+    let stale_session_max_age = std::env::var("TYMUXD_STALE_SESSION_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|days| Duration::from_secs(days * 86400))
+        .unwrap_or(tymux_core::STALE_SESSION_MAX_AGE);
+    if stale_session_max_age.is_zero() {
+        tracing::debug!(
+            "stale session-record pruning disabled via TYMUXD_STALE_SESSION_MAX_AGE_DAYS=0"
         );
+    } else {
+        let pruned_stale_count = backend.prune_stale(stale_session_max_age);
+        if pruned_stale_count > 0 {
+            tracing::warn!(
+                count = pruned_stale_count,
+                max_age_days = stale_session_max_age.as_secs() / 86400,
+                "pruned stale dead-flagged session records nothing had touched in over \
+                 max_age_days — irreversible; see docs/runbooks/orphaned-processes.md if you \
+                 needed an old one. Set TYMUXD_STALE_SESSION_MAX_AGE_DAYS=0 to disable"
+            );
+        }
     }
     let records = backend.load_all();
     let restored_count = records.len();

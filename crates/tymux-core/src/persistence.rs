@@ -330,11 +330,19 @@ impl FsPersistenceBackend {
     /// stat'd or removed is logged and left in place, never fatal. Returns
     /// the number of files removed.
     pub fn prune_stale(&self, max_age: Duration) -> usize {
+        self.prune_stale_at(max_age, SystemTime::now())
+    }
+
+    /// `prune_stale`'s real work, with `now` injected so a test can compare
+    /// a file it just backdated against the exact same instant rather than
+    /// two independent `SystemTime::now()` calls a few microseconds apart —
+    /// which, right at the `max_age` boundary, is the difference between a
+    /// deterministic test and a flaky one.
+    fn prune_stale_at(&self, max_age: Duration, now: SystemTime) -> usize {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(e) => e,
             Err(_) => return 0, // load_all logs this same condition right after
         };
-        let now = SystemTime::now();
         let mut pruned = 0;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -579,15 +587,19 @@ mod tests {
         std::fs::remove_dir_all(&tmp_dir).ok();
     }
 
-    /// Backdates a record's file mtime by `age` so prune_stale tests don't
-    /// need to actually wait — `save` always sets mtime to "now", so this
-    /// is the only way to exercise an aged file without a real 30-day wait.
-    fn backdate(backend: &FsPersistenceBackend, session_id: Uuid, age: Duration) {
+    /// Sets a record's file mtime to an absolute instant — `save` always
+    /// sets mtime to "now", so this is the only way to exercise an aged
+    /// file without a real 30-day wait.
+    fn backdate_to(backend: &FsPersistenceBackend, session_id: Uuid, modified: SystemTime) {
         let file = std::fs::File::options()
             .write(true)
             .open(backend.final_path(session_id))
             .unwrap();
-        file.set_modified(SystemTime::now() - age).unwrap();
+        file.set_modified(modified).unwrap();
+    }
+
+    fn backdate(backend: &FsPersistenceBackend, session_id: Uuid, age: Duration) {
+        backdate_to(backend, session_id, SystemTime::now() - age);
     }
 
     #[test]
@@ -639,6 +651,26 @@ mod tests {
 
         assert_eq!(pruned, 0);
         assert!(stray.exists());
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    #[test]
+    fn fs_persistence_backend_prune_stale_should_keep_file_exactly_at_max_age_boundary() {
+        let tmp_dir = std::env::temp_dir().join(format!("tymux-test-{}", Uuid::new_v4()));
+        let backend = FsPersistenceBackend::new(tmp_dir.clone()).unwrap();
+        let record = sample_record();
+        backend.save(&record).unwrap();
+        let now = SystemTime::now();
+        backdate_to(&backend, record.session_id, now - STALE_SESSION_MAX_AGE);
+
+        // Same `now` the file was backdated against — not two independent
+        // `SystemTime::now()` calls — so `age == max_age` exactly, proving
+        // the `<=` (not `<`) comparison keeps a file right at the boundary.
+        let pruned = backend.prune_stale_at(STALE_SESSION_MAX_AGE, now);
+
+        assert_eq!(pruned, 0, "exactly at max_age is not yet stale");
+        assert_eq!(backend.load_all().len(), 1);
 
         std::fs::remove_dir_all(&tmp_dir).ok();
     }
