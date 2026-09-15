@@ -1216,8 +1216,50 @@ fn count_orphan_candidates(records: &[tymux_core::PersistedSessionRecord]) -> us
         .sum()
 }
 
+/// Text for `-h`/`--help`. Deliberately never interpolates an env var's
+/// *value* (unlike `clap`'s default `--help`, which echoes an `env = "..."`
+/// field's current value unless `hide_env_values` is set — the exact
+/// footgun ADR-002 cites for keeping this binary's flag parsing
+/// hand-rolled) since `TYMUXD_TOKEN` is one of the env vars listed here.
+fn help_text() -> String {
+    format!(
+        "tymuxd {version}\n\
+         Headless session-multiplexer daemon.\n\
+         \n\
+         USAGE:\n\
+         \x20   tymuxd [OPTIONS]\n\
+         \n\
+         OPTIONS:\n\
+         \x20   -h, --help                  Print this help and exit\n\
+         \x20   -V, --version               Print version and exit\n\
+         \x20   --token <TOKEN>             Bearer token required for non-loopback binds [env: TYMUXD_TOKEN]\n\
+         \x20   --socket-path <PATH>        Unix-domain-socket path [env: TYMUXD_SOCKET_PATH]\n\
+         \x20   --socket-group <GROUP>      POSIX group granted full daemon access over the UDS [env: TYMUXD_SOCKET_GROUP]\n\
+         \x20   --disable-tcp-loopback      Disable the TCP loopback listener [env: TYMUXD_DISABLE_TCP_LOOPBACK]\n\
+         \n\
+         Also read from the environment: TYMUXD_ADDR (default 127.0.0.1:7419),\n\
+         TYMUXD_STALE_SESSION_MAX_AGE_DAYS, TYMUXD_GRACE_PERIOD_MS,\n\
+         TYMUXD_DISCONNECT_REGRESSION_WINDOW_MS.\n",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Must run before anything else in main() — before logging init, the
+    // setsid() call, and certainly before any port bind or persisted-state
+    // touch — since #49 requires --version/--help to exit 0 without any of
+    // those side effects.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{}", help_text());
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("tymuxd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1235,7 +1277,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TymuxService RPC is gated by auth::BearerAuthInterceptor when bound
     // non-loopback (wired at server construction below). Loopback binds are
     // unaffected — only local processes can reach the port there.
-    let args: Vec<String> = std::env::args().collect();
     let configured_token = auth::resolve_token(&args);
     let is_loopback = socket_addr.ip().is_loopback();
 
@@ -5418,6 +5459,35 @@ mod tests {
             response.is_ok(),
             "expected success via the group path when uid is mismatched but the configured \
              allowed_gid matches this test process's own real egid, got {response:?}"
+        );
+    }
+
+    // --- #49: --version/--help exit without touching daemon state ---
+    // Actually running the compiled binary with these flags is covered by
+    // crates/tymuxd/tests/version_and_help.rs (needs CARGO_BIN_EXE_tymuxd,
+    // which is only set for tests/ integration binaries, not this unit-test
+    // module).
+
+    #[test]
+    fn help_text_names_binary_and_every_documented_flag_but_no_env_var_value() {
+        std::env::set_var("TYMUXD_TOKEN", "should-never-be-echoed");
+        let text = help_text();
+        std::env::remove_var("TYMUXD_TOKEN");
+
+        assert!(text.starts_with("tymuxd "));
+        for flag in [
+            "--help",
+            "--version",
+            "--token",
+            "--socket-path",
+            "--socket-group",
+            "--disable-tcp-loopback",
+        ] {
+            assert!(text.contains(flag), "help text missing {flag}: {text}");
+        }
+        assert!(
+            !text.contains("should-never-be-echoed"),
+            "help text must never echo an env var's current value: {text}"
         );
     }
 }
