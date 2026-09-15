@@ -1342,6 +1342,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sessions_dir.display()
         )
     })?;
+    let pruned_stale_count = backend.prune_stale(tymux_core::STALE_SESSION_MAX_AGE);
+    if pruned_stale_count > 0 {
+        tracing::info!(
+            count = pruned_stale_count,
+            max_age_days = tymux_core::STALE_SESSION_MAX_AGE.as_secs() / 86400,
+            "pruned stale dead-flagged session records nothing had touched in over max_age_days"
+        );
+    }
     let records = backend.load_all();
     let restored_count = records.len();
     let orphan_candidate_count = count_orphan_candidates(&records);
