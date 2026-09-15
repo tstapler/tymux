@@ -1487,6 +1487,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         res
     };
 
+    // The accept loop above only ever surfaces a problem by erroring out of
+    // `serve_with_incoming_shutdown` — but a listener that's stopped
+    // accepting connections (backlog full, socket in a wedged state, etc.)
+    // doesn't necessarily error; the tonic future can sit there healthy
+    // while every external dial gets refused. A periodic self-dial is the
+    // only way to observe what an external caller actually sees.
+    let tcp_health_future = async {
+        if !tcp_disabled {
+            tcp_health_probe(tcp_probe_target(socket_addr)).await;
+        }
+    };
+
     // tokio::join!, not select!/try_join! — a disabled TCP branch resolves
     // immediately via the `if tcp_disabled { return Ok(()) }` short-circuit
     // rather than hanging forever, and both listeners always fully drain
@@ -1497,11 +1509,137 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // that early-failure path: deterministically forcing a fatal
     // accept-loop IO error is disproportionate to this fix's scope; the
     // existing uds_socket_lifecycle.rs tests cover the join wiring itself.)
-    let (uds_res, tcp_res) = tokio::join!(uds_future, tcp_future);
+    let (uds_res, tcp_res, ()) = tokio::join!(uds_future, tcp_future, tcp_health_future);
     uds_res?;
     tcp_res?;
     tracing::info!("tymuxd shut down");
     Ok(())
+}
+
+/// `TcpListener::bind`ing e.g. `0.0.0.0:7419` means the daemon accepts on
+/// every interface, but nothing can dial `0.0.0.0` itself — substitute the
+/// same-family loopback address so the self-probe always has a concrete,
+/// reachable target.
+fn tcp_probe_target(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    if addr.ip().is_unspecified() {
+        let loopback = if addr.is_ipv6() {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        };
+        std::net::SocketAddr::new(loopback, addr.port())
+    } else {
+        addr
+    }
+}
+
+/// Consecutive failed probes required before a failure is logged. One-off
+/// blips (a momentary scheduling delay, a single dropped SYN) are not
+/// logged — only a sustained run is, so this doesn't turn ordinary
+/// transient noise into an error-level log line.
+const TCP_HEALTH_PROBE_WARN_THRESHOLD: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpProbeOutcome {
+    Connected,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpHealthProbeLog {
+    None,
+    Failing(u32),
+    Recovered,
+}
+
+/// Pure state transition for the probe loop below, split out so the
+/// logging decision is unit-testable without real sockets or timers — same
+/// extract-a-pure-function pattern as `log_tcp_listener_status`.
+fn tcp_health_probe_transition(
+    consecutive_failures: u32,
+    outcome: TcpProbeOutcome,
+) -> (u32, TcpHealthProbeLog) {
+    match outcome {
+        TcpProbeOutcome::Connected => {
+            let was_failing = consecutive_failures >= TCP_HEALTH_PROBE_WARN_THRESHOLD;
+            (
+                0,
+                if was_failing {
+                    TcpHealthProbeLog::Recovered
+                } else {
+                    TcpHealthProbeLog::None
+                },
+            )
+        }
+        TcpProbeOutcome::Failed => {
+            let next = consecutive_failures + 1;
+            (
+                next,
+                if next >= TCP_HEALTH_PROBE_WARN_THRESHOLD {
+                    TcpHealthProbeLog::Failing(next)
+                } else {
+                    TcpHealthProbeLog::None
+                },
+            )
+        }
+    }
+}
+
+/// Self-dials `probe_addr` on an interval for the life of the daemon,
+/// giving external supervision a log line that distinguishes "daemon
+/// alive, TCP listener specifically unreachable" from "daemon fully
+/// healthy" without having to infer it from a pattern of external
+/// connection failures first.
+async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
+    // Frequent enough to catch a wedged listener well before an operator
+    // would notice from external symptoms alone, without adding meaningful
+    // load.
+    const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+    // Generous relative to a loopback connect (normally sub-millisecond) so
+    // host scheduling jitter alone can't manufacture a false failure.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let mut interval = tokio::time::interval(PROBE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut consecutive_failures = 0u32;
+
+    // Pinned once and reused across iterations, unlike a `shutdown_signal()`
+    // call made fresh inside `select!` each time: this task also awaits the
+    // probe's own connect/timeout (up to PROBE_TIMEOUT) *outside* `select!`,
+    // and a per-iteration signal future has no registration during that
+    // window — a SIGTERM delivered then would be missed entirely, hanging
+    // this task and, with it, the `tokio::join!` in `main()` that waits on
+    // it alongside the UDS/TCP listeners.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = &mut shutdown => return,
+        }
+        let outcome =
+            match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(probe_addr))
+                .await
+            {
+                Ok(Ok(_stream)) => TcpProbeOutcome::Connected,
+                Ok(Err(_)) | Err(_) => TcpProbeOutcome::Failed,
+            };
+        let (next, action) = tcp_health_probe_transition(consecutive_failures, outcome);
+        consecutive_failures = next;
+        match action {
+            TcpHealthProbeLog::None => {}
+            TcpHealthProbeLog::Failing(count) => tracing::error!(
+                %probe_addr,
+                consecutive_failures = count,
+                "tcp listener health probe failed repeatedly — tymuxd is alive but its TCP endpoint may not be accepting connections"
+            ),
+            TcpHealthProbeLog::Recovered => tracing::info!(
+                %probe_addr,
+                "tcp listener health probe recovered — accepting connections again"
+            ),
+        }
+    }
 }
 
 /// Shared `tonic::transport::Server` keepalive configuration for both the
@@ -5084,6 +5222,102 @@ mod tests {
         log_socket_group_caveat(None, None);
 
         assert!(!logs_contain("full daemon control"));
+    }
+
+    // --- TCP listener self-health-probe ---
+
+    #[test]
+    fn tcp_probe_target_substitutes_loopback_for_unspecified_ipv4() {
+        let target = tcp_probe_target("0.0.0.0:7419".parse().unwrap());
+        assert_eq!(target, "127.0.0.1:7419".parse().unwrap());
+    }
+
+    #[test]
+    fn tcp_probe_target_substitutes_loopback_for_unspecified_ipv6() {
+        let target = tcp_probe_target("[::]:7419".parse().unwrap());
+        assert_eq!(target, "[::1]:7419".parse().unwrap());
+    }
+
+    #[test]
+    fn tcp_probe_target_leaves_concrete_address_unchanged() {
+        let target = tcp_probe_target(test_socket_addr());
+        assert_eq!(target, test_socket_addr());
+    }
+
+    #[test]
+    fn tcp_health_probe_transition_stays_quiet_below_warn_threshold() {
+        let mut failures = 0;
+        for _ in 0..TCP_HEALTH_PROBE_WARN_THRESHOLD - 1 {
+            let (next, action) = tcp_health_probe_transition(failures, TcpProbeOutcome::Failed);
+            failures = next;
+            assert_eq!(action, TcpHealthProbeLog::None);
+        }
+    }
+
+    #[test]
+    fn tcp_health_probe_transition_warns_once_threshold_reached_and_keeps_warning() {
+        let mut failures = TCP_HEALTH_PROBE_WARN_THRESHOLD - 1;
+        let (next, action) = tcp_health_probe_transition(failures, TcpProbeOutcome::Failed);
+        failures = next;
+        assert_eq!(
+            action,
+            TcpHealthProbeLog::Failing(TCP_HEALTH_PROBE_WARN_THRESHOLD)
+        );
+
+        // Still failing on the next tick — keeps warning, doesn't fall
+        // silent just because it already warned once.
+        let (next, action) = tcp_health_probe_transition(failures, TcpProbeOutcome::Failed);
+        assert_eq!(
+            action,
+            TcpHealthProbeLog::Failing(TCP_HEALTH_PROBE_WARN_THRESHOLD + 1)
+        );
+        assert_eq!(next, TCP_HEALTH_PROBE_WARN_THRESHOLD + 1);
+    }
+
+    #[test]
+    fn tcp_health_probe_transition_success_below_threshold_logs_nothing() {
+        let (next, action) = tcp_health_probe_transition(1, TcpProbeOutcome::Connected);
+        assert_eq!(next, 0);
+        assert_eq!(action, TcpHealthProbeLog::None);
+    }
+
+    #[test]
+    fn tcp_health_probe_transition_success_after_warning_logs_recovery() {
+        let (next, action) = tcp_health_probe_transition(
+            TCP_HEALTH_PROBE_WARN_THRESHOLD,
+            TcpProbeOutcome::Connected,
+        );
+        assert_eq!(next, 0);
+        assert_eq!(action, TcpHealthProbeLog::Recovered);
+    }
+
+    /// The unit tests above only cover `tcp_health_probe_transition`'s pure
+    /// decision logic, fed synthetic `TcpProbeOutcome` values — they never
+    /// exercise the real `TcpStream::connect`/`timeout` call in
+    /// `tcp_health_probe` that actually classifies those outcomes. Drives
+    /// the real function against a real (bound-then-dropped, so it refuses
+    /// instantly) loopback listener, with the clock paused so the test
+    /// doesn't block real wall-clock time waiting out `PROBE_INTERVAL`.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn tcp_health_probe_logs_failing_after_sustained_real_refusal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // now refuses every connection
+
+        tokio::spawn(tcp_health_probe(addr));
+
+        // A few extra advances beyond the bare warn threshold, each
+        // followed by a yield so the probe task is actually polled before
+        // the next one lands — a couple of ticks get consumed by task
+        // scheduling/registration overhead around the spawn itself, so the
+        // exact threshold count alone isn't reliably enough real polls.
+        for _ in 0..(TCP_HEALTH_PROBE_WARN_THRESHOLD + 2) {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(logs_contain("tcp listener health probe failed repeatedly"));
     }
 
     // --- Epic 5.1: accept/reject over a real UDS connection ---
