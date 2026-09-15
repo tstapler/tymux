@@ -1590,15 +1590,13 @@ async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
             _ = interval.tick() => {}
             _ = &mut shutdown => return,
         }
-        let outcome = match tokio::time::timeout(
-            PROBE_TIMEOUT,
-            tokio::net::TcpStream::connect(probe_addr),
-        )
-        .await
-        {
-            Ok(Ok(_stream)) => TcpProbeOutcome::Connected,
-            Ok(Err(_)) | Err(_) => TcpProbeOutcome::Failed,
-        };
+        let outcome =
+            match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(probe_addr))
+                .await
+            {
+                Ok(Ok(_stream)) => TcpProbeOutcome::Connected,
+                Ok(Err(_)) | Err(_) => TcpProbeOutcome::Failed,
+            };
         let (next, action) = tcp_health_probe_transition(consecutive_failures, outcome);
         consecutive_failures = next;
         match action {
