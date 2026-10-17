@@ -171,6 +171,13 @@ message CreateSessionRequest {
   // Working directory for the spawned pane. Empty means "the daemon's own
   // cwd" (matching `command`'s empty-means-default convention) — Epic 1.5.
   string cwd = 3;
+  // Arguments for `command`. `command` is exec'd as a single program name, so
+  // anything with arguments must come through here (e.g. command "/bin/sh",
+  // args ["-c", "claude --resume x"]). Persisted and replayed on revive.
+  repeated string args = 4;
+  // Extra environment for the spawned pane, layered over the daemon's. Persisted
+  // in plaintext with the session record and replayed on revive; do not put secrets here.
+  map<string, string> env = 5;
 }
 
 message ListSessionsRequest {}

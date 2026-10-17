@@ -29,6 +29,10 @@ pub struct PersistedPaneRecord {
     /// deserialize without a migration.
     #[serde(default)]
     pub exit_code: Option<i32>,
+    /// Arguments and environment the pane was spawned with, replayed by
+    /// `tymux revive`. `#[serde(default)]` so older on-disk records load unchanged.
+    #[serde(default)]
+    pub launch: crate::pane::Launch,
 }
 
 /// Mirrors [`LayoutNode`], but leaves hold a full [`PersistedPaneRecord`]
@@ -100,6 +104,7 @@ impl PersistedLayoutNode {
                             // exit — the "structural mutation" trigger this
                             // whole snapshot path already runs on.
                             exit_code: pane.exit_code(),
+                            launch: pane.launch.clone(),
                         }
                     }
                     // Already `Dead` (e.g. a partially-revived session, or a
@@ -115,6 +120,7 @@ impl PersistedLayoutNode {
                         rows: 0,
                         cols: 0,
                         exit_code: None,
+                        launch: Default::default(),
                     },
                 };
                 PersistedLayoutNode::Leaf { pane: record }
@@ -433,6 +439,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persisted_pane_record_should_load_without_launch_and_roundtrip_it() {
+        let old = r#"{"pane_id":"00000000-0000-0000-0000-000000000001","command":"/bin/sh","cwd":"/tmp","rows":24,"cols":80}"#;
+        let loaded: PersistedPaneRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded.launch, crate::pane::Launch::default());
+
+        let mut with = loaded.clone();
+        with.launch.args = vec!["-c".to_string(), "true".to_string()];
+        with.launch.env.insert("K".to_string(), "V".to_string());
+        let back: PersistedPaneRecord =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back, with);
+    }
+
     fn leaf(id: Uuid) -> PersistedLayoutNode {
         PersistedLayoutNode::Leaf {
             pane: PersistedPaneRecord {
@@ -442,6 +462,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 exit_code: None,
+                launch: Default::default(),
             },
         }
     }

@@ -158,6 +158,7 @@ async fn shutdown_signal_should_flush_pending_persistence_before_process_exits_o
                 name: "sigterm-test".to_string(),
                 command: "/bin/sh".to_string(),
                 cwd: String::new(),
+                ..Default::default()
             })
             .await
             .unwrap()

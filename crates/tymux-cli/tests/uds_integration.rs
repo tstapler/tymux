@@ -203,6 +203,7 @@ async fn seed_session(socket_path: &Path, name: &str) {
             name: name.to_string(),
             command: "/bin/sh".to_string(),
             cwd: String::new(),
+            ..Default::default()
         })
         .await
         .expect("CreateSession should succeed while seeding test data");

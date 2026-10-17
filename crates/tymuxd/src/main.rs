@@ -540,7 +540,15 @@ impl TymuxService for TymuxDaemon {
         };
         let id = self
             .engine
-            .create_session(req.name, command, cwd)
+            .create_session_with(
+                req.name,
+                command,
+                tymux_core::Launch {
+                    args: req.args,
+                    env: req.env.into_iter().collect(),
+                },
+                cwd,
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
         // O(1) lookup, not list_sessions().find() — the latter rebuilds a
         // full snapshot of every session under both locks just to find the
@@ -1862,6 +1870,7 @@ mod tests {
             name: name.to_string(),
             command: "/bin/sh".to_string(),
             cwd: String::new(),
+            ..Default::default()
         }
     }
 
@@ -2116,6 +2125,57 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    /// `command` is exec'd as one program name, so arguments and environment
+    /// must arrive through `args`/`env` and reach the spawned process.
+    #[tokio::test]
+    async fn create_session_should_pass_args_and_env_to_the_spawned_process() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+
+        let mut req = create_req("test");
+        req.command = "/bin/sh".to_string();
+        req.args = vec![
+            "-c".to_string(),
+            "echo \"$TYMUX_TEST_VAR\" | rev; sleep 30".to_string(),
+        ];
+        req.env
+            .insert("TYMUX_TEST_VAR".to_string(), "env-marker".to_string());
+        let session = daemon
+            .create_session(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let text: String = pane
+                .snapshot()
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.clone())
+                .collect();
+            if text.contains("rekram-vne") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected the env var, reversed, within 5s; got: {text}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(pane.launch.args.len(), 2);
+        assert_eq!(
+            pane.launch.env.get("TYMUX_TEST_VAR").map(String::as_str),
+            Some("env-marker")
+        );
     }
 
     /// REQ-8 (Epic 1.5) edge path — empty string means "the daemon's own
@@ -5004,6 +5064,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 exit_code: None,
+                launch: Default::default(),
             },
         };
         let dead_leaf = PersistedLayoutNode::Leaf {
@@ -5014,6 +5075,7 @@ mod tests {
                 rows: 0,
                 cols: 0,
                 exit_code: None,
+                launch: Default::default(),
             },
         };
         let record = PersistedSessionRecord {
@@ -5060,6 +5122,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 exit_code: Some(0),
+                launch: Default::default(),
             },
         };
         let record = PersistedSessionRecord {

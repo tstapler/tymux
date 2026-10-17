@@ -10,7 +10,7 @@ use crate::layout::{
     LayoutNode, Orientation, RemoveOutcome, MIN_PANE_COLS, MIN_PANE_ROWS,
     RECOMMENDED_SPLIT_MIN_ROWS,
 };
-use crate::pane::Pane;
+use crate::pane::{Launch, Pane};
 use crate::persistence::{
     persisted_layout_to_live, NullPersistenceBackend, PersistedPaneRecord, PersistedSessionRecord,
     PersistedWindowRecord, PersistenceBackend,
@@ -363,8 +363,26 @@ impl Engine {
         command: Option<String>,
         cwd: Option<String>,
     ) -> Result<Uuid> {
+        self.create_session_with(name, command, Launch::default(), cwd)
+    }
+
+    /// [`Self::create_session`] with explicit program arguments and environment.
+    pub fn create_session_with(
+        &self,
+        name: String,
+        command: Option<String>,
+        launch: Launch,
+        cwd: Option<String>,
+    ) -> Result<Uuid> {
         let shell = command.unwrap_or_else(default_shell);
-        let pane = Pane::spawn_with_cwd(&shell, cwd.as_deref(), DEFAULT_ROWS, DEFAULT_COLS)?;
+        let pane = Pane::spawn_launch(
+            &shell,
+            &launch,
+            cwd.as_deref(),
+            None,
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+        )?;
         let pane_id = pane.id;
         let window_id = Uuid::new_v4();
 
@@ -814,10 +832,11 @@ impl Engine {
                     _ => continue,
                 }
             };
-            match Pane::spawn_with_id(
-                *pane_id,
+            match Pane::spawn_launch(
                 &record.command,
+                &record.launch,
                 Some(&record.cwd),
+                Some(*pane_id),
                 record.rows.max(MIN_PANE_ROWS),
                 record.cols.max(MIN_PANE_COLS),
             ) {
@@ -1675,6 +1694,7 @@ mod tests {
                     rows: 24,
                     cols: 40,
                     exit_code: None,
+                    launch: Default::default(),
                 }),
             );
         }
