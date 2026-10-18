@@ -69,6 +69,14 @@ const PTY_READ_BUF_SIZE: usize = 4096;
 /// on, it isn't a correctness concern.
 const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Extra spawn parameters beyond the program name, kept on the pane so a
+/// revive can respawn an equivalent process.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Launch {
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
 /// A single pty-backed terminal. Owns the child process, the pty master
 /// (for resize + writing input), and a `vt100::Parser` that keeps a
 /// structured screen model in sync with everything the child prints.
@@ -82,6 +90,7 @@ pub struct Pane {
     /// directory at spawn time — persisted (Epic 4) so `tymux revive` can
     /// respawn an equivalent process later; not otherwise used at runtime.
     pub command: String,
+    pub launch: Launch,
     pub cwd: String,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -160,7 +169,7 @@ pub struct CellSnapshot {
 
 impl Pane {
     pub fn spawn(command: &str, rows: u16, cols: u16) -> Result<Arc<Self>> {
-        Self::spawn_internal(command, None, None, rows, cols)
+        Self::spawn_internal(command, &Launch::default(), None, None, rows, cols)
     }
 
     /// Like [`Self::spawn`], but with an explicit working directory — used
@@ -173,7 +182,7 @@ impl Pane {
         rows: u16,
         cols: u16,
     ) -> Result<Arc<Self>> {
-        Self::spawn_internal(command, cwd, None, rows, cols)
+        Self::spawn_internal(command, &Launch::default(), cwd, None, rows, cols)
     }
 
     /// Like [`Self::spawn_with_cwd`], but assigns a specific `id` rather
@@ -189,11 +198,25 @@ impl Pane {
         rows: u16,
         cols: u16,
     ) -> Result<Arc<Self>> {
-        Self::spawn_internal(command, cwd, Some(id), rows, cols)
+        Self::spawn_internal(command, &Launch::default(), cwd, Some(id), rows, cols)
+    }
+
+    /// The general spawn: like [`Self::spawn_with_id`] (`id: None` generates
+    /// one) but with explicit arguments and environment.
+    pub fn spawn_launch(
+        command: &str,
+        launch: &Launch,
+        cwd: Option<&str>,
+        id: Option<Uuid>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_internal(command, launch, cwd, id, rows, cols)
     }
 
     fn spawn_internal(
         command: &str,
+        launch: &Launch,
         cwd: Option<&str>,
         id: Option<Uuid>,
         rows: u16,
@@ -208,6 +231,10 @@ impl Pane {
         })?;
 
         let mut cmd = CommandBuilder::new(command);
+        cmd.args(&launch.args);
+        for (key, value) in &launch.env {
+            cmd.env(key, value);
+        }
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
@@ -237,6 +264,7 @@ impl Pane {
         let pane = Arc::new(Pane {
             id: id.unwrap_or_else(Uuid::new_v4),
             command: command.to_string(),
+            launch: launch.clone(),
             cwd: effective_cwd,
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),

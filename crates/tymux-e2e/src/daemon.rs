@@ -316,6 +316,7 @@ mod tests {
                 name: "transport-drop-smoke".into(),
                 command: "/bin/sh".into(),
                 cwd: String::new(),
+                ..Default::default()
             })
             .await
             .unwrap()

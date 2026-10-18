@@ -522,6 +522,7 @@ async fn run() -> Result<()> {
                     name: name.clone(),
                     command: command.unwrap_or_default(),
                     cwd: String::new(),
+                    ..Default::default()
                 })
                 .await?
                 .into_inner();
@@ -1569,6 +1570,7 @@ mod tests {
                 name: "bearer-auth-attach-test".to_string(),
                 command: "/bin/sh".to_string(),
                 cwd: String::new(),
+                ..Default::default()
             })
             .await
             .expect("CreateSession should succeed with the correct bearer token")

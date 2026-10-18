@@ -420,6 +420,7 @@ async fn tymuxd_restart_with_open_uds_attach_stream_resumes_cleanly() {
                 name: "uds-restart-clean".to_string(),
                 command: "/bin/sh".to_string(),
                 cwd: String::new(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -500,6 +501,7 @@ async fn tymuxd_restart_after_unclean_exit_with_open_uds_attach_stream_resumes_c
                 name: "uds-restart-unclean".to_string(),
                 command: "/bin/sh".to_string(),
                 cwd: String::new(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -583,6 +585,7 @@ async fn tymuxd_dual_listener_drains_concurrent_tcp_and_uds_attach_streams_on_si
             name: "dual-drain-tcp".to_string(),
             command: "/bin/sh".to_string(),
             cwd: String::new(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -594,6 +597,7 @@ async fn tymuxd_dual_listener_drains_concurrent_tcp_and_uds_attach_streams_on_si
             name: "dual-drain-uds".to_string(),
             command: "/bin/sh".to_string(),
             cwd: String::new(),
+            ..Default::default()
         })
         .await
         .unwrap()

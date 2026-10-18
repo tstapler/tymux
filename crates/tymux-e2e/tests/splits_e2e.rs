@@ -27,6 +27,7 @@ async fn split_panes_should_render_and_accept_input_independently() {
             name: "splits-e2e".into(),
             command: "/bin/sh".into(),
             cwd: String::new(),
+            ..Default::default()
         })
         .await
         .unwrap()

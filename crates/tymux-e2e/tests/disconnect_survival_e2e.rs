@@ -18,6 +18,7 @@ async fn pane_survives_graceful_detach() {
             name: "survive-graceful".into(),
             command: "/bin/sh".into(),
             cwd: String::new(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -331,6 +332,7 @@ async fn pane_survives_abrupt_disconnect() {
             name: "survive-abrupt".into(),
             command: "/bin/sh".into(),
             cwd: String::new(),
+            ..Default::default()
         })
         .await
         .unwrap()

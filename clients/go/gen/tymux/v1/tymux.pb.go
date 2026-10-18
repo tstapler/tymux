@@ -531,7 +531,14 @@ type CreateSessionRequest struct {
 	Command string                 `protobuf:"bytes,2,opt,name=command,proto3" json:"command,omitempty"` // defaults to $SHELL if empty
 	// Working directory for the spawned pane. Empty means "the daemon's own
 	// cwd" (matching `command`'s empty-means-default convention) — Epic 1.5.
-	Cwd           string `protobuf:"bytes,3,opt,name=cwd,proto3" json:"cwd,omitempty"`
+	Cwd string `protobuf:"bytes,3,opt,name=cwd,proto3" json:"cwd,omitempty"`
+	// Arguments for `command`. `command` is exec'd as a single program name, so
+	// anything with arguments must come through here (e.g. command "/bin/sh",
+	// args ["-c", "claude --resume x"]). Persisted and replayed on revive.
+	Args []string `protobuf:"bytes,4,rep,name=args,proto3" json:"args,omitempty"`
+	// Extra environment for the spawned pane, layered over the daemon's. Persisted
+	// in plaintext with the session record and replayed on revive; do not put secrets here.
+	Env           map[string]string `protobuf:"bytes,5,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -585,6 +592,20 @@ func (x *CreateSessionRequest) GetCwd() string {
 		return x.Cwd
 	}
 	return ""
+}
+
+func (x *CreateSessionRequest) GetArgs() []string {
+	if x != nil {
+		return x.Args
+	}
+	return nil
+}
+
+func (x *CreateSessionRequest) GetEnv() map[string]string {
+	if x != nil {
+		return x.Env
+	}
+	return nil
 }
 
 type ListSessionsRequest struct {
@@ -2145,11 +2166,16 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x04rows\x18\x02 \x01(\rR\x04rows\x12\x12\n" +
 	"\x04cols\x18\x03 \x01(\rR\x04cols\x12.\n" +
 	"\bliveness\x18\x04 \x01(\x0e2\x12.tymux.v1.LivenessR\bliveness\x12\x10\n" +
-	"\x03cwd\x18\x05 \x01(\tR\x03cwd\"V\n" +
+	"\x03cwd\x18\x05 \x01(\tR\x03cwd\"\xdd\x01\n" +
 	"\x14CreateSessionRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x10\n" +
-	"\x03cwd\x18\x03 \x01(\tR\x03cwd\"\x15\n" +
+	"\x03cwd\x18\x03 \x01(\tR\x03cwd\x12\x12\n" +
+	"\x04args\x18\x04 \x03(\tR\x04args\x129\n" +
+	"\x03env\x18\x05 \x03(\v2'.tymux.v1.CreateSessionRequest.EnvEntryR\x03env\x1a6\n" +
+	"\bEnvEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x15\n" +
 	"\x13ListSessionsRequest\"E\n" +
 	"\x14ListSessionsResponse\x12-\n" +
 	"\bsessions\x18\x01 \x03(\v2\x11.tymux.v1.SessionR\bsessions\"3\n" +
@@ -2280,7 +2306,7 @@ func file_tymux_v1_tymux_proto_rawDescGZIP() []byte {
 }
 
 var file_tymux_v1_tymux_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
+var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
 var file_tymux_v1_tymux_proto_goTypes = []any{
 	(Liveness)(0),                    // 0: tymux.v1.Liveness
 	(Orientation)(0),                 // 1: tymux.v1.Orientation
@@ -2316,6 +2342,7 @@ var file_tymux_v1_tymux_proto_goTypes = []any{
 	(*GapExceeded)(nil),              // 31: tymux.v1.GapExceeded
 	(*Heartbeat)(nil),                // 32: tymux.v1.Heartbeat
 	(*AttachEvent)(nil),              // 33: tymux.v1.AttachEvent
+	nil,                              // 34: tymux.v1.CreateSessionRequest.EnvEntry
 }
 var file_tymux_v1_tymux_proto_depIdxs = []int32{
 	3,  // 0: tymux.v1.Session.windows:type_name -> tymux.v1.Window
@@ -2327,47 +2354,48 @@ var file_tymux_v1_tymux_proto_depIdxs = []int32{
 	6,  // 6: tymux.v1.Split.children:type_name -> tymux.v1.LayoutChild
 	4,  // 7: tymux.v1.LayoutChild.layout:type_name -> tymux.v1.Layout
 	0,  // 8: tymux.v1.Pane.liveness:type_name -> tymux.v1.Liveness
-	2,  // 9: tymux.v1.ListSessionsResponse.sessions:type_name -> tymux.v1.Session
-	2,  // 10: tymux.v1.ReviveSessionResponse.session:type_name -> tymux.v1.Session
-	1,  // 11: tymux.v1.SplitPaneRequest.orientation:type_name -> tymux.v1.Orientation
-	2,  // 12: tymux.v1.ClosePaneResponse.session:type_name -> tymux.v1.Session
-	4,  // 13: tymux.v1.WindowLayoutEvent.layout:type_name -> tymux.v1.Layout
-	25, // 14: tymux.v1.PaneSnapshot.grid:type_name -> tymux.v1.Row
-	0,  // 15: tymux.v1.PaneSnapshot.liveness:type_name -> tymux.v1.Liveness
-	26, // 16: tymux.v1.Row.cells:type_name -> tymux.v1.Cell
-	28, // 17: tymux.v1.AttachRequest.resize:type_name -> tymux.v1.Resize
-	24, // 18: tymux.v1.AttachEvent.snapshot:type_name -> tymux.v1.PaneSnapshot
-	29, // 19: tymux.v1.AttachEvent.exited:type_name -> tymux.v1.ExitStatus
-	31, // 20: tymux.v1.AttachEvent.gap_exceeded:type_name -> tymux.v1.GapExceeded
-	32, // 21: tymux.v1.AttachEvent.heartbeat:type_name -> tymux.v1.Heartbeat
-	30, // 22: tymux.v1.AttachEvent.output_chunk:type_name -> tymux.v1.OutputChunk
-	8,  // 23: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
-	9,  // 24: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
-	11, // 25: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
-	13, // 26: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
-	21, // 27: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
-	22, // 28: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
-	15, // 29: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
-	16, // 30: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
-	18, // 31: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
-	19, // 32: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
-	27, // 33: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
-	2,  // 34: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
-	10, // 35: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
-	12, // 36: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
-	14, // 37: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
-	24, // 38: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
-	23, // 39: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
-	2,  // 40: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
-	17, // 41: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
-	2,  // 42: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
-	20, // 43: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
-	33, // 44: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
-	34, // [34:45] is the sub-list for method output_type
-	23, // [23:34] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	34, // 9: tymux.v1.CreateSessionRequest.env:type_name -> tymux.v1.CreateSessionRequest.EnvEntry
+	2,  // 10: tymux.v1.ListSessionsResponse.sessions:type_name -> tymux.v1.Session
+	2,  // 11: tymux.v1.ReviveSessionResponse.session:type_name -> tymux.v1.Session
+	1,  // 12: tymux.v1.SplitPaneRequest.orientation:type_name -> tymux.v1.Orientation
+	2,  // 13: tymux.v1.ClosePaneResponse.session:type_name -> tymux.v1.Session
+	4,  // 14: tymux.v1.WindowLayoutEvent.layout:type_name -> tymux.v1.Layout
+	25, // 15: tymux.v1.PaneSnapshot.grid:type_name -> tymux.v1.Row
+	0,  // 16: tymux.v1.PaneSnapshot.liveness:type_name -> tymux.v1.Liveness
+	26, // 17: tymux.v1.Row.cells:type_name -> tymux.v1.Cell
+	28, // 18: tymux.v1.AttachRequest.resize:type_name -> tymux.v1.Resize
+	24, // 19: tymux.v1.AttachEvent.snapshot:type_name -> tymux.v1.PaneSnapshot
+	29, // 20: tymux.v1.AttachEvent.exited:type_name -> tymux.v1.ExitStatus
+	31, // 21: tymux.v1.AttachEvent.gap_exceeded:type_name -> tymux.v1.GapExceeded
+	32, // 22: tymux.v1.AttachEvent.heartbeat:type_name -> tymux.v1.Heartbeat
+	30, // 23: tymux.v1.AttachEvent.output_chunk:type_name -> tymux.v1.OutputChunk
+	8,  // 24: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
+	9,  // 25: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
+	11, // 26: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
+	13, // 27: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
+	21, // 28: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
+	22, // 29: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
+	15, // 30: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
+	16, // 31: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
+	18, // 32: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
+	19, // 33: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
+	27, // 34: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
+	2,  // 35: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
+	10, // 36: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
+	12, // 37: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
+	14, // 38: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
+	24, // 39: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
+	23, // 40: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
+	2,  // 41: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
+	17, // 42: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
+	2,  // 43: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
+	20, // 44: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
+	33, // 45: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
+	35, // [35:46] is the sub-list for method output_type
+	24, // [24:35] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_tymux_v1_tymux_proto_init() }
@@ -2400,7 +2428,7 @@ func file_tymux_v1_tymux_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tymux_v1_tymux_proto_rawDesc), len(file_tymux_v1_tymux_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   32,
+			NumMessages:   33,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
