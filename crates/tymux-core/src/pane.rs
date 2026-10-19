@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -62,6 +63,10 @@ fn release_scrollback_budget(lines: usize) {
 /// keystrokes, so this is deliberately larger than tymux-cli's 1024-byte
 /// stdin-forwarding buffer.
 const PTY_READ_BUF_SIZE: usize = 4096;
+
+/// How long a SIGHUP'd child gets before `Pane::kill` escalates to SIGKILL.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_millis(250);
 
 /// Backlog for the output broadcast channel. Sized to absorb a burst of
 /// terminal output between two `Attach` clients' `recv()` polls without
@@ -135,7 +140,7 @@ pub struct Pane {
     /// this is what lets `attach()` tell which broadcast chunks are
     /// already reflected in a given snapshot and must not be replayed.
     output_seq: AtomicU64,
-    exited: AtomicBool,
+    exited: Arc<AtomicBool>,
     exit_notify: Notify,
     /// The child's numeric exit code, captured by the reader thread's
     /// `_child.wait()` call right after it observes EOF (Story 1.2.2).
@@ -144,6 +149,8 @@ pub struct Pane {
     /// caller that observes `is_exited() == true` is guaranteed to see the
     /// final `exit_code()` value too (write-then-flag, no separate race).
     exit_code: Mutex<Option<i32>>,
+    /// Captured at spawn so `kill` can signal without taking `_child`.
+    pid: Option<u32>,
     // Held only to keep the child alive; not otherwise touched.
     _child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     // Tracked so the reader thread's lifecycle is at least observable
@@ -246,6 +253,7 @@ impl Pane {
         // PRIORITY).
         cmd.env_remove("TYMUXD_TOKEN");
         let child = pair.slave.spawn_command(cmd)?;
+        let pid = child.process_id();
         drop(pair.slave);
 
         let writer = pair.master.take_writer()?;
@@ -276,9 +284,10 @@ impl Pane {
             replay_budget_bytes,
             output_tx: output_tx.clone(),
             output_seq: AtomicU64::new(0),
-            exited: AtomicBool::new(false),
+            exited: Arc::new(AtomicBool::new(false)),
             exit_notify: Notify::new(),
             exit_code: Mutex::new(None),
+            pid,
             _child: Mutex::new(child),
             _reader_handle: Mutex::new(None),
         });
@@ -361,7 +370,48 @@ impl Pane {
     /// `KillSession` signaling attached clients) should await
     /// [`Self::wait_exit`] after calling this.
     pub fn kill(&self) -> Result<()> {
-        self._child.lock().unwrap().kill()?;
+        #[cfg(unix)]
+        {
+            self.kill_unix()
+        }
+        #[cfg(not(unix))]
+        {
+            self._child.lock().unwrap().kill()?;
+            Ok(())
+        }
+    }
+
+    /// SIGHUP now, SIGKILL after `KILL_GRACE` if the child is still alive.
+    /// Not `portable_pty::Child::kill`: it sleeps 50ms before its first
+    /// liveness re-check even when the child dies instantly, which blocked
+    /// `KillSession` (and the engine's `panes` lock) for ~50ms per pane.
+    #[cfg(unix)]
+    fn kill_unix(&self) -> Result<()> {
+        let Some(pid) = self.pid else {
+            return Ok(());
+        };
+        // SAFETY: plain signal to a pid we spawned and have not yet reaped
+        // (the reader thread reaps only after pty EOF).
+        if unsafe { libc::kill(pid as i32, libc::SIGHUP) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if self.is_exited() {
+            return Ok(());
+        }
+        let exited = self.exited.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + KILL_GRACE;
+            while std::time::Instant::now() < deadline {
+                if exited.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !exited.load(Ordering::SeqCst) {
+                // SAFETY: as above; `exited` is set right after the reap.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
+        });
         Ok(())
     }
 
@@ -560,7 +610,11 @@ impl Drop for Pane {
     /// so this join returns immediately.
     fn drop(&mut self) {
         if let Some(handle) = self._reader_handle.lock().unwrap().take() {
-            if let Err(panic) = handle.join() {
+            // The reader thread itself can drop the last Arc<Pane>; joining
+            // itself fails with EDEADLK and panics.
+            if handle.thread().id() == std::thread::current().id() {
+                // fall through to budget release
+            } else if let Err(panic) = handle.join() {
                 tracing::error!(pane_id = %self.id, ?panic, "pane reader thread panicked");
             }
         }
@@ -931,6 +985,44 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), pane.wait_exit())
             .await
             .expect("wait_exit must resolve immediately for an already-exited pane");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_should_return_without_waiting_for_portable_pty_grace_sleep() {
+        let pane = Pane::spawn("/bin/cat", 24, 80).unwrap();
+        let started = std::time::Instant::now();
+        pane.kill().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "kill() blocked for {:?}",
+            started.elapsed()
+        );
+        tokio::time::timeout(Duration::from_secs(2), pane.wait_exit())
+            .await
+            .expect("SIGHUP should end a plain child promptly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_should_escalate_to_sigkill_when_child_ignores_sighup() {
+        let pane = Pane::spawn_launch(
+            "/bin/sh",
+            &Launch {
+                args: vec!["-c".into(), "trap '' HUP; while :; do sleep 1; done".into()],
+                env: Default::default(),
+            },
+            None,
+            None,
+            24,
+            80,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        pane.kill().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), pane.wait_exit())
+            .await
+            .expect("a SIGHUP-ignoring child must still die via SIGKILL escalation");
     }
 
     #[tokio::test]
