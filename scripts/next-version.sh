@@ -18,13 +18,13 @@ fi
 range="$last_tag..HEAD"
 [ -n "$(git rev-list "$range" --max-count=1)" ] || exit 0
 
-level=patch
+level="patch"
 if git log --format=%B "$range" | grep -Eq '^BREAKING[ -]CHANGE'; then
-  level=major
+  level="major"
 elif git log --format=%s "$range" | grep -Eq '^[a-z]+(\([^)]*\))?!:'; then
-  level=major
+  level="major"
 elif git log --format=%s "$range" | grep -Eq '^feat(\([^)]*\))?:'; then
-  level=minor
+  level="minor"
 fi
 
 IFS=. read -r major minor patch <<<"${last_tag#v}"
