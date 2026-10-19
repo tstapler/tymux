@@ -842,3 +842,30 @@ func TestListSessionsRejectsOverUDSWithMismatchedUID(t *testing.T) {
 		t.Fatalf("expected client helper subprocess output to contain %q, got:\n%s", wantLine, out)
 	}
 }
+
+func TestGetServerInfoReportsVersionProtocolAndCapabilities(t *testing.T) {
+	addr := startDaemon(t)
+	client := newClient(addr, "")
+
+	resp, err := client.GetServerInfo(context.Background(), connect.NewRequest(&tymuxv1.GetServerInfoRequest{ClientProtocolVersion: 1}))
+	if err != nil {
+		t.Fatalf("GetServerInfo: %v", err)
+	}
+	info := resp.Msg
+	if info.GetVersion() == "" {
+		t.Error("version is empty")
+	}
+	if info.GetProtocolVersion() < 1 || info.GetMinClientProtocolVersion() > info.GetProtocolVersion() {
+		t.Errorf("implausible protocol range: protocol=%d min_client=%d", info.GetProtocolVersion(), info.GetMinClientProtocolVersion())
+	}
+	hasArgsEnv := false
+	for _, c := range info.GetCapabilities() {
+		hasArgsEnv = hasArgsEnv || c == "create_session.args_env"
+	}
+	if !hasArgsEnv {
+		t.Errorf("capabilities %v missing create_session.args_env", info.GetCapabilities())
+	}
+	if info.GetPid() == 0 || info.GetStartedAtUnix() == 0 {
+		t.Errorf("pid/started_at not populated: pid=%d started_at=%d", info.GetPid(), info.GetStartedAtUnix())
+	}
+}
