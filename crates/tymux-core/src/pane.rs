@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+#[cfg(not(unix))]
+use portable_pty::CommandBuilder;
+use portable_pty::{native_pty_system, MasterPty, PtySize};
 use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
 
@@ -237,22 +239,30 @@ impl Pane {
             pixel_height: 0,
         })?;
 
-        let mut cmd = CommandBuilder::new(command);
-        cmd.args(&launch.args);
-        for (key, value) in &launch.env {
-            cmd.env(key, value);
-        }
-        if let Some(cwd) = cwd {
-            cmd.cwd(cwd);
-        }
-        // Never let the daemon's own bearer secret (if TYMUXD_TOKEN is set in
-        // tymuxd's process environment) reach a spawned pane — portable_pty's
-        // CommandBuilder inherits the full parent environment by default, and
-        // this is the daemon's own secret, not something a pane's user should
-        // ever see via `env`/`printenv` (research/pitfalls.md §2, HIGH
-        // PRIORITY).
-        cmd.env_remove("TYMUXD_TOKEN");
-        let child = pair.slave.spawn_command(cmd)?;
+        #[cfg(unix)]
+        let child: Box<dyn portable_pty::Child + Send + Sync> = {
+            let master_fd = pair
+                .master
+                .as_raw_fd()
+                .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
+            // TYMUXD_TOKEN is stripped inside spawn_on_pty: it's the daemon's
+            // own secret and must never reach a pane's environment
+            // (research/pitfalls.md §2, HIGH PRIORITY).
+            Box::new(crate::spawn::spawn_on_pty(master_fd, command, launch, cwd)?)
+        };
+        #[cfg(not(unix))]
+        let child = {
+            let mut cmd = CommandBuilder::new(command);
+            cmd.args(&launch.args);
+            for (key, value) in &launch.env {
+                cmd.env(key, value);
+            }
+            if let Some(cwd) = cwd {
+                cmd.cwd(cwd);
+            }
+            cmd.env_remove("TYMUXD_TOKEN");
+            pair.slave.spawn_command(cmd)?
+        };
         let pid = child.process_id();
         drop(pair.slave);
 
@@ -1059,13 +1069,85 @@ mod tests {
         assert_eq!(pane.exit_code(), Some(0));
     }
 
+    fn wait_for_grid_text(pane: &Pane, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let text: String = pane
+                .snapshot()
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.as_str())
+                .collect();
+            if text.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_give_child_a_controlling_terminal() {
+        // Field 7 of /proc/self/stat is tty_nr: nonzero only with a
+        // controlling terminal. Linux-only probe; the print is arithmetic so
+        // the typed-command echo can't satisfy the match.
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let script = "read -r l < /proc/self/stat; set -- $l; \
+                      if [ \"$7\" != 0 ]; then echo CTTY-$((20+22)); else echo NOCTTY-$((20+22)); fi";
+        let launch = Launch {
+            args: vec!["-c".into(), script.into()],
+            ..Launch::default()
+        };
+        let pane = Pane::spawn_launch("/bin/sh", &launch, None, None, 24, 80).unwrap();
+        assert!(
+            wait_for_grid_text(&pane, "CTTY-42"),
+            "child had no controlling tty"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_fail_when_program_does_not_exist() {
+        assert!(Pane::spawn("/nonexistent/tymux-test-prog", 24, 80).is_err());
+        assert!(Pane::spawn("tymux-test-prog-not-on-path", 24, 80).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_start_in_home_when_requested_cwd_is_not_a_directory() {
+        let home = std::env::var("HOME").expect("HOME set");
+        let launch = Launch {
+            args: vec!["-c".into(), "echo CWD-$(pwd)-END".into()],
+            ..Launch::default()
+        };
+        let pane = Pane::spawn_launch(
+            "/bin/sh",
+            &launch,
+            Some("/definitely/not/a/dir"),
+            None,
+            24,
+            200,
+        )
+        .unwrap();
+        let real_home = std::fs::canonicalize(&home).unwrap();
+        assert!(
+            wait_for_grid_text(&pane, &format!("CWD-{}-END", real_home.display()))
+                || wait_for_grid_text(&pane, &format!("CWD-{home}-END")),
+            "child did not fall back to HOME"
+        );
+    }
+
     /// Task 1.3.1b (bearer-token-auth Epic 1.3): `TYMUXD_TOKEN` — the
     /// daemon's own bearer secret, if set in `tymuxd`'s process
     /// environment — must never reach a spawned pane's process
     /// environment, since `portable_pty::CommandBuilder` inherits the full
     /// parent environment by default (research/pitfalls.md §2, HIGH
-    /// PRIORITY). The fix (`cmd.env_remove("TYMUXD_TOKEN")` in
-    /// `spawn_internal`) must be targeted: every other variable still
+    /// PRIORITY). The fix (the `TYMUXD_TOKEN` filter in
+    /// `spawn::spawn_on_pty`) must be targeted: every other variable still
     /// reaches the pane.
     #[test]
     fn spawn_should_not_leak_tymuxd_token_into_pane_environment() {
