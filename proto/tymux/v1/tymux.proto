@@ -6,6 +6,13 @@ package tymux.v1;
 // a typed, cross-language RPC surface, so a web UI, an AI agent, or a CLI
 // can all drive the same multiplexer without scraping terminal escape codes.
 service TymuxService {
+  // Reports the daemon's build version, wire-protocol revision, and optional
+  // capabilities, so a client can decide whether it can talk to this daemon
+  // (and which newer features it may use) before issuing anything else. See
+  // docs/adr/0003-protocol-versioning.md for the compatibility policy. A
+  // daemon older than this RPC (<= 1.3.0) answers UNIMPLEMENTED, which
+  // clients should treat as "pre-versioning, protocol 0".
+  rpc GetServerInfo(GetServerInfoRequest) returns (ServerInfo);
   rpc CreateSession(CreateSessionRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc KillSession(KillSessionRequest) returns (KillSessionResponse);
@@ -377,4 +384,28 @@ message AttachEvent {
     // one of `output`/`output_chunk` per AttachEvent, not both.
     OutputChunk output_chunk = 7;
   }
+}
+
+message GetServerInfoRequest {
+  // The caller's own protocol revision, for the daemon's logs; the daemon does
+  // not reject on it (the client decides compatibility from ServerInfo).
+  uint32 client_protocol_version = 1;
+}
+
+message ServerInfo {
+  // The tymuxd build's semver, e.g. "1.4.0" (same value as `tymuxd --version`).
+  string version = 1;
+  // Wire-protocol revision: an integer bumped on any change a client may need
+  // to branch on. Independent of `version`; additive changes that clients can
+  // ignore do not bump it.
+  uint32 protocol_version = 2;
+  // Oldest client protocol revision this daemon still serves correctly.
+  uint32 min_client_protocol_version = 3;
+  // Feature names for optional behavior, e.g. "create_session.args_env". Check
+  // for a capability rather than comparing versions when gating one feature.
+  repeated string capabilities = 4;
+  // The daemon process's id, so a supervisor can signal exactly this daemon.
+  uint32 pid = 5;
+  // Daemon start time, seconds since the Unix epoch.
+  int64 started_at_unix = 6;
 }
