@@ -248,7 +248,7 @@ impl Pane {
             // TYMUXD_TOKEN is stripped inside spawn_on_pty: it's the daemon's
             // own secret and must never reach a pane's environment
             // (research/pitfalls.md §2, HIGH PRIORITY).
-            Box::new(crate::spawn::spawn_on_pty(master_fd, command, launch, cwd)?)
+            crate::spawn::spawn_on_pty(master_fd, command, launch, cwd)?
         };
         #[cfg(not(unix))]
         let child = {
