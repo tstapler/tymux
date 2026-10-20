@@ -1,0 +1,46 @@
+name: Auto release
+
+# Every merge to main gets a version tag and a GitHub release. The level is
+# computed by scripts/next-version.sh from the Conventional Commit subjects
+# since the last v* tag. main is branch-protected, so this only pushes a tag
+# (no version-bump commit); release.yml stamps the workspace version from the
+# tag at build time.
+#
+# A tag pushed with GITHUB_TOKEN does not trigger other workflows, so the
+# release workflow is started explicitly via workflow_dispatch (the one
+# event GITHUB_TOKEN is allowed to trigger).
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Compute next version
+        id: version
+        run: |
+          next="$(scripts/next-version.sh)"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Next version: ${next:-<none>}"
+      - name: Tag and start the release
+        if: steps.version.outputs.next != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          git tag "v$NEXT"
+          git push origin "v$NEXT"
+          gh workflow run release.yml --ref "v$NEXT"
