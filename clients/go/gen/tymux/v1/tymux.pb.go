@@ -2137,6 +2137,145 @@ func (*AttachEvent_Heartbeat) isAttachEvent_Payload() {}
 
 func (*AttachEvent_OutputChunk) isAttachEvent_Payload() {}
 
+type GetServerInfoRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The caller's own protocol revision, for the daemon's logs; the daemon does
+	// not reject on it (the client decides compatibility from ServerInfo).
+	ClientProtocolVersion uint32 `protobuf:"varint,1,opt,name=client_protocol_version,json=clientProtocolVersion,proto3" json:"client_protocol_version,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *GetServerInfoRequest) Reset() {
+	*x = GetServerInfoRequest{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetServerInfoRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetServerInfoRequest) ProtoMessage() {}
+
+func (x *GetServerInfoRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetServerInfoRequest.ProtoReflect.Descriptor instead.
+func (*GetServerInfoRequest) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *GetServerInfoRequest) GetClientProtocolVersion() uint32 {
+	if x != nil {
+		return x.ClientProtocolVersion
+	}
+	return 0
+}
+
+type ServerInfo struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The tymuxd build's semver, e.g. "1.4.0" (same value as `tymuxd --version`).
+	Version string `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"`
+	// Wire-protocol revision: an integer bumped on any change a client may need
+	// to branch on. Independent of `version`; additive changes that clients can
+	// ignore do not bump it.
+	ProtocolVersion uint32 `protobuf:"varint,2,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	// Oldest client protocol revision this daemon still serves correctly.
+	MinClientProtocolVersion uint32 `protobuf:"varint,3,opt,name=min_client_protocol_version,json=minClientProtocolVersion,proto3" json:"min_client_protocol_version,omitempty"`
+	// Feature names for optional behavior, e.g. "create_session.args_env". Check
+	// for a capability rather than comparing versions when gating one feature.
+	Capabilities []string `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	// The daemon process's id, so a supervisor can signal exactly this daemon.
+	Pid uint32 `protobuf:"varint,5,opt,name=pid,proto3" json:"pid,omitempty"`
+	// Daemon start time, seconds since the Unix epoch.
+	StartedAtUnix int64 `protobuf:"varint,6,opt,name=started_at_unix,json=startedAtUnix,proto3" json:"started_at_unix,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ServerInfo) Reset() {
+	*x = ServerInfo{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ServerInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ServerInfo) ProtoMessage() {}
+
+func (x *ServerInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ServerInfo.ProtoReflect.Descriptor instead.
+func (*ServerInfo) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *ServerInfo) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *ServerInfo) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *ServerInfo) GetMinClientProtocolVersion() uint32 {
+	if x != nil {
+		return x.MinClientProtocolVersion
+	}
+	return 0
+}
+
+func (x *ServerInfo) GetCapabilities() []string {
+	if x != nil {
+		return x.Capabilities
+	}
+	return nil
+}
+
+func (x *ServerInfo) GetPid() uint32 {
+	if x != nil {
+		return x.Pid
+	}
+	return 0
+}
+
+func (x *ServerInfo) GetStartedAtUnix() int64 {
+	if x != nil {
+		return x.StartedAtUnix
+	}
+	return 0
+}
+
 var File_tymux_v1_tymux_proto protoreflect.FileDescriptor
 
 const file_tymux_v1_tymux_proto_rawDesc = "" +
@@ -2269,7 +2408,17 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\fgap_exceeded\x18\x05 \x01(\v2\x15.tymux.v1.GapExceededH\x00R\vgapExceeded\x123\n" +
 	"\theartbeat\x18\x06 \x01(\v2\x13.tymux.v1.HeartbeatH\x00R\theartbeat\x12:\n" +
 	"\foutput_chunk\x18\a \x01(\v2\x15.tymux.v1.OutputChunkH\x00R\voutputChunkB\t\n" +
-	"\apayload*J\n" +
+	"\apayload\"N\n" +
+	"\x14GetServerInfoRequest\x126\n" +
+	"\x17client_protocol_version\x18\x01 \x01(\rR\x15clientProtocolVersion\"\xee\x01\n" +
+	"\n" +
+	"ServerInfo\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\tR\aversion\x12)\n" +
+	"\x10protocol_version\x18\x02 \x01(\rR\x0fprotocolVersion\x12=\n" +
+	"\x1bmin_client_protocol_version\x18\x03 \x01(\rR\x18minClientProtocolVersion\x12\"\n" +
+	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12\x10\n" +
+	"\x03pid\x18\x05 \x01(\rR\x03pid\x12&\n" +
+	"\x0fstarted_at_unix\x18\x06 \x01(\x03R\rstartedAtUnix*J\n" +
 	"\bLiveness\x12\x18\n" +
 	"\x14LIVENESS_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rLIVENESS_LIVE\x10\x01\x12\x11\n" +
@@ -2277,8 +2426,9 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\vOrientation\x12\x1b\n" +
 	"\x17ORIENTATION_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16ORIENTATION_HORIZONTAL\x10\x01\x12\x18\n" +
-	"\x14ORIENTATION_VERTICAL\x10\x022\xad\x06\n" +
-	"\fTymuxService\x12B\n" +
+	"\x14ORIENTATION_VERTICAL\x10\x022\xf4\x06\n" +
+	"\fTymuxService\x12E\n" +
+	"\rGetServerInfo\x12\x1e.tymux.v1.GetServerInfoRequest\x1a\x14.tymux.v1.ServerInfo\x12B\n" +
 	"\rCreateSession\x12\x1e.tymux.v1.CreateSessionRequest\x1a\x11.tymux.v1.Session\x12M\n" +
 	"\fListSessions\x12\x1d.tymux.v1.ListSessionsRequest\x1a\x1e.tymux.v1.ListSessionsResponse\x12J\n" +
 	"\vKillSession\x12\x1c.tymux.v1.KillSessionRequest\x1a\x1d.tymux.v1.KillSessionResponse\x12P\n" +
@@ -2306,7 +2456,7 @@ func file_tymux_v1_tymux_proto_rawDescGZIP() []byte {
 }
 
 var file_tymux_v1_tymux_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
+var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
 var file_tymux_v1_tymux_proto_goTypes = []any{
 	(Liveness)(0),                    // 0: tymux.v1.Liveness
 	(Orientation)(0),                 // 1: tymux.v1.Orientation
@@ -2342,7 +2492,9 @@ var file_tymux_v1_tymux_proto_goTypes = []any{
 	(*GapExceeded)(nil),              // 31: tymux.v1.GapExceeded
 	(*Heartbeat)(nil),                // 32: tymux.v1.Heartbeat
 	(*AttachEvent)(nil),              // 33: tymux.v1.AttachEvent
-	nil,                              // 34: tymux.v1.CreateSessionRequest.EnvEntry
+	(*GetServerInfoRequest)(nil),     // 34: tymux.v1.GetServerInfoRequest
+	(*ServerInfo)(nil),               // 35: tymux.v1.ServerInfo
+	nil,                              // 36: tymux.v1.CreateSessionRequest.EnvEntry
 }
 var file_tymux_v1_tymux_proto_depIdxs = []int32{
 	3,  // 0: tymux.v1.Session.windows:type_name -> tymux.v1.Window
@@ -2354,7 +2506,7 @@ var file_tymux_v1_tymux_proto_depIdxs = []int32{
 	6,  // 6: tymux.v1.Split.children:type_name -> tymux.v1.LayoutChild
 	4,  // 7: tymux.v1.LayoutChild.layout:type_name -> tymux.v1.Layout
 	0,  // 8: tymux.v1.Pane.liveness:type_name -> tymux.v1.Liveness
-	34, // 9: tymux.v1.CreateSessionRequest.env:type_name -> tymux.v1.CreateSessionRequest.EnvEntry
+	36, // 9: tymux.v1.CreateSessionRequest.env:type_name -> tymux.v1.CreateSessionRequest.EnvEntry
 	2,  // 10: tymux.v1.ListSessionsResponse.sessions:type_name -> tymux.v1.Session
 	2,  // 11: tymux.v1.ReviveSessionResponse.session:type_name -> tymux.v1.Session
 	1,  // 12: tymux.v1.SplitPaneRequest.orientation:type_name -> tymux.v1.Orientation
@@ -2369,30 +2521,32 @@ var file_tymux_v1_tymux_proto_depIdxs = []int32{
 	31, // 21: tymux.v1.AttachEvent.gap_exceeded:type_name -> tymux.v1.GapExceeded
 	32, // 22: tymux.v1.AttachEvent.heartbeat:type_name -> tymux.v1.Heartbeat
 	30, // 23: tymux.v1.AttachEvent.output_chunk:type_name -> tymux.v1.OutputChunk
-	8,  // 24: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
-	9,  // 25: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
-	11, // 26: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
-	13, // 27: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
-	21, // 28: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
-	22, // 29: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
-	15, // 30: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
-	16, // 31: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
-	18, // 32: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
-	19, // 33: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
-	27, // 34: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
-	2,  // 35: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
-	10, // 36: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
-	12, // 37: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
-	14, // 38: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
-	24, // 39: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
-	23, // 40: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
-	2,  // 41: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
-	17, // 42: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
-	2,  // 43: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
-	20, // 44: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
-	33, // 45: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
-	35, // [35:46] is the sub-list for method output_type
-	24, // [24:35] is the sub-list for method input_type
+	34, // 24: tymux.v1.TymuxService.GetServerInfo:input_type -> tymux.v1.GetServerInfoRequest
+	8,  // 25: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
+	9,  // 26: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
+	11, // 27: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
+	13, // 28: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
+	21, // 29: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
+	22, // 30: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
+	15, // 31: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
+	16, // 32: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
+	18, // 33: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
+	19, // 34: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
+	27, // 35: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
+	35, // 36: tymux.v1.TymuxService.GetServerInfo:output_type -> tymux.v1.ServerInfo
+	2,  // 37: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
+	10, // 38: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
+	12, // 39: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
+	14, // 40: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
+	24, // 41: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
+	23, // 42: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
+	2,  // 43: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
+	17, // 44: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
+	2,  // 45: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
+	20, // 46: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
+	33, // 47: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
+	36, // [36:48] is the sub-list for method output_type
+	24, // [24:36] is the sub-list for method input_type
 	24, // [24:24] is the sub-list for extension type_name
 	24, // [24:24] is the sub-list for extension extendee
 	0,  // [0:24] is the sub-list for field type_name
@@ -2428,7 +2582,7 @@ func file_tymux_v1_tymux_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tymux_v1_tymux_proto_rawDesc), len(file_tymux_v1_tymux_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   33,
+			NumMessages:   35,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
