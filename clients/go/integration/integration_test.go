@@ -135,21 +135,20 @@ func TestAttachResumesByteIdenticalAfterDisconnectAndReattachWithRecordedSeq(t *
 	client := newClient(addr, "")
 	ctx := context.Background()
 
-	// Deterministic, non-timestamped output so two independent shell
-	// processes produce byte-identical bytes: a short paced loop (sleeps
-	// give the disconnect below a real mid-stream window to land in)
-	// followed by a completion marker.
-	// The completion marker is split across two adjacent quoted strings
-	// ('RESUME-TEST-D' + 'ONE', concatenated by the shell) so the literal
-	// keystroke bytes echoed back by the pty before execution never
-	// contain the contiguous marker text — otherwise a naive
-	// strings.Contains check below would match on the command's own echo
-	// instead of its actual stdout.
-	const cmd = "i=0; while [ $i -lt 40 ]; do printf 'M%03dE\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; printf 'RESUME-TEST-D''ONE\\n'\n"
+	// Each pane runs `/bin/sh -c <script>` rather than typing into an
+	// interactive shell: with no prompt and no keystrokes, there is no
+	// echo or prompt redraw whose ordering could differ between the two
+	// independent panes (that race made this test flaky). The leading
+	// sleep gives the first attach time to land before the paced loop
+	// starts, so the disconnect below hits a real mid-stream window. The
+	// completion marker is split across two quoted strings so the script
+	// text itself (never echoed now, but cheap insurance) can't match it.
+	const script = "sleep 0.2; i=0; while [ $i -lt 40 ]; do printf 'M%03dE\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; printf 'RESUME-TEST-D''ONE\\n'"
+	shArgs := []string{"-c", script}
 	const doneMarker = "RESUME-TEST-DONE"
 	const partialMarker = "M015E"
 
-	refSession, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{Name: "go-integration-resume-ref"}))
+	refSession, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{Name: "go-integration-resume-ref", Command: "/bin/sh", Args: shArgs}))
 	if err != nil {
 		t.Fatalf("CreateSession (reference): %v", err)
 	}
@@ -161,9 +160,9 @@ func TestAttachResumesByteIdenticalAfterDisconnectAndReattachWithRecordedSeq(t *
 	// branch) — an attach with no resume_from_seq at all gets only the
 	// legacy, seq-less Output field forever, which this seq-tracking test
 	// can't use.
-	reference := runAttachUntilMarker(t, client, refPaneID, seqPtr(0), cmd, doneMarker, 15*time.Second)
+	reference := runAttachUntilMarker(t, client, refPaneID, seqPtr(0), "", doneMarker, 15*time.Second)
 
-	session, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{Name: "go-integration-resume"}))
+	session, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{Name: "go-integration-resume", Command: "/bin/sh", Args: shArgs}))
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -176,9 +175,6 @@ func TestAttachResumesByteIdenticalAfterDisconnectAndReattachWithRecordedSeq(t *
 		ResumeFromSeq: seqPtr(0),
 	}); err != nil {
 		t.Fatalf("send pane_id: %v", err)
-	}
-	if err := stream1.Send(&tymuxv1.AttachRequest{Payload: &tymuxv1.AttachRequest_Input{Input: []byte(cmd)}}); err != nil {
-		t.Fatalf("send input: %v", err)
 	}
 
 	var firstLeg []byte
@@ -416,6 +412,17 @@ func startDaemonOn(t *testing.T, addr, token string, extraEnv ...string) string 
 	if token != "" {
 		env = append(env, "TYMUXD_TOKEN="+token)
 	}
+	// Isolated by default so a developer's own running tymuxd (default socket
+	// path) can't make the test daemon fail its single-instance lock; later
+	// entries win, so an explicit TYMUXD_SOCKET_PATH in extraEnv overrides.
+	// Short /tmp base: t.TempDir() embeds the test name and can exceed the
+	// 108-byte sun_path limit.
+	sockDir, err := os.MkdirTemp("/tmp", "tymux-it-")
+	if err != nil {
+		t.Fatalf("mkdir socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	env = append(env, "TYMUXD_SOCKET_PATH="+filepath.Join(sockDir, "uds", "tymuxd.sock"))
 	env = append(env, extraEnv...)
 	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
