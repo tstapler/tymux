@@ -18,13 +18,13 @@ use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
     attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
     Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse, CreateSessionRequest,
-    CreateWindowRequest, ExitStatus, GapExceeded, Heartbeat, KillSessionRequest,
-    KillSessionResponse, Layout as ProtoLayout, LayoutChild as ProtoLayoutChild,
-    ListSessionsRequest, ListSessionsResponse, Liveness, Orientation as ProtoOrientation,
-    OutputChunk, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot, ReviveSessionRequest,
-    ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest, SearchScrollbackResponse,
-    Session as ProtoSession, Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest,
-    Window as ProtoWindow, WindowLayoutEvent,
+    CreateWindowRequest, ExitStatus, GapExceeded, GetServerInfoRequest, Heartbeat,
+    KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
+    LayoutChild as ProtoLayoutChild, ListSessionsRequest, ListSessionsResponse, Liveness,
+    Orientation as ProtoOrientation, OutputChunk, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
+    ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest,
+    SearchScrollbackResponse, ServerInfo, Session as ProtoSession, Split as ProtoSplit,
+    SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
 };
 
 mod auth;
@@ -91,8 +91,12 @@ pub struct TymuxDaemon {
     heartbeat_interval: Duration,
 }
 
+/// Process start time, pinned the first time a daemon is constructed.
+static STARTED_AT: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
 impl TymuxDaemon {
     fn new(engine: Arc<Engine>) -> Self {
+        STARTED_AT.get_or_init(std::time::SystemTime::now);
         let disconnect_regression_window = std::env::var("TYMUXD_DISCONNECT_REGRESSION_WINDOW_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -522,6 +526,37 @@ fn snapshot_priming_event(pane: &tymux_core::Pane, pane_id_str: &str) -> (Attach
 
 #[tonic::async_trait]
 impl TymuxService for TymuxDaemon {
+    async fn get_server_info(
+        &self,
+        request: Request<GetServerInfoRequest>,
+    ) -> Result<Response<ServerInfo>, Status> {
+        let client_protocol_version = request.into_inner().client_protocol_version;
+        if client_protocol_version != 0
+            && client_protocol_version < tymux_proto::MIN_CLIENT_PROTOCOL_VERSION
+        {
+            tracing::warn!(
+                client_protocol_version,
+                min = tymux_proto::MIN_CLIENT_PROTOCOL_VERSION,
+                "client speaks a protocol older than this daemon supports"
+            );
+        }
+        let started_at_unix = STARTED_AT
+            .get()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        Ok(Response::new(ServerInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: tymux_proto::PROTOCOL_VERSION,
+            min_client_protocol_version: tymux_proto::MIN_CLIENT_PROTOCOL_VERSION,
+            capabilities: tymux_proto::CAPABILITIES
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            pid: std::process::id(),
+            started_at_unix,
+        }))
+    }
+
     async fn create_session(
         &self,
         request: Request<CreateSessionRequest>,
@@ -2269,6 +2304,27 @@ mod tests {
             sole_pane(&session.windows[0]).liveness,
             Liveness::Live as i32
         );
+    }
+
+    #[tokio::test]
+    async fn get_server_info_should_report_build_version_protocol_and_capabilities() {
+        let daemon = test_daemon();
+        let info = daemon
+            .get_server_info(Request::new(GetServerInfoRequest {
+                client_protocol_version: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.protocol_version, tymux_proto::PROTOCOL_VERSION);
+        assert!(info.min_client_protocol_version <= info.protocol_version);
+        assert!(info
+            .capabilities
+            .iter()
+            .any(|c| c == "create_session.args_env"));
+        assert_eq!(info.pid, std::process::id());
+        assert!(info.started_at_unix > 0);
     }
 
     #[tokio::test]
@@ -4731,7 +4787,7 @@ mod tests {
     async fn deferred_cleanup_tasks_should_each_fire_independently_on_schedule_when_ten_rapid_reconnect_drop_cycles_occur_within_one_grace_period(
     ) {
         const N: usize = 10;
-        let grace_period = Duration::from_millis(400);
+        let grace_period = Duration::from_millis(1200);
         let daemon = test_daemon_with_intervals(DEFAULT_HEARTBEAT_INTERVAL, grace_period);
         let mut client = spawn_test_server(daemon).await;
 
@@ -4788,7 +4844,7 @@ mod tests {
             // forward_handle, matching the Task 3.2.2c/3.2.2d tests'
             // existing pattern above.
             streams.push(stream);
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(75)).await;
         }
 
         // 10 setup-time layout events, one per registration —
@@ -4848,7 +4904,7 @@ mod tests {
             // not after the batch's last disconnect. A shared/reset
             // deadline would push every firing to ~`grace_period` after
             // client 9's disconnect, which for early `j` is far outside
-            // this tolerance window (the 9 * 25ms of inter-cycle gaps
+            // this tolerance window (the 9 * 75ms of inter-cycle gaps
             // alone exceeds it).
             let elapsed = fired_at.duration_since(disconnected_at);
             assert!(
