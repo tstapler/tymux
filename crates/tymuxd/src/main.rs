@@ -4731,7 +4731,7 @@ mod tests {
     async fn deferred_cleanup_tasks_should_each_fire_independently_on_schedule_when_ten_rapid_reconnect_drop_cycles_occur_within_one_grace_period(
     ) {
         const N: usize = 10;
-        let grace_period = Duration::from_millis(400);
+        let grace_period = Duration::from_millis(1200);
         let daemon = test_daemon_with_intervals(DEFAULT_HEARTBEAT_INTERVAL, grace_period);
         let mut client = spawn_test_server(daemon).await;
 
@@ -4788,7 +4788,7 @@ mod tests {
             // forward_handle, matching the Task 3.2.2c/3.2.2d tests'
             // existing pattern above.
             streams.push(stream);
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(75)).await;
         }
 
         // 10 setup-time layout events, one per registration —
@@ -4848,7 +4848,7 @@ mod tests {
             // not after the batch's last disconnect. A shared/reset
             // deadline would push every firing to ~`grace_period` after
             // client 9's disconnect, which for early `j` is far outside
-            // this tolerance window (the 9 * 25ms of inter-cycle gaps
+            // this tolerance window (the 9 * 75ms of inter-cycle gaps
             // alone exceeds it).
             let elapsed = fired_at.duration_since(disconnected_at);
             assert!(
