@@ -1686,9 +1686,9 @@ mod tests {
     ) {
         use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
         use tymux_proto::v1::{
-            AttachEvent, ClosePaneResponse, KillSessionResponse, ListSessionsResponse,
-            PaneSnapshot, SearchScrollbackRequest, SearchScrollbackResponse, WatchWindowRequest,
-            WindowLayoutEvent,
+            AttachEvent, ClosePaneResponse, GetServerInfoRequest, KillSessionResponse,
+            ListSessionsResponse, PaneSnapshot, SearchScrollbackRequest, SearchScrollbackResponse,
+            ServerInfo, WatchWindowRequest, WindowLayoutEvent,
         };
 
         /// Bare-bones service that only needs to complete an HTTP/2
@@ -1699,6 +1699,12 @@ mod tests {
 
         #[tonic::async_trait]
         impl TymuxService for DummyTymuxService {
+            async fn get_server_info(
+                &self,
+                _request: tonic::Request<GetServerInfoRequest>,
+            ) -> Result<tonic::Response<ServerInfo>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
             async fn create_session(
                 &self,
                 _request: tonic::Request<CreateSessionRequest>,

@@ -33,6 +33,9 @@ const (
 // reflection-formatted method names, remove the leading slash and convert the remaining slash to a
 // period.
 const (
+	// TymuxServiceGetServerInfoProcedure is the fully-qualified name of the TymuxService's
+	// GetServerInfo RPC.
+	TymuxServiceGetServerInfoProcedure = "/tymux.v1.TymuxService/GetServerInfo"
 	// TymuxServiceCreateSessionProcedure is the fully-qualified name of the TymuxService's
 	// CreateSession RPC.
 	TymuxServiceCreateSessionProcedure = "/tymux.v1.TymuxService/CreateSession"
@@ -67,6 +70,13 @@ const (
 
 // TymuxServiceClient is a client for the tymux.v1.TymuxService service.
 type TymuxServiceClient interface {
+	// Reports the daemon's build version, wire-protocol revision, and optional
+	// capabilities, so a client can decide whether it can talk to this daemon
+	// (and which newer features it may use) before issuing anything else. See
+	// docs/adr/0003-protocol-versioning.md for the compatibility policy. A
+	// daemon older than this RPC (<= 1.3.0) answers UNIMPLEMENTED, which
+	// clients should treat as "pre-versioning, protocol 0".
+	GetServerInfo(context.Context, *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error)
 	CreateSession(context.Context, *connect.Request[v1.CreateSessionRequest]) (*connect.Response[v1.Session], error)
 	ListSessions(context.Context, *connect.Request[v1.ListSessionsRequest]) (*connect.Response[v1.ListSessionsResponse], error)
 	KillSession(context.Context, *connect.Request[v1.KillSessionRequest]) (*connect.Response[v1.KillSessionResponse], error)
@@ -168,6 +178,12 @@ func NewTymuxServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 	baseURL = strings.TrimRight(baseURL, "/")
 	tymuxServiceMethods := v1.File_tymux_v1_tymux_proto.Services().ByName("TymuxService").Methods()
 	return &tymuxServiceClient{
+		getServerInfo: connect.NewClient[v1.GetServerInfoRequest, v1.ServerInfo](
+			httpClient,
+			baseURL+TymuxServiceGetServerInfoProcedure,
+			connect.WithSchema(tymuxServiceMethods.ByName("GetServerInfo")),
+			connect.WithClientOptions(opts...),
+		),
 		createSession: connect.NewClient[v1.CreateSessionRequest, v1.Session](
 			httpClient,
 			baseURL+TymuxServiceCreateSessionProcedure,
@@ -239,6 +255,7 @@ func NewTymuxServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 
 // tymuxServiceClient implements TymuxServiceClient.
 type tymuxServiceClient struct {
+	getServerInfo    *connect.Client[v1.GetServerInfoRequest, v1.ServerInfo]
 	createSession    *connect.Client[v1.CreateSessionRequest, v1.Session]
 	listSessions     *connect.Client[v1.ListSessionsRequest, v1.ListSessionsResponse]
 	killSession      *connect.Client[v1.KillSessionRequest, v1.KillSessionResponse]
@@ -250,6 +267,11 @@ type tymuxServiceClient struct {
 	createWindow     *connect.Client[v1.CreateWindowRequest, v1.Session]
 	watchWindow      *connect.Client[v1.WatchWindowRequest, v1.WindowLayoutEvent]
 	attach           *connect.Client[v1.AttachRequest, v1.AttachEvent]
+}
+
+// GetServerInfo calls tymux.v1.TymuxService.GetServerInfo.
+func (c *tymuxServiceClient) GetServerInfo(ctx context.Context, req *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error) {
+	return c.getServerInfo.CallUnary(ctx, req)
 }
 
 // CreateSession calls tymux.v1.TymuxService.CreateSession.
@@ -309,6 +331,13 @@ func (c *tymuxServiceClient) Attach(ctx context.Context) *connect.BidiStreamForC
 
 // TymuxServiceHandler is an implementation of the tymux.v1.TymuxService service.
 type TymuxServiceHandler interface {
+	// Reports the daemon's build version, wire-protocol revision, and optional
+	// capabilities, so a client can decide whether it can talk to this daemon
+	// (and which newer features it may use) before issuing anything else. See
+	// docs/adr/0003-protocol-versioning.md for the compatibility policy. A
+	// daemon older than this RPC (<= 1.3.0) answers UNIMPLEMENTED, which
+	// clients should treat as "pre-versioning, protocol 0".
+	GetServerInfo(context.Context, *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error)
 	CreateSession(context.Context, *connect.Request[v1.CreateSessionRequest]) (*connect.Response[v1.Session], error)
 	ListSessions(context.Context, *connect.Request[v1.ListSessionsRequest]) (*connect.Response[v1.ListSessionsResponse], error)
 	KillSession(context.Context, *connect.Request[v1.KillSessionRequest]) (*connect.Response[v1.KillSessionResponse], error)
@@ -406,6 +435,12 @@ type TymuxServiceHandler interface {
 // and JSON codecs. They also support gzip compression.
 func NewTymuxServiceHandler(svc TymuxServiceHandler, opts ...connect.HandlerOption) (string, http.Handler) {
 	tymuxServiceMethods := v1.File_tymux_v1_tymux_proto.Services().ByName("TymuxService").Methods()
+	tymuxServiceGetServerInfoHandler := connect.NewUnaryHandler(
+		TymuxServiceGetServerInfoProcedure,
+		svc.GetServerInfo,
+		connect.WithSchema(tymuxServiceMethods.ByName("GetServerInfo")),
+		connect.WithHandlerOptions(opts...),
+	)
 	tymuxServiceCreateSessionHandler := connect.NewUnaryHandler(
 		TymuxServiceCreateSessionProcedure,
 		svc.CreateSession,
@@ -474,6 +509,8 @@ func NewTymuxServiceHandler(svc TymuxServiceHandler, opts ...connect.HandlerOpti
 	)
 	return "/tymux.v1.TymuxService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case TymuxServiceGetServerInfoProcedure:
+			tymuxServiceGetServerInfoHandler.ServeHTTP(w, r)
 		case TymuxServiceCreateSessionProcedure:
 			tymuxServiceCreateSessionHandler.ServeHTTP(w, r)
 		case TymuxServiceListSessionsProcedure:
@@ -504,6 +541,10 @@ func NewTymuxServiceHandler(svc TymuxServiceHandler, opts ...connect.HandlerOpti
 
 // UnimplementedTymuxServiceHandler returns CodeUnimplemented from all methods.
 type UnimplementedTymuxServiceHandler struct{}
+
+func (UnimplementedTymuxServiceHandler) GetServerInfo(context.Context, *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.GetServerInfo is not implemented"))
+}
 
 func (UnimplementedTymuxServiceHandler) CreateSession(context.Context, *connect.Request[v1.CreateSessionRequest]) (*connect.Response[v1.Session], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.CreateSession is not implemented"))
