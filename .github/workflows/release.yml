@@ -22,7 +22,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
+      - uses: tstapler/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # fork of taiki-e/create-gh-release-action, upstream v1.11.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -80,7 +80,7 @@ jobs:
         uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
         with:
           target: ${{ matrix.target }}
-      - uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+      - uses: tstapler/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # fork of taiki-e/upload-rust-binary-action, upstream v1.30.2
         with:
           # tymux-cli is the package name; its actual [[bin]] target is
           # named tymux (crates/tymux-cli/Cargo.toml).
