@@ -3,6 +3,8 @@ mod layout;
 mod pane;
 mod persistence;
 mod replay_buffer;
+#[cfg(unix)]
+mod spawn;
 
 pub use engine::{
     ClosePaneOutcome, Engine, EngineError, LayoutSnapshot, PaneEntry, PaneInfo, PaneLookup,
