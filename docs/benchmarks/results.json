@@ -1,0 +1,219 @@
+{
+  "env": {
+    "generated_at": "2026-10-22T16:46:24Z",
+    "tymux_git_sha": "47dd60a",
+    "tmux_version": "tmux 3.6a",
+    "kernel": "Linux 6.6.128-1-MANJARO",
+    "cpu": "AMD Ryzen 9 7900X 12-Core Processor",
+    "cores": 24,
+    "sessions": 600,
+    "bucket_size": 100,
+    "session_command": "/bin/cat"
+  },
+  "backends": [
+    {
+      "name": "tymux (gRPC API)",
+      "create": [
+        {
+          "live_from": 0,
+          "live_to": 100,
+          "n": 100,
+          "min_ms": 0.335017,
+          "p50_ms": 0.476932,
+          "p95_ms": 0.905684,
+          "max_ms": 49.782277
+        },
+        {
+          "live_from": 100,
+          "live_to": 200,
+          "n": 100,
+          "min_ms": 0.461724,
+          "p50_ms": 0.580806,
+          "p95_ms": 0.929719,
+          "max_ms": 41.166719
+        },
+        {
+          "live_from": 200,
+          "live_to": 300,
+          "n": 100,
+          "min_ms": 0.358581,
+          "p50_ms": 0.471081,
+          "p95_ms": 0.80212,
+          "max_ms": 1.39477
+        },
+        {
+          "live_from": 300,
+          "live_to": 400,
+          "n": 100,
+          "min_ms": 0.37415,
+          "p50_ms": 0.472724,
+          "p95_ms": 0.911315,
+          "max_ms": 42.304989
+        },
+        {
+          "live_from": 400,
+          "live_to": 500,
+          "n": 100,
+          "min_ms": 0.425185,
+          "p50_ms": 0.648654,
+          "p95_ms": 1.036799,
+          "max_ms": 1.408836
+        },
+        {
+          "live_from": 500,
+          "live_to": 600,
+          "n": 100,
+          "min_ms": 0.413052,
+          "p50_ms": 0.568494,
+          "p95_ms": 0.810176,
+          "max_ms": 1.236322
+        }
+      ],
+      "kill": {
+        "n": 600,
+        "min_ms": 0.070451,
+        "p50_ms": 0.122178,
+        "p95_ms": 0.19251,
+        "max_ms": 1.463898
+      },
+      "server_rss_kib_at_max_sessions": 87560,
+      "server_rss_kib_per_session": 145.93333333333334
+    },
+    {
+      "name": "tmux (CLI)",
+      "create": [
+        {
+          "live_from": 0,
+          "live_to": 100,
+          "n": 100,
+          "min_ms": 1.761205,
+          "p50_ms": 2.178476,
+          "p95_ms": 2.899043,
+          "max_ms": 26.201755
+        },
+        {
+          "live_from": 100,
+          "live_to": 200,
+          "n": 100,
+          "min_ms": 1.997497,
+          "p50_ms": 2.714347,
+          "p95_ms": 4.416671,
+          "max_ms": 60.055624
+        },
+        {
+          "live_from": 200,
+          "live_to": 300,
+          "n": 100,
+          "min_ms": 2.324398,
+          "p50_ms": 3.295355,
+          "p95_ms": 5.861835,
+          "max_ms": 26.682123
+        },
+        {
+          "live_from": 300,
+          "live_to": 400,
+          "n": 100,
+          "min_ms": 2.505908,
+          "p50_ms": 3.543077,
+          "p95_ms": 5.129045,
+          "max_ms": 35.18015
+        },
+        {
+          "live_from": 400,
+          "live_to": 500,
+          "n": 100,
+          "min_ms": 2.891389,
+          "p50_ms": 3.731991,
+          "p95_ms": 5.787937,
+          "max_ms": 22.411896
+        },
+        {
+          "live_from": 500,
+          "live_to": 600,
+          "n": 100,
+          "min_ms": 3.022043,
+          "p50_ms": 3.981298,
+          "p95_ms": 6.54856,
+          "max_ms": 7.572476
+        }
+      ],
+      "kill": {
+        "n": 600,
+        "min_ms": 1.205876,
+        "p50_ms": 2.235633,
+        "p95_ms": 3.814605,
+        "max_ms": 5.960109
+      },
+      "server_rss_kib_at_max_sessions": 8376,
+      "server_rss_kib_per_session": 13.96
+    },
+    {
+      "name": "tmux (control mode)",
+      "create": [
+        {
+          "live_from": 0,
+          "live_to": 100,
+          "n": 100,
+          "min_ms": 0.483224,
+          "p50_ms": 0.599561,
+          "p95_ms": 0.840813,
+          "max_ms": 1.243987
+        },
+        {
+          "live_from": 100,
+          "live_to": 200,
+          "n": 100,
+          "min_ms": 0.626903,
+          "p50_ms": 0.867894,
+          "p95_ms": 1.190286,
+          "max_ms": 1.726319
+        },
+        {
+          "live_from": 200,
+          "live_to": 300,
+          "n": 100,
+          "min_ms": 0.796349,
+          "p50_ms": 1.071153,
+          "p95_ms": 1.423513,
+          "max_ms": 2.524402
+        },
+        {
+          "live_from": 300,
+          "live_to": 400,
+          "n": 100,
+          "min_ms": 0.973531,
+          "p50_ms": 1.255068,
+          "p95_ms": 1.690743,
+          "max_ms": 2.113433
+        },
+        {
+          "live_from": 400,
+          "live_to": 500,
+          "n": 100,
+          "min_ms": 1.189295,
+          "p50_ms": 1.604432,
+          "p95_ms": 2.204524,
+          "max_ms": 3.237887
+        },
+        {
+          "live_from": 500,
+          "live_to": 600,
+          "n": 100,
+          "min_ms": 1.317915,
+          "p50_ms": 1.736028,
+          "p95_ms": 2.244328,
+          "max_ms": 4.368071
+        }
+      ],
+      "kill": {
+        "n": 600,
+        "min_ms": 0.068478,
+        "p50_ms": 0.308727,
+        "p95_ms": 0.667568,
+        "max_ms": 1.868585
+      },
+      "server_rss_kib_at_max_sessions": 8568,
+      "server_rss_kib_per_session": 14.28
+    }
+  ]
+}

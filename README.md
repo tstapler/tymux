@@ -31,6 +31,27 @@ structured grid of cells with attributes directly (see
 ([`vt100`](https://docs.rs/vt100)) inside the daemon. That structured model
 is the actual point of this project.
 
+## Performance vs tmux
+
+Creating and killing sessions, measured against tmux 3.6 on one workstation
+(600 sessions, each running `/bin/cat`). tymux stays flat as sessions pile up;
+tmux slows down. tymux uses about 10× more memory per session.
+
+<picture>
+  <img alt="Session create latency vs live sessions: tymux stays near 0.5 ms while tmux rises from 2 to 4 ms (CLI) and 0.6 to 1.7 ms (control mode)" src="docs/benchmarks/create-scaling.svg">
+</picture>
+
+| Backend | Create p50 (0–100 live) | Create p50 (500–600 live) | Kill p50 | Server RSS per session |
+|---|---:|---:|---:|---:|
+| tymux (gRPC API) | 0.48 ms | 0.57 ms | 0.12 ms | 146 KiB |
+| tmux (CLI) | 2.18 ms | 3.98 ms | 2.24 ms | 14 KiB |
+| tmux (control mode) | 0.60 ms | 1.74 ms | 0.31 ms | 14 KiB |
+
+The tymux numbers are over its gRPC API, since its CLI has no detached `new`;
+tmux is shown both as one CLI process per command and over one persistent
+control-mode connection. Re-run it yourself with `scripts/bench.sh`. Method,
+caveats and every chart are in [docs/benchmarks](docs/benchmarks/README.md).
+
 ## Layout
 
 ```
