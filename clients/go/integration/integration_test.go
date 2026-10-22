@@ -27,6 +27,7 @@ import (
 	"golang.org/x/net/http2"
 
 	"github.com/tstapler/tymux/clients/go/authinterceptor"
+	"github.com/tstapler/tymux/clients/go/capabilities"
 	tymuxv1 "github.com/tstapler/tymux/clients/go/gen/tymux/v1"
 	"github.com/tstapler/tymux/clients/go/gen/tymux/v1/tymuxv1connect"
 	"github.com/tstapler/tymux/clients/go/udsdialer"
@@ -874,5 +875,96 @@ func TestGetServerInfoReportsVersionProtocolAndCapabilities(t *testing.T) {
 	}
 	if info.GetPid() == 0 || info.GetStartedAtUnix() == 0 {
 		t.Errorf("pid/started_at not populated: pid=%d started_at=%d", info.GetPid(), info.GetStartedAtUnix())
+	}
+}
+
+func paneText(t *testing.T, client tymuxv1connect.TymuxServiceClient, paneID string) string {
+	t.Helper()
+	snap, err := client.CapturePane(context.Background(), connect.NewRequest(&tymuxv1.CapturePaneRequest{PaneId: paneID}))
+	if err != nil {
+		t.Fatalf("CapturePane: %v", err)
+	}
+	var b strings.Builder
+	for _, row := range snap.Msg.GetGrid() {
+		for _, cell := range row.GetCells() {
+			b.WriteString(cell.GetText())
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// TestCreateSessionResolvesFileArgsAndRedirectsStderr drives the two launch
+// features end to end through the generated client: no shell parses the
+// argv, a file-backed argument arrives byte-for-byte, and stderr leaves the
+// pane for the file.
+func TestCreateSessionResolvesFileArgsAndRedirectsStderr(t *testing.T) {
+	addr := startDaemon(t)
+	client := newClient(addr, "")
+	ctx := context.Background()
+
+	caps, err := capabilities.Detect(ctx, client)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	for _, c := range []string{capabilities.StderrRedirect, capabilities.FileArgs} {
+		if !caps.Has(c) {
+			t.Fatalf("daemon does not advertise %q", c)
+		}
+	}
+
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	stderrPath := filepath.Join(dir, "stderr.log")
+	const prompt = `file "arg" $HOME ` + "`id`" + ` 'x' ; & *`
+	if err := os.WriteFile(promptPath, []byte(prompt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{
+		Name:    "go-launch",
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf '<%s><%s>\n' "$1" "$2"; echo ERR-MARK >&2; read x`, "sh"},
+		ArgSpecs: []*tymuxv1.ArgSpec{
+			{Source: &tymuxv1.ArgSpec_FileContentsPath{FileContentsPath: promptPath}},
+			{Source: &tymuxv1.ArgSpec_Literal{Literal: "a b"}},
+		},
+		StderrPath: stderrPath,
+	}))
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	paneID := firstPaneID(t, created.Msg)
+
+	want := "<" + prompt + "><a b>"
+	deadline := time.Now().Add(5 * time.Second)
+	var text string
+	for time.Now().Before(deadline) {
+		text = paneText(t, client, paneID)
+		stderr, _ := os.ReadFile(stderrPath)
+		if strings.Contains(text, want) && strings.Contains(string(stderr), "ERR-MARK") {
+			if strings.Contains(text, "ERR-MARK") {
+				t.Fatalf("stderr leaked onto the pty:\n%s", text)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	stderr, _ := os.ReadFile(stderrPath)
+	t.Fatalf("want %q on the pane and ERR-MARK in the stderr file\npane:\n%s\nstderr file: %q", want, text, stderr)
+}
+
+func TestCreateSessionReportsMissingArgFileAsNotFound(t *testing.T) {
+	addr := startDaemon(t)
+	client := newClient(addr, "")
+	_, err := client.CreateSession(context.Background(), connect.NewRequest(&tymuxv1.CreateSessionRequest{
+		Name:    "go-launch-missing",
+		Command: "/bin/sh",
+		ArgSpecs: []*tymuxv1.ArgSpec{
+			{Source: &tymuxv1.ArgSpec_FileContentsPath{FileContentsPath: filepath.Join(t.TempDir(), "absent")}},
+		},
+	}))
+	if connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("got %v, want NotFound", err)
 	}
 }

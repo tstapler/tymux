@@ -79,6 +79,12 @@ pub enum EngineError {
     BelowRecommendedSize {
         rows: u16,
     },
+    /// A revive found a pane whose argument file or stderr path can no longer
+    /// be resolved. Nothing was respawned.
+    ReviveLaunch {
+        pane_id: Uuid,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for EngineError {
@@ -97,6 +103,9 @@ impl std::fmt::Display for EngineError {
                  ~{RECOMMENDED_SPLIT_MIN_ROWS} rows. Resize your terminal or close another \
                  pane first."
             ),
+            EngineError::ReviveLaunch { pane_id, message } => {
+                write!(f, "cannot revive pane {pane_id}: {message}")
+            }
         }
     }
 }
@@ -821,6 +830,24 @@ impl Engine {
         drop(panes);
         if already_live {
             return Ok(ReviveOutcome::AlreadyLive);
+        }
+
+        // Resolve every dead pane's launch first, so a file deleted since the
+        // session died fails the whole revive instead of respawning some panes
+        // without the argument they were created with.
+        {
+            let panes = self.panes.lock().unwrap();
+            for pane_id in &pane_ids {
+                if let Some(PaneEntry::Dead(record)) = panes.get(pane_id) {
+                    record
+                        .launch
+                        .prepare()
+                        .map_err(|e| EngineError::ReviveLaunch {
+                            pane_id: *pane_id,
+                            message: e.to_string(),
+                        })?;
+                }
+            }
         }
 
         let mut revived = 0usize;
@@ -2078,6 +2105,130 @@ mod tests {
             "the split shape must be preserved through revival"
         );
 
+        std::fs::remove_dir_all(&persist_dir).ok();
+    }
+
+    /// A dead session loaded from disk for a launch that reads `arg_file` and
+    /// writes to `log`; the child prints `<arg>` and an stderr line, then idles.
+    fn dead_session_with_file_arg(
+        arg_file: &std::path::Path,
+        log: &std::path::Path,
+    ) -> (Engine, Uuid, std::path::PathBuf) {
+        let persist_dir =
+            std::env::temp_dir().join(format!("tymux-revive-test-{}", Uuid::new_v4()));
+        let backend = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let engine = Engine::with_persistence(Box::new(backend));
+        let launch = Launch {
+            args: vec![
+                "-c".into(),
+                "printf '<%s>\\n' \"$1\"; echo STDERR-LINE >&2; read x".into(),
+                "sh".into(),
+            ],
+            arg_specs: vec![crate::launch::ArgSpec::FileContents(
+                arg_file.display().to_string(),
+            )],
+            stderr_path: Some(log.display().to_string()),
+            ..Launch::default()
+        };
+        let id = engine
+            .create_session_with("test".to_string(), sh(), launch, None)
+            .unwrap();
+        drop(engine);
+
+        let backend = crate::persistence::FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let records = backend.load_all();
+        let fresh = Engine::with_persistence(Box::new(backend));
+        fresh.load_persisted(records);
+        (fresh, id, persist_dir)
+    }
+
+    fn pane_text_contains(engine: &Engine, session_id: Uuid, needle: &str) -> bool {
+        let snapshot = engine
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.id == session_id)
+            .unwrap();
+        let PaneLookup::Live(pane) = engine.pane_lookup(sole_pane_id(&snapshot)) else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let text: String = pane
+                .snapshot()
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.as_str())
+                .collect();
+            if text.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn revive_session_should_reread_the_arg_file_and_reappend_to_the_stderr_file() {
+        let dir = std::env::temp_dir().join(format!("tymux-revive-files-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (arg_file, log) = (dir.join("arg"), dir.join("stderr.log"));
+        std::fs::write(&arg_file, "first value").unwrap();
+        let (engine, id, persist_dir) = dead_session_with_file_arg(&arg_file, &log);
+
+        // The spawn at create time already ran; the file changes before revive.
+        std::fs::write(&arg_file, "second value").unwrap();
+        assert!(matches!(
+            engine.revive_session(id).unwrap(),
+            ReviveOutcome::Revived { pane_count: 1 }
+        ));
+        assert!(pane_text_contains(&engine, id, "<second value>"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("STDERR-LINE")
+            .count()
+            < 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected create + revive to both append to the stderr file"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&persist_dir).ok();
+    }
+
+    #[test]
+    fn revive_session_should_fail_clearly_and_respawn_nothing_when_the_arg_file_is_gone() {
+        let dir = std::env::temp_dir().join(format!("tymux-revive-files-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (arg_file, log) = (dir.join("arg"), dir.join("stderr.log"));
+        std::fs::write(&arg_file, "value").unwrap();
+        let (engine, id, persist_dir) = dead_session_with_file_arg(&arg_file, &log);
+
+        std::fs::remove_file(&arg_file).unwrap();
+        let err = engine.revive_session(id).unwrap_err();
+        assert!(
+            matches!(err, EngineError::ReviveLaunch { .. }),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&arg_file.display().to_string()),
+            "error must name the missing file: {message}"
+        );
+        let snapshot = engine
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        assert!(
+            !snapshot.live,
+            "a failed revive must leave the session dead"
+        );
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&persist_dir).ok();
     }
 

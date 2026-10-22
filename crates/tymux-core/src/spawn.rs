@@ -26,14 +26,16 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 
-use crate::pane::Launch;
+use crate::launch::{Launch, PreparedLaunch};
 
-/// Spawns `program` with the pty slave behind `master_fd` as stdin/out/err and
-/// controlling terminal, in a new session.
+/// Spawns `program` with the pty slave behind `master_fd` as stdin/stdout and
+/// controlling terminal, in a new session. Stderr is the slave too, unless
+/// `prepared.stderr` is set, in which case it is that file.
 pub(crate) fn spawn_on_pty(
     master_fd: RawFd,
     program: &str,
     launch: &Launch,
+    prepared: &PreparedLaunch,
     cwd: Option<&str>,
 ) -> Result<Box<dyn portable_pty::Child + Send + Sync>> {
     // Same base env as CommandBuilder: inherit everything, force SHELL to a
@@ -70,14 +72,22 @@ pub(crate) fn spawn_on_pty(
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         let slave = slave_path(master_fd).context("failed to find pty slave")?;
-        let child = posix::spawn(&resolved, program, &launch.args, &env, &dir, &slave)?;
+        let child = posix::spawn(
+            &resolved,
+            program,
+            &prepared.args,
+            &env,
+            &dir,
+            &slave,
+            prepared.stderr.as_ref(),
+        )?;
         Ok(Box::new(child))
     }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
     {
         let slave = open_slave(master_fd).context("failed to open pty slave")?;
         Ok(Box::new(spawn_with_command(
-            resolved, program, launch, &dir, env, slave,
+            resolved, program, prepared, &dir, env, slave,
         )?))
     }
 }
@@ -86,20 +96,23 @@ pub(crate) fn spawn_on_pty(
 fn spawn_with_command(
     resolved: OsString,
     program: &str,
-    launch: &Launch,
+    prepared: &PreparedLaunch,
     dir: &Path,
     env: Vec<(OsString, OsString)>,
     slave: File,
 ) -> Result<std::process::Child> {
     let mut cmd = Command::new(resolved);
     cmd.arg0(program);
-    cmd.args(&launch.args);
+    cmd.args(&prepared.args);
     cmd.current_dir(dir);
     cmd.env_clear();
     cmd.envs(env);
     cmd.stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
-        .stderr(Stdio::from(slave));
+        .stderr(match &prepared.stderr {
+            Some(file) => Stdio::from(file.try_clone()?),
+            None => Stdio::from(slave),
+        });
 
     // SAFETY: the closure calls only async-signal-safe libc functions and
     // allocates nothing.
@@ -240,7 +253,9 @@ fn search_path(exe: &Path, cwd: &Path, path_env: Option<&OsStr>) -> Result<OsStr
 mod posix {
     use super::*;
     use std::ffi::CString;
+    use std::fs::File;
     use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
 
@@ -277,6 +292,7 @@ mod posix {
         env: &[(OsString, OsString)],
         dir: &Path,
         slave: &Path,
+        stderr: Option<&File>,
     ) -> Result<PosixChild> {
         let path = cstr(resolved)?;
         let mut argv_owned = vec![cstr(OsStr::new(arg0))?];
@@ -297,6 +313,20 @@ mod posix {
         let mut envp: Vec<*mut libc::c_char> =
             envp_owned.iter().map(|c| c.as_ptr() as *mut _).collect();
         envp.push(std::ptr::null_mut());
+
+        // Above fd 2, so the addopen/dup2 of the slave onto 0..=2 below cannot
+        // clobber it if the daemon itself runs with a closed stdio fd.
+        let stderr_fd = stderr
+            .map(|f| {
+                let fd = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: fcntl just returned this fd and nothing else owns it.
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            })
+            .transpose()
+            .context("failed to duplicate the stderr file descriptor")?;
 
         let dir_c = cstr(dir.as_os_str())?;
         let slave_c = cstr(slave.as_os_str())?;
@@ -347,7 +377,15 @@ mod posix {
                 0,
             ))?;
             check(libc::posix_spawn_file_actions_adddup2(&mut fa.0, 0, 1))?;
-            check(libc::posix_spawn_file_actions_adddup2(&mut fa.0, 0, 2))?;
+            match &stderr_fd {
+                // The closefrom below drops the original descriptor in the child.
+                Some(fd) => check(libc::posix_spawn_file_actions_adddup2(
+                    &mut fa.0,
+                    fd.as_raw_fd(),
+                    2,
+                ))?,
+                None => check(libc::posix_spawn_file_actions_adddup2(&mut fa.0, 0, 2))?,
+            }
             // Constant-time close of everything inherited above fd 2.
             check(libc::posix_spawn_file_actions_addclosefrom_np(&mut fa.0, 3))?;
 

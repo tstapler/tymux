@@ -216,3 +216,107 @@ async fn session_layout_should_match_pre_restart_shape_when_daemon_is_killed_and
 
     std::fs::remove_dir_all(&sessions_dir).ok();
 }
+
+/// The wire-level revive contract for file-backed arguments and a stderr
+/// file: a revive re-reads the file (not a snapshot taken at create), appends
+/// to the same stderr file, and a file that vanished fails the revive with
+/// FAILED_PRECONDITION naming it, leaving the session dead.
+#[tokio::test]
+async fn revive_should_reread_arg_file_and_fail_clearly_when_it_is_gone() {
+    use tymux_proto::v1::{arg_spec, ArgSpec, ReviveSessionRequest};
+
+    let addr = "127.0.0.1:17421";
+    let sessions_dir =
+        std::env::temp_dir().join(format!("tymuxd-restart-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let arg_file = sessions_dir.join("prompt.txt");
+    let stderr_file = sessions_dir.join("stderr.log");
+    std::fs::write(&arg_file, "value-one").unwrap();
+
+    let session_id = {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        client
+            .create_session(CreateSessionRequest {
+                name: "file-args".to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo \"$1\" >&2; read x".to_string(),
+                    "sh".to_string(),
+                ],
+                arg_specs: vec![ArgSpec {
+                    source: Some(arg_spec::Source::FileContentsPath(
+                        arg_file.display().to_string(),
+                    )),
+                }],
+                stderr_path: stderr_file.display().to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .id
+    };
+
+    async fn wait_for_stderr_lines(path: &std::path::Path, want: &[&str]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(path).unwrap_or_default();
+            if got.lines().collect::<Vec<_>>() == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stderr file has {got:?}, want lines {want:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    wait_for_stderr_lines(&stderr_file, &["value-one"]).await;
+
+    // Crash, change the file, restart, revive.
+    std::fs::write(&arg_file, "value-two").unwrap();
+    {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let revived = client
+            .revive_session(ReviveSessionRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(revived.pane_count, 1);
+        wait_for_stderr_lines(&stderr_file, &["value-one", "value-two"]).await;
+    }
+
+    // Crash again, delete the file: the revive must refuse, not run with an
+    // empty argument.
+    std::fs::remove_file(&arg_file).unwrap();
+    {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let status = client
+            .revive_session(ReviveSessionRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+        assert!(
+            status.message().contains("prompt.txt"),
+            "error must name the missing file: {status}"
+        );
+        let listed = client
+            .list_sessions(ListSessionsRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let session = listed.sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(session.liveness, Liveness::Dead as i32);
+    }
+    wait_for_stderr_lines(&stderr_file, &["value-one", "value-two"]).await;
+
+    std::fs::remove_dir_all(&sessions_dir).ok();
+}

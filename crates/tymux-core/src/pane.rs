@@ -76,13 +76,7 @@ const KILL_GRACE: Duration = Duration::from_millis(250);
 /// on, it isn't a correctness concern.
 const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 
-/// Extra spawn parameters beyond the program name, kept on the pane so a
-/// revive can respawn an equivalent process.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Launch {
-    pub args: Vec<String>,
-    pub env: std::collections::BTreeMap<String, String>,
-}
+pub use crate::launch::Launch;
 
 /// A single pty-backed terminal. Owns the child process, the pty master
 /// (for resize + writing input), and a `vt100::Parser` that keeps a
@@ -231,6 +225,9 @@ impl Pane {
         rows: u16,
         cols: u16,
     ) -> Result<Arc<Self>> {
+        // Before openpty so a bad argument file or stderr path fails with no
+        // pty allocated.
+        let prepared = launch.prepare()?;
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -248,12 +245,15 @@ impl Pane {
             // TYMUXD_TOKEN is stripped inside spawn_on_pty: it's the daemon's
             // own secret and must never reach a pane's environment
             // (research/pitfalls.md §2, HIGH PRIORITY).
-            crate::spawn::spawn_on_pty(master_fd, command, launch, cwd)?
+            crate::spawn::spawn_on_pty(master_fd, command, launch, &prepared, cwd)?
         };
         #[cfg(not(unix))]
         let child = {
+            if prepared.stderr.is_some() {
+                anyhow::bail!("stderr_path is only supported on unix");
+            }
             let mut cmd = CommandBuilder::new(command);
-            cmd.args(&launch.args);
+            cmd.args(&prepared.args);
             for (key, value) in &launch.env {
                 cmd.env(key, value);
             }
@@ -1020,7 +1020,7 @@ mod tests {
             "/bin/sh",
             &Launch {
                 args: vec!["-c".into(), "trap '' HUP; while :; do sleep 1; done".into()],
-                env: Default::default(),
+                ..Launch::default()
             },
             None,
             None,
@@ -1106,6 +1106,106 @@ mod tests {
         assert!(
             wait_for_grid_text(&pane, "CTTY-42"),
             "child had no controlling tty"
+        );
+    }
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tymux-pane-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// No shell between the request and `exec`: `printf` (a real binary on
+    /// PATH, not a builtin here) prints each argv entry on its own line, so
+    /// anything a shell would have split, expanded or unquoted shows up raw.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_deliver_awkward_args_unmangled_without_a_shell() {
+        let from_file = tmp_path("prompt");
+        std::fs::write(&from_file, "file \"arg\" $HOME `id` 'x' ; & *").unwrap();
+        let launch = Launch {
+            args: vec![
+                "<%s>\n".into(),
+                "a b".into(),
+                "it's \"q\"".into(),
+                "$HOME".into(),
+                "`id`;&|*".into(),
+            ],
+            arg_specs: vec![crate::launch::ArgSpec::FileContents(
+                from_file.display().to_string(),
+            )],
+            ..Launch::default()
+        };
+        let pane = Pane::spawn_launch("printf", &launch, None, None, 24, 200).unwrap();
+        for expected in [
+            "<a b>",
+            "<it's \"q\">",
+            "<$HOME>",
+            "<`id`;&|*>",
+            "<file \"arg\" $HOME `id` 'x' ; & *>",
+        ] {
+            assert!(
+                wait_for_grid_text(&pane, expected),
+                "argv entry {expected:?} did not arrive unmangled"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_send_only_stderr_to_the_file_and_keep_stdout_on_the_pty() {
+        let log = tmp_path("stderr.log");
+        let launch = Launch {
+            args: vec![
+                "-c".into(),
+                "echo OUT-$((40+2)); echo ERR-$((40+2)) >&2; \
+                 if [ -t 2 ]; then echo STDERR-TTY; else echo STDERR-NOTTY; fi; \
+                 if [ -t 1 ]; then echo STDOUT-TTY; fi"
+                    .into(),
+            ],
+            stderr_path: Some(log.display().to_string()),
+            ..Launch::default()
+        };
+        let pane = Pane::spawn_launch("/bin/sh", &launch, None, None, 24, 200).unwrap();
+        assert!(wait_for_grid_text(&pane, "OUT-42"));
+        assert!(wait_for_grid_text(&pane, "STDOUT-TTY"));
+        assert!(wait_for_grid_text(&pane, "STDERR-NOTTY"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("ERR-42")
+        {
+            assert!(Instant::now() < deadline, "stderr never reached {log:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let screen: String = pane
+            .snapshot()
+            .grid
+            .iter()
+            .flatten()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert!(
+            !screen.contains("ERR-42"),
+            "stderr leaked onto the pty: {screen}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_fail_before_starting_anything_when_an_arg_file_is_missing() {
+        let launch = Launch {
+            arg_specs: vec![crate::launch::ArgSpec::FileContents(
+                tmp_path("missing").display().to_string(),
+            )],
+            ..Launch::default()
+        };
+        let err = Pane::spawn_launch("/bin/sh", &launch, None, None, 24, 80)
+            .err()
+            .expect("spawn must fail");
+        assert!(
+            err.downcast_ref::<crate::launch::LaunchError>().is_some(),
+            "{err}"
         );
     }
 

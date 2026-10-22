@@ -448,6 +448,11 @@ mod tests {
         let mut with = loaded.clone();
         with.launch.args = vec!["-c".to_string(), "true".to_string()];
         with.launch.env.insert("K".to_string(), "V".to_string());
+        with.launch.arg_specs = vec![
+            crate::launch::ArgSpec::Literal("x y".to_string()),
+            crate::launch::ArgSpec::FileContents("/tmp/prompt".to_string()),
+        ];
+        with.launch.stderr_path = Some("/tmp/err.log".to_string());
         let back: PersistedPaneRecord =
             serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back, with);

@@ -185,6 +185,35 @@ message CreateSessionRequest {
   // Extra environment for the spawned pane, layered over the daemon's. Persisted
   // in plaintext with the session record and replayed on revive; do not put secrets here.
   map<string, string> env = 5;
+  // Absolute path the pane process's stderr is appended to (opened
+  // O_WRONLY|O_APPEND|O_CREAT, mode 0600, by the daemon — no shell involved).
+  // stdin/stdout stay on the pty; stderr therefore no longer reaches the
+  // pane's screen, scrollback or replay, and isatty(2) is false for the
+  // process. Empty means "stderr stays on the pty" (the default). Persisted
+  // and re-opened on revive. Advertised as capability
+  // "create_session.stderr_redirect"; ADR-0004.
+  string stderr_path = 6;
+  // Further arguments, appended after `args` in order. Use this (alone) when a
+  // value must come from a file: see ArgSpec. Resolved by the daemon at spawn
+  // and again at every revive. Advertised as capability
+  // "create_session.file_args"; ADR-0004.
+  repeated ArgSpec arg_specs = 7;
+}
+
+// One argv entry.
+message ArgSpec {
+  oneof source {
+    // Used verbatim.
+    string literal = 1;
+    // Absolute path of a file whose entire contents (not trimmed) become this
+    // argv entry. The daemon reads it at every spawn and revive; a missing or
+    // unreadable file fails the call (CreateSession: NOT_FOUND /
+    // FAILED_PRECONDITION, ReviveSession: FAILED_PRECONDITION, no pane is
+    // respawned) rather than yielding an empty argument. The contents must be
+    // valid UTF-8, contain no NUL byte and be under 128 KiB (Linux
+    // MAX_ARG_STRLEN, including the terminating NUL): otherwise INVALID_ARGUMENT.
+    string file_contents_path = 2;
+  }
 }
 
 message ListSessionsRequest {}
