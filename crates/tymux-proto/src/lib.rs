@@ -12,4 +12,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const MIN_CLIENT_PROTOCOL_VERSION: u32 = 1;
 
 /// Optional behaviors a client can feature-detect via `ServerInfo.capabilities`.
-pub const CAPABILITIES: &[&str] = &["create_session.args_env", "uds_auth"];
+pub const CAPABILITIES: &[&str] = &[
+    "create_session.args_env",
+    "create_session.stderr_redirect",
+    "create_session.file_args",
+    "uds_auth",
+];

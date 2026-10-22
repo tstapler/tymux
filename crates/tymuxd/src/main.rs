@@ -14,9 +14,10 @@ use tymux_core::{
     PersistedLayoutNode, PersistenceBackend, ReplayOutcome, SessionSnapshot, WindowSnapshot,
     RECOMMENDED_SPLIT_MIN_ROWS,
 };
+use tymux_proto::v1::arg_spec;
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
-    attach_event, attach_request, AttachEvent, AttachRequest, CapturePaneRequest,
+    attach_event, attach_request, ArgSpec, AttachEvent, AttachRequest, CapturePaneRequest,
     Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse, CreateSessionRequest,
     CreateWindowRequest, ExitStatus, GapExceeded, GetServerInfoRequest, Heartbeat,
     KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
@@ -397,6 +398,17 @@ async fn send_exited_event(
     let _ = forward_tx.send(Ok(event)).await;
 }
 
+#[allow(clippy::result_large_err)]
+fn arg_spec_from_proto(spec: ArgSpec) -> Result<tymux_core::ArgSpec, Status> {
+    match spec.source {
+        Some(arg_spec::Source::Literal(s)) => Ok(tymux_core::ArgSpec::Literal(s)),
+        Some(arg_spec::Source::FileContentsPath(p)) => Ok(tymux_core::ArgSpec::FileContents(p)),
+        None => Err(Status::invalid_argument(
+            "arg_specs entry has no source set",
+        )),
+    }
+}
+
 fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
     match e {
         tymux_core::EngineError::PaneNotFound(id) => {
@@ -422,6 +434,24 @@ fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
                  pane first."
             ))
         }
+        tymux_core::EngineError::ReviveLaunch { pane_id, message } => {
+            Status::failed_precondition(format!("cannot revive pane {pane_id}: {message}"))
+        }
+    }
+}
+
+/// A failed spawn caused by the request's launch description is the caller's
+/// to fix; anything else is the daemon's.
+fn spawn_error_to_status(e: anyhow::Error) -> Status {
+    use tymux_core::LaunchErrorKind;
+    match e
+        .downcast_ref::<tymux_core::LaunchError>()
+        .map(|l| l.kind())
+    {
+        Some(LaunchErrorKind::Invalid) => Status::invalid_argument(e.to_string()),
+        Some(LaunchErrorKind::NotFound) => Status::not_found(e.to_string()),
+        Some(LaunchErrorKind::Precondition) => Status::failed_precondition(e.to_string()),
+        None => Status::internal(e.to_string()),
     }
 }
 
@@ -581,10 +611,16 @@ impl TymuxService for TymuxDaemon {
                 tymux_core::Launch {
                     args: req.args,
                     env: req.env.into_iter().collect(),
+                    arg_specs: req
+                        .arg_specs
+                        .into_iter()
+                        .map(arg_spec_from_proto)
+                        .collect::<Result<_, _>>()?,
+                    stderr_path: Some(req.stderr_path).filter(|p| !p.is_empty()),
                 },
                 cwd,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(spawn_error_to_status)?;
         // O(1) lookup, not list_sessions().find() — the latter rebuilds a
         // full snapshot of every session under both locks just to find the
         // one this call just created (the confirmed scale-feasibility
@@ -2213,6 +2249,136 @@ mod tests {
         );
     }
 
+    fn file_arg(path: &std::path::Path) -> ArgSpec {
+        ArgSpec {
+            source: Some(arg_spec::Source::FileContentsPath(
+                path.display().to_string(),
+            )),
+        }
+    }
+
+    fn literal_arg(s: &str) -> ArgSpec {
+        ArgSpec {
+            source: Some(arg_spec::Source::Literal(s.to_string())),
+        }
+    }
+
+    fn temp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tymuxd-launch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    async fn wait_for_pane_text(pane: &tymux_core::Pane, needle: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let text: String = pane
+                .snapshot()
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.clone())
+                .collect();
+            if text.contains(needle) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected {needle:?} within 5s; got: {text}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `arg_specs` and `stderr_path` over the service API: a file-backed and a
+    /// literal argument reach the process after `args`, stderr lands in the file.
+    #[tokio::test]
+    async fn create_session_should_resolve_arg_specs_and_redirect_stderr() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+        let prompt = temp_file("prompt", b"big prompt $HOME \"quoted\"");
+        let log = prompt.with_file_name("stderr.log");
+
+        let mut req = create_req("test");
+        req.args = vec![
+            "-c".to_string(),
+            "printf '<%s><%s>\\n' \"$1\" \"$2\"; echo ERR-MARK >&2; read x".to_string(),
+            "sh".to_string(),
+        ];
+        req.arg_specs = vec![file_arg(&prompt), literal_arg("a b")];
+        req.stderr_path = log.display().to_string();
+        let session = daemon
+            .create_session(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        wait_for_pane_text(&pane, "<big prompt $HOME \"quoted\"><a b>").await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("ERR-MARK")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stderr never reached the file"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_should_reject_bad_launch_requests_with_distinct_status_codes() {
+        use tonic::Code;
+        let daemon = test_daemon();
+        let check = |mutate: Box<dyn Fn(&mut CreateSessionRequest)>| {
+            let daemon = &daemon;
+            async move {
+                let mut req = create_req("test");
+                mutate(&mut req);
+                daemon.create_session(Request::new(req)).await.unwrap_err()
+            }
+        };
+
+        let missing = temp_file("present", b"x").with_file_name("absent");
+        let err = check(Box::new(move |r| r.arg_specs = vec![file_arg(&missing)])).await;
+        assert_eq!(err.code(), Code::NotFound, "{err}");
+        assert!(err.message().contains("absent"), "{err}");
+
+        let oversize = temp_file("oversize", &vec![b'x'; tymux_core::MAX_ARG_STRLEN]);
+        let err = check(Box::new(move |r| r.arg_specs = vec![file_arg(&oversize)])).await;
+        assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+        let err = check(Box::new(|r| r.arg_specs = vec![ArgSpec { source: None }])).await;
+        assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+        let err = check(Box::new(|r| r.stderr_path = "relative.log".to_string())).await;
+        assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+        let err = check(Box::new(|r| {
+            r.stderr_path = "/nonexistent-tymux-dir/e.log".to_string()
+        }))
+        .await;
+        assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    }
+
+    #[test]
+    fn revive_launch_failure_should_map_to_failed_precondition() {
+        let status = engine_error_to_status(tymux_core::EngineError::ReviveLaunch {
+            pane_id: Uuid::new_v4(),
+            message: "arg_specs[0]: cannot read \"/gone\"".to_string(),
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("/gone"));
+    }
+
     /// REQ-8 (Epic 1.5) edge path — empty string means "the daemon's own
     /// cwd," matching `command`'s existing empty-means-default convention.
     /// Must not regress: this is today's implicit behavior for every
@@ -2323,6 +2489,12 @@ mod tests {
             .capabilities
             .iter()
             .any(|c| c == "create_session.args_env"));
+        for feature in ["create_session.stderr_redirect", "create_session.file_args"] {
+            assert!(
+                info.capabilities.iter().any(|c| c == feature),
+                "missing {feature}"
+            );
+        }
         assert_eq!(info.pid, std::process::id());
         assert!(info.started_at_unix > 0);
     }
