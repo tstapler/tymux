@@ -1,7 +1,6 @@
-// Command bench compares tymux against tmux on session create/kill latency as
-// the number of live sessions grows, and writes the results as JSON.
+// Command bench compares tymux against tmux and writes the results as JSON.
 //
-//	go run ./bench --tymuxd target/release/tymuxd --out docs/benchmarks/results.json
+//	scripts/bench.sh --out docs/benchmarks/results.json
 package main
 
 import (
@@ -24,12 +23,31 @@ type Bucket struct {
 	Stats
 }
 
+// BackendResult holds every scenario for one backend; scenarios a backend
+// can't run are omitted (nil), not zero.
 type BackendResult struct {
-	Name         string   `json:"name"`
-	Create       []Bucket `json:"create"`
-	Kill         Stats    `json:"kill"`
-	ServerRSSKiB int      `json:"server_rss_kib_at_max_sessions"`
-	RSSPerKiB    float64  `json:"server_rss_kib_per_session"`
+	Name   string   `json:"name"`
+	Create []Bucket `json:"create"`
+	Kill   Stats    `json:"kill"`
+	// List and Capture are measured with the maximum number of live sessions.
+	List    Stats  `json:"list_at_max_sessions"`
+	Capture *Stats `json:"capture_at_max_sessions,omitempty"`
+	// Echo is keystroke -> echoed output over a persistent connection.
+	Echo *Stats `json:"keystroke_echo,omitempty"`
+	// ColdStart is server launch until the first request is answered.
+	ColdStart *Stats `json:"cold_start,omitempty"`
+	// Reattach is dropping the client and getting it streaming again.
+	Reattach *Reattach `json:"reattach,omitempty"`
+	// Memory is the server's RSS; omitted for rows that share another row's server.
+	ServerRSSKiB int     `json:"server_rss_kib_at_max_sessions,omitempty"`
+	RSSPerKiB    float64 `json:"server_rss_kib_per_session,omitempty"`
+}
+
+type Reattach struct {
+	Stats
+	// Contiguous counts reattaches whose first chunk followed the recorded
+	// seq exactly; 0 for tmux, which has no resume protocol.
+	Contiguous int `json:"gap_free_resumes"`
 }
 
 type Env struct {
@@ -49,23 +67,30 @@ type Results struct {
 	Backends []BackendResult `json:"backends"`
 }
 
+type sizes struct{ sessions, bucket, echo, capture, list, cold, reattach int }
+
 func main() {
 	tymuxd := flag.String("tymuxd", "target/release/tymuxd", "path to the tymuxd binary")
+	tymux := flag.String("tymux", "target/release/tymux", "path to the tymux CLI binary")
 	tmux := flag.String("tmux", "tmux", "path to the tmux binary")
-	sessions := flag.Int("sessions", 600, "sessions to create per backend")
-	bucket := flag.Int("bucket", 100, "report create latency per this many live sessions")
-	quick := flag.Bool("quick", false, "smoke-test sizes (100 sessions, buckets of 25)")
+	quick := flag.Bool("quick", false, "smoke-test sizes (100 sessions, fewer samples)")
 	out := flag.String("out", "", "write results JSON here (default: print the table only)")
 	flag.Parse()
+
+	sz := sizes{sessions: 600, bucket: 100, echo: 200, capture: 100, list: 30, cold: 20, reattach: 50}
 	if *quick {
-		*sessions, *bucket = 100, 25
-	}
-	if *sessions%*bucket != 0 {
-		fatalf("--sessions (%d) must be a multiple of --bucket (%d)", *sessions, *bucket)
+		sz = sizes{sessions: 100, bucket: 25, echo: 50, capture: 30, list: 10, cold: 5, reattach: 10}
 	}
 
-	backends := []Backend{&tymuxAPI{bin: *tymuxd}, &tmuxCLI{bin: *tmux}, &tmuxControl{tmuxCLI: tmuxCLI{bin: *tmux}}}
-	res := Results{Env: collectEnv(*tmux, *sessions, *bucket)}
+	mk := func() []Backend {
+		return []Backend{
+			&tymuxAPI{bin: *tymuxd},
+			&tymuxCLI{tymuxAPI: tymuxAPI{bin: *tymuxd}, cli: *tymux},
+			&tmuxCLI{bin: *tmux},
+			&tmuxControl{tmuxCLI: tmuxCLI{bin: *tmux}},
+		}
+	}
+	res := Results{Env: collectEnv(*tmux, sz)}
 
 	// Ctrl-C must still tear servers down; they are real child processes.
 	sig := make(chan os.Signal, 1)
@@ -79,12 +104,27 @@ func main() {
 		os.Exit(130)
 	}()
 
-	for _, b := range backends {
+	for i := range mk() {
+		b := mk()[i]
 		current = b
-		r, err := runBackend(b, *sessions, *bucket)
+		r, err := runScale(b, sz)
 		if err != nil {
 			b.Stop()
 			fatalf("%s: %v", b.Name(), err)
+		}
+		if b.OwnsServer() {
+			cs, err := runColdStart(mk()[i], sz.cold)
+			if err != nil {
+				fatalf("%s cold start: %v", b.Name(), err)
+			}
+			r.ColdStart = &cs
+		}
+		if _, ok := b.(Reattacher); ok && b.OwnsServer() {
+			ra, err := runReattach(mk()[i], sz.reattach)
+			if err != nil {
+				fatalf("%s reattach: %v", b.Name(), err)
+			}
+			r.Reattach = ra
 		}
 		res.Backends = append(res.Backends, r)
 	}
@@ -100,72 +140,204 @@ func main() {
 	}
 }
 
-func runBackend(b Backend, n, bucketSize int) (BackendResult, error) {
-	fmt.Fprintf(os.Stderr, "== %s\n", b.Name())
+// supportsEcho: rows that share another row's persistent-connection path
+// (the CLI forks a process per command) have no keystroke-echo number.
+func supportsEcho(b Backend) bool {
+	switch b.(type) {
+	case *tymuxCLI, *tmuxCLI:
+		return false
+	}
+	_, ok := b.(Echoer)
+	return ok
+}
+
+func withServer(b Backend, f func(dir string) error) error {
 	dir, err := os.MkdirTemp("", "tb-") // short: sun_path is 108 bytes
 	if err != nil {
-		return BackendResult{}, err
+		return err
 	}
 	defer os.RemoveAll(dir)
 	if err := b.Start(dir); err != nil {
-		return BackendResult{}, err
+		b.Stop()
+		return err
 	}
 	defer b.Stop()
+	return f(dir)
+}
 
+func runScale(b Backend, sz sizes) (BackendResult, error) {
+	fmt.Fprintf(os.Stderr, "== %s\n", b.Name())
 	r := BackendResult{Name: b.Name()}
-	ids := make([]string, 0, n)
-	var samples []time.Duration
+	err := withServer(b, func(string) error {
+		ids := make([]string, 0, sz.sessions)
+		var samples []time.Duration
+		for i := 0; i < sz.sessions; i++ {
+			t := time.Now()
+			id, err := b.Create(i)
+			d := time.Since(t)
+			if err != nil {
+				return fmt.Errorf("create #%d: %w", i, err)
+			}
+			ids = append(ids, id)
+			samples = append(samples, d)
+			if len(samples) == sz.bucket {
+				r.Create = append(r.Create, Bucket{From: i + 1 - sz.bucket, To: i + 1, Stats: summarize(samples)})
+				samples = samples[:0]
+			}
+		}
+		if b.OwnsServer() {
+			r.ServerRSSKiB = rssKiB(b.ServerPID())
+			r.RSSPerKiB = float64(r.ServerRSSKiB) / float64(sz.sessions)
+		}
+
+		// Everything below runs with the maximum number of sessions alive.
+		var err error
+		if r.List, err = timeN(sz.list, b.List); err != nil {
+			return fmt.Errorf("list: %w", err)
+		}
+		if e, ok := b.(Echoer); ok {
+			// Type into session 0 so its screen has content for the capture
+			// below, whether or not this row reports echo latency.
+			echo, err := e.EchoSession(ids[0])
+			if err != nil {
+				return fmt.Errorf("echo session: %w", err)
+			}
+			var samples []time.Duration
+			for i := 0; i < sz.echo; i++ {
+				d, err := echo.RoundTrip(byte('a' + i%26))
+				if err != nil {
+					echo.Close()
+					return fmt.Errorf("echo: %w", err)
+				}
+				samples = append(samples, d)
+			}
+			echo.Close()
+			if supportsEcho(b) {
+				s := summarize(samples)
+				r.Echo = &s
+			}
+		}
+		c, err := timeN(sz.capture, func() error { _, err := b.Capture(ids[0]); return err })
+		if err != nil {
+			return fmt.Errorf("capture: %w", err)
+		}
+		r.Capture = &c
+
+		kills := make([]time.Duration, 0, len(ids))
+		for _, id := range ids {
+			t := time.Now()
+			if err := b.Kill(id); err != nil {
+				return fmt.Errorf("kill %s: %w", id, err)
+			}
+			kills = append(kills, time.Since(t))
+		}
+		r.Kill = summarize(kills)
+		return nil
+	})
+	return r, err
+}
+
+func timeN(n int, f func() error) (Stats, error) {
+	var s []time.Duration
 	for i := 0; i < n; i++ {
 		t := time.Now()
-		id, err := b.Create(i)
-		d := time.Since(t)
-		if err != nil {
-			return r, fmt.Errorf("create #%d: %w", i, err)
+		if err := f(); err != nil {
+			return Stats{}, err
 		}
-		ids = append(ids, id)
-		samples = append(samples, d)
-		if len(samples) == bucketSize {
-			r.Create = append(r.Create, Bucket{From: i + 1 - bucketSize, To: i + 1, Stats: summarize(samples)})
-			samples = samples[:0]
-		}
+		s = append(s, time.Since(t))
 	}
-	r.ServerRSSKiB = rssKiB(b.ServerPID())
-	r.RSSPerKiB = float64(r.ServerRSSKiB) / float64(n)
+	return summarize(s), nil
+}
 
-	kills := make([]time.Duration, 0, n)
-	for _, id := range ids {
-		t := time.Now()
-		if err := b.Kill(id); err != nil {
-			return r, fmt.Errorf("kill %s: %w", id, err)
+// runColdStart launches a fresh server n times and times each launch until
+// the server answers.
+func runColdStart(b Backend, n int) (Stats, error) {
+	var s []time.Duration
+	for i := 0; i < n; i++ {
+		dir, err := os.MkdirTemp("", "tb-")
+		if err != nil {
+			return Stats{}, err
 		}
-		kills = append(kills, time.Since(t))
+		t := time.Now()
+		err = b.Start(dir)
+		d := time.Since(t)
+		b.Stop()
+		os.RemoveAll(dir)
+		if err != nil {
+			return Stats{}, err
+		}
+		s = append(s, d)
 	}
-	r.Kill = summarize(kills)
-	return r, nil
+	return summarize(s), nil
+}
+
+func runReattach(b Backend, n int) (*Reattach, error) {
+	ra := b.(Reattacher)
+	lastSeq = 0
+	var out *Reattach
+	err := withServer(b, func(string) error {
+		id, err := ra.ReattachTarget()
+		if err != nil {
+			return err
+		}
+		// The first attach has nothing to resume from; it only learns the seq.
+		if _, _, err := ra.Reattach(id); err != nil {
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
+		var s []time.Duration
+		ok := 0
+		for i := 0; i < n; i++ {
+			d, contiguous, err := ra.Reattach(id)
+			if err != nil {
+				return err
+			}
+			s = append(s, d)
+			if contiguous {
+				ok++
+			}
+			time.Sleep(20 * time.Millisecond) // output accrues while "offline"
+		}
+		out = &Reattach{Stats: summarize(s), Contiguous: ok}
+		return nil
+	})
+	return out, err
 }
 
 func printTable(res Results) {
-	fmt.Printf("\ncreate latency p50 / p95 (ms) by live session count; %d sessions, `%s`\n\n", res.Env.Sessions, res.Env.SessionCmd)
-	fmt.Printf("%-22s", "backend")
-	for _, bk := range res.Backends[0].Create {
-		fmt.Printf(" %13s", fmt.Sprintf("%d-%d", bk.From, bk.To))
-	}
-	fmt.Printf(" %13s %10s\n", "kill", "KiB/sess")
-	for _, r := range res.Backends {
-		fmt.Printf("%-22s", r.Name)
-		for _, bk := range r.Create {
-			fmt.Printf(" %13s", fmt.Sprintf("%.2f/%.2f", bk.P50, bk.P95))
+	fmt.Printf("\n%d sessions of `%s`; ms, p50 (p95)\n\n", res.Env.Sessions, res.Env.SessionCmd)
+	cell := func(s *Stats) string {
+		if s == nil || s.N == 0 {
+			return "-"
 		}
-		fmt.Printf(" %13s %10.0f\n", fmt.Sprintf("%.2f/%.2f", r.Kill.P50, r.Kill.P95), r.RSSPerKiB)
+		return fmt.Sprintf("%.2f (%.2f)", s.P50, s.P95)
+	}
+	fmt.Printf("%-22s %-14s %-14s %-14s %-14s %-14s %-14s %-14s %-14s\n", "backend", "create first", "create last", "kill", "list@max", "capture", "echo", "cold start", "reattach")
+	for _, r := range res.Backends {
+		f, l := r.Create[0].Stats, r.Create[len(r.Create)-1].Stats
+		var ra *Stats
+		if r.Reattach != nil {
+			ra = &r.Reattach.Stats
+		}
+		fmt.Printf("%-22s %-14s %-14s %-14s %-14s %-14s %-14s %-14s %-14s\n", r.Name, cell(&f), cell(&l), cell(&r.Kill), cell(&r.List), cell(r.Capture), cell(r.Echo), cell(r.ColdStart), cell(ra))
+	}
+	fmt.Println()
+	for _, r := range res.Backends {
+		if r.RSSPerKiB > 0 {
+			fmt.Printf("%-22s server RSS %.0f KiB per session\n", r.Name, r.RSSPerKiB)
+		}
+		if r.Reattach != nil && strings.HasPrefix(r.Name, "tymux") {
+			fmt.Printf("%-22s gap-free resumes %d/%d (tmux has no resume protocol)\n", r.Name, r.Reattach.Contiguous, r.Reattach.N)
+		}
 	}
 }
 
-func collectEnv(tmuxBin string, sessions, bucket int) Env {
+func collectEnv(tmuxBin string, sz sizes) Env {
 	e := Env{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Cores:       runtime.NumCPU(),
-		Sessions:    sessions,
-		BucketSize:  bucket,
+		Sessions:    sz.sessions,
+		BucketSize:  sz.bucket,
 		SessionCmd:  sessionCmd,
 		GitSHA:      run("git", "rev-parse", "--short", "HEAD"),
 		TmuxVersion: run(tmuxBin, "-V"),

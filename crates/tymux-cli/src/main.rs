@@ -143,6 +143,33 @@ fn first_pane_id(session: &Session) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("window {} has no panes", window.id))
 }
 
+/// A snapshot as plain text: one line per row, trailing spaces trimmed, and
+/// trailing blank rows dropped (like `tmux capture-pane -p`).
+fn snapshot_text(snap: &tymux_proto::v1::PaneSnapshot) -> String {
+    let mut lines: Vec<String> = snap
+        .grid
+        .iter()
+        .map(|row| {
+            let line: String = row
+                .cells
+                .iter()
+                .map(|c| {
+                    if c.text.is_empty() {
+                        " "
+                    } else {
+                        c.text.as_str()
+                    }
+                })
+                .collect();
+            line.trim_end().to_string()
+        })
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.iter().map(|l| format!("{l}\n")).collect()
+}
+
 async fn resolve_target(client: &mut TymuxClient, target: &TargetString) -> Result<ProtoPane> {
     let resp = client
         .list_sessions(ListSessionsRequest {})
@@ -344,12 +371,16 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Create a new session and attach to it.
+    /// Create a new session and attach to it (or, with `-d`, just create it).
     New {
         #[arg(long, default_value = "default")]
         name: String,
         #[arg(long)]
         command: Option<String>,
+        /// Create the session without attaching; prints the session id, which
+        /// is what `tymux kill` takes.
+        #[arg(short = 'd', long)]
+        detach: bool,
     },
     /// List sessions on the daemon.
     Ls,
@@ -371,6 +402,8 @@ enum Command {
     },
     /// Close a single pane (not the whole session).
     KillPane { target: String },
+    /// Print a pane's current screen as plain text, e.g. `tymux capture myproject:0.0`.
+    Capture { target: String },
 }
 
 /// Restores the local terminal out of raw mode on drop, including on
@@ -391,7 +424,9 @@ impl Drop for RawGuard {
     }
 }
 
-#[tokio::main]
+// One thread: the default runtime starts a worker per core, which costs more
+// than a short command's whole run (the input reader is a plain thread).
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -516,7 +551,11 @@ async fn run() -> Result<()> {
     let status_bar_cfg = StatusBarConfig::new(!cli.no_status_bar);
 
     match cli.command {
-        Command::New { name, command } => {
+        Command::New {
+            name,
+            command,
+            detach,
+        } => {
             let session = client
                 .create_session(CreateSessionRequest {
                     name: name.clone(),
@@ -526,8 +565,24 @@ async fn run() -> Result<()> {
                 })
                 .await?
                 .into_inner();
+            if detach {
+                println!("{}", session.id);
+                return Ok(());
+            }
             let pane_id = first_pane_id(&session)?;
             attach_and_follow(&mut client, pane_id, &name, &config, &status_bar_cfg).await?;
+        }
+        Command::Capture { target } => {
+            let target = TargetString::parse(&target)?;
+            let pane = resolve_target(&mut client, &target).await?;
+            let snap = client
+                .capture_pane(CapturePaneRequest {
+                    pane_id: pane.id,
+                    scrollback_offset: 0,
+                })
+                .await?
+                .into_inner();
+            print!("{}", snapshot_text(&snap));
         }
         Command::Ls => {
             let resp = client
@@ -2107,9 +2162,14 @@ mod tests {
     #[test]
     fn new_defaults_to_name_default_and_no_command() {
         match parse(&["new"]).command {
-            Command::New { name, command } => {
+            Command::New {
+                name,
+                command,
+                detach,
+            } => {
                 assert_eq!(name, "default");
                 assert_eq!(command, None);
+                assert!(!detach);
             }
             other => panic!("expected Command::New, got a different variant: {other:?}"),
         }
@@ -2118,12 +2178,49 @@ mod tests {
     #[test]
     fn new_accepts_name_and_command() {
         match parse(&["new", "--name", "work", "--command", "bash"]).command {
-            Command::New { name, command } => {
+            Command::New { name, command, .. } => {
                 assert_eq!(name, "work");
                 assert_eq!(command, Some("bash".to_string()));
             }
             other => panic!("expected Command::New, got a different variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_detach_flag_parses_short_and_long() {
+        for flag in ["-d", "--detach"] {
+            match parse(&["new", flag]).command {
+                Command::New { detach, .. } => assert!(detach, "{flag}"),
+                other => panic!("expected Command::New, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn capture_requires_target() {
+        match parse(&["capture", "myproject:0.0"]).command {
+            Command::Capture { target } => assert_eq!(target, "myproject:0.0"),
+            other => panic!("expected Command::Capture, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["tymux", "capture"]).is_err());
+    }
+
+    #[test]
+    fn snapshot_text_trims_trailing_blanks_and_keeps_inner_gaps() {
+        let row = |t: &str| tymux_proto::v1::Row {
+            cells: t
+                .chars()
+                .map(|c| tymux_proto::v1::Cell {
+                    text: c.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let snap = tymux_proto::v1::PaneSnapshot {
+            grid: vec![row("hi  "), row("    "), row("yo "), row("    ")],
+            ..Default::default()
+        };
+        assert_eq!(snapshot_text(&snap), "hi\n\nyo\n");
     }
 
     #[test]
