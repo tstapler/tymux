@@ -407,3 +407,92 @@ fn tymux_ls_is_rejected_with_permission_denied_remedy_when_client_uid_differs_fr
         "stderr should contain the documented PermissionDenied remedy text, got: {stderr}"
     );
 }
+
+/// Runs a real `tymux` subprocess against `socket_path` with `args`.
+fn run_tymux(socket_path: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tymux"))
+        .args(args)
+        .env("TYMUXD_SOCKET_PATH", socket_path)
+        .env_remove("TYMUXD_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run tymux")
+}
+
+fn stdout_of(output: &Output) -> String {
+    assert!(
+        output.status.success(),
+        "tymux failed; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `tymux new -d` creates without attaching and prints the id that `ls`,
+/// `capture` and `kill` then work with, end to end through real subprocesses.
+#[test]
+fn tymux_new_detach_then_ls_capture_kill_round_trip() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let socket_path = unique_temp_dir("detach").join("s.sock");
+    let _daemon = spawn_daemon(DaemonConfig {
+        tcp_addr: "127.0.0.1:0",
+        socket_path: &socket_path,
+        disable_tcp: true,
+    });
+
+    // The CLI passes `--command` as a bare program, so the pane's output
+    // comes from a script.
+    let script = unique_temp_dir("detach-script");
+    std::fs::create_dir_all(&script).unwrap();
+    let script_path = script.join("hello.sh");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\necho hello-from-detached\nexec cat\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = run_tymux(
+        &socket_path,
+        &[
+            "new",
+            "-d",
+            "--name",
+            "det",
+            "--command",
+            script_path.to_str().unwrap(),
+        ],
+    );
+    let id = stdout_of(&out).trim().to_string();
+    assert!(!id.is_empty(), "new -d must print the session id");
+
+    let ls = stdout_of(&run_tymux(&socket_path, &["ls"]));
+    assert!(
+        ls.contains(&id) && ls.contains("[live]"),
+        "ls should show {id}, got: {ls}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let captured = loop {
+        let text = stdout_of(&run_tymux(&socket_path, &["capture", "det"]));
+        if text.contains("hello-from-detached") || std::time::Instant::now() > deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        captured.contains("hello-from-detached"),
+        "capture should return the pane's screen text, got: {captured:?}"
+    );
+
+    stdout_of(&run_tymux(&socket_path, &["kill", &id]));
+    let ls = stdout_of(&run_tymux(&socket_path, &["ls"]));
+    assert!(
+        !ls.contains(&id),
+        "killed session must be gone from ls, got: {ls}"
+    );
+    std::fs::remove_dir_all(&script).ok();
+}

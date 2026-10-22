@@ -6,6 +6,7 @@ members = [
     "crates/tymuxd",
     "crates/tymux-cli",
     "crates/tymux-e2e",
+    "crates/tymux-bench",
 ]
 
 [workspace.package]
