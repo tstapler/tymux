@@ -249,8 +249,8 @@ impl Pane {
         };
         #[cfg(not(unix))]
         let child = {
-            if prepared.stderr.is_some() {
-                anyhow::bail!("stderr_path is only supported on unix");
+            if prepared.stderr.is_some() || prepared.stdin.is_some() {
+                anyhow::bail!("stderr_path and stdin_path are only supported on unix");
             }
             let mut cmd = CommandBuilder::new(command);
             cmd.args(&prepared.args);
@@ -1189,6 +1189,102 @@ mod tests {
             !screen.contains("ERR-42"),
             "stderr leaked onto the pty: {screen}"
         );
+    }
+
+    fn stdin_launch(script: &str, stdin: &std::path::Path) -> Launch {
+        Launch {
+            args: vec!["-c".into(), script.into(), "sh".into()],
+            stdin_path: Some(stdin.display().to_string()),
+            ..Launch::default()
+        }
+    }
+
+    fn wait_for_exit(pane: &Pane) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pane.is_exited() {
+            assert!(Instant::now() < deadline, "child never saw EOF and exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 3 MiB covering every byte value (NUL, ^C, ^D, 0xff, no trailing newline,
+    /// lines far past the 4096-byte canonical-mode limit): what a pty write
+    /// would mangle must arrive intact, and `cat` only exits on a real EOF.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_deliver_a_stdin_file_over_one_mib_byte_identical_then_eof() {
+        let input = tmp_path("in.bin");
+        let output = tmp_path("out.bin");
+        let bytes: Vec<u8> = (0..3 * 1024 * 1024u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .chain(0..=255u8)
+            .collect();
+        std::fs::write(&input, &bytes).unwrap();
+        let launch = Launch {
+            args: vec!["-c".into(), "exec cat > \"$OUT\"".into()],
+            env: [("OUT".to_string(), output.display().to_string())].into(),
+            stdin_path: Some(input.display().to_string()),
+            ..Launch::default()
+        };
+        let pane = Pane::spawn_launch("/bin/sh", &launch, None, None, 24, 80).unwrap();
+        wait_for_exit(&pane);
+        assert_eq!(pane.exit_code(), Some(0));
+        let got = std::fs::read(&output).unwrap();
+        assert_eq!(got.len(), bytes.len());
+        assert!(got == bytes, "stdin bytes differ from the file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_with_stdin_file_should_keep_the_tty_on_stdout_but_not_stdin() {
+        let input = tmp_path("in.txt");
+        std::fs::write(&input, "hello\n").unwrap();
+        let script = "if [ -t 0 ]; then echo STDIN-TTY; else echo STDIN-NOTTY; fi; \
+                      if [ -t 1 ]; then echo STDOUT-TTY; fi; \
+                      if [ -t 2 ]; then echo STDERR-TTY; fi; \
+                      read -r line; echo GOT-$line; \
+                      if read -r more; then echo MORE; else echo EOF-SEEN; fi";
+        let pane = Pane::spawn_launch("/bin/sh", &stdin_launch(script, &input), None, None, 24, 80)
+            .unwrap();
+        for expected in [
+            "STDIN-NOTTY",
+            "STDOUT-TTY",
+            "STDERR-TTY",
+            "GOT-hello",
+            "EOF-SEEN",
+        ] {
+            assert!(wait_for_grid_text(&pane, expected), "missing {expected}");
+        }
+        // /proc/self/stat field 7 (tty_nr) is nonzero only with a controlling
+        // terminal; SIGWINCH reaches the child through it.
+        if std::path::Path::new("/proc/self/stat").exists() {
+            let ctty = "read -r l < /proc/self/stat; set -- $l; \
+                        if [ \"$7\" != 0 ]; then echo CTTY-$((20+22)); else echo NOCTTY-$((20+22)); fi";
+            let pane =
+                Pane::spawn_launch("/bin/sh", &stdin_launch(ctty, &input), None, None, 24, 80)
+                    .unwrap();
+            assert!(
+                wait_for_grid_text(&pane, "CTTY-42"),
+                "lost the controlling tty"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_fail_before_starting_anything_when_the_stdin_file_is_missing() {
+        let err = Pane::spawn_launch(
+            "/bin/sh",
+            &stdin_launch("true", &tmp_path("absent")),
+            None,
+            None,
+            24,
+            80,
+        )
+        .err()
+        .expect("spawn must fail");
+        let launch_err = err.downcast_ref::<crate::launch::LaunchError>().unwrap();
+        assert_eq!(launch_err.kind(), crate::launch::LaunchErrorKind::NotFound);
     }
 
     #[cfg(unix)]

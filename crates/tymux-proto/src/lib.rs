@@ -16,5 +16,6 @@ pub const CAPABILITIES: &[&str] = &[
     "create_session.args_env",
     "create_session.stderr_redirect",
     "create_session.file_args",
+    "create_session.stdin_file",
     "uds_auth",
 ];

@@ -551,7 +551,21 @@ type CreateSessionRequest struct {
 	// value must come from a file: see ArgSpec. Resolved by the daemon at spawn
 	// and again at every revive. Advertised as capability
 	// "create_session.file_args"; ADR-0004.
-	ArgSpecs      []*ArgSpec `protobuf:"bytes,7,rep,name=arg_specs,json=argSpecs,proto3" json:"arg_specs,omitempty"`
+	ArgSpecs []*ArgSpec `protobuf:"bytes,7,rep,name=arg_specs,json=argSpecs,proto3" json:"arg_specs,omitempty"`
+	// Absolute path of a regular file that becomes the process's stdin, as
+	// `< file` does in a shell. The daemon opens it read-only itself (no shell)
+	// at every spawn and revive, so each run reads it from byte 0 and gets a
+	// real EOF at its end; there is no size limit and the bytes are delivered
+	// unmodified. stdout (and stderr, unless stderr_path is set) stay on the
+	// pty, which remains the controlling terminal, but isatty(0) is false and
+	// anything typed into the pane never reaches the process. A missing file
+	// fails the call (CreateSession: NOT_FOUND, ReviveSession:
+	// FAILED_PRECONDITION); an unreadable one is FAILED_PRECONDITION, and a
+	// relative path or a non-regular file (directory, FIFO, device) is
+	// INVALID_ARGUMENT. Empty means "stdin stays on the pty" (the default).
+	// Persisted and re-opened on revive. Advertised as capability
+	// "create_session.stdin_file"; ADR-0005.
+	StdinPath     string `protobuf:"bytes,8,opt,name=stdin_path,json=stdinPath,proto3" json:"stdin_path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -633,6 +647,13 @@ func (x *CreateSessionRequest) GetArgSpecs() []*ArgSpec {
 		return x.ArgSpecs
 	}
 	return nil
+}
+
+func (x *CreateSessionRequest) GetStdinPath() string {
+	if x != nil {
+		return x.StdinPath
+	}
+	return ""
 }
 
 // One argv entry.
@@ -2423,7 +2444,7 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x04rows\x18\x02 \x01(\rR\x04rows\x12\x12\n" +
 	"\x04cols\x18\x03 \x01(\rR\x04cols\x12.\n" +
 	"\bliveness\x18\x04 \x01(\x0e2\x12.tymux.v1.LivenessR\bliveness\x12\x10\n" +
-	"\x03cwd\x18\x05 \x01(\tR\x03cwd\"\xae\x02\n" +
+	"\x03cwd\x18\x05 \x01(\tR\x03cwd\"\xcd\x02\n" +
 	"\x14CreateSessionRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x10\n" +
@@ -2432,7 +2453,9 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x03env\x18\x05 \x03(\v2'.tymux.v1.CreateSessionRequest.EnvEntryR\x03env\x12\x1f\n" +
 	"\vstderr_path\x18\x06 \x01(\tR\n" +
 	"stderrPath\x12.\n" +
-	"\targ_specs\x18\a \x03(\v2\x11.tymux.v1.ArgSpecR\bargSpecs\x1a6\n" +
+	"\targ_specs\x18\a \x03(\v2\x11.tymux.v1.ArgSpecR\bargSpecs\x12\x1d\n" +
+	"\n" +
+	"stdin_path\x18\b \x01(\tR\tstdinPath\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"_\n" +

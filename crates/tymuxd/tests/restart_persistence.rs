@@ -320,3 +320,97 @@ async fn revive_should_reread_arg_file_and_fail_clearly_when_it_is_gone() {
 
     std::fs::remove_dir_all(&sessions_dir).ok();
 }
+
+/// A `stdin_path` pane is replayed on revive: the file is re-opened and read
+/// from byte 0 again (seeing its current contents), and a deleted file
+/// refuses the revive instead of starting the process on empty input.
+#[tokio::test]
+async fn revive_should_replay_stdin_file_and_fail_clearly_when_it_is_gone() {
+    use tymux_proto::v1::ReviveSessionRequest;
+
+    let addr = "127.0.0.1:17422";
+    let sessions_dir =
+        std::env::temp_dir().join(format!("tymuxd-restart-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let stdin_file = sessions_dir.join("input.txt");
+    let log = sessions_dir.join("seen.log");
+    std::fs::write(&stdin_file, "input-one\n").unwrap();
+
+    let session_id = {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        client
+            .create_session(CreateSessionRequest {
+                name: "stdin-file".to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("cat >> {}; sleep 30", log.display()),
+                ],
+                stdin_path: stdin_file.display().to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .id
+    };
+
+    async fn wait_for_log(path: &std::path::Path, want: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(path).unwrap_or_default();
+            if got == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log has {got:?}, want {want:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    wait_for_log(&log, "input-one\n").await;
+
+    std::fs::write(&stdin_file, "input-two\n").unwrap();
+    {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let revived = client
+            .revive_session(ReviveSessionRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(revived.pane_count, 1);
+        wait_for_log(&log, "input-one\ninput-two\n").await;
+    }
+
+    std::fs::remove_file(&stdin_file).unwrap();
+    {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let status = client
+            .revive_session(ReviveSessionRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+        assert!(
+            status.message().contains("input.txt"),
+            "error must name the missing file: {status}"
+        );
+        let listed = client
+            .list_sessions(ListSessionsRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let session = listed.sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(session.liveness, Liveness::Dead as i32);
+    }
+    wait_for_log(&log, "input-one\ninput-two\n").await;
+
+    std::fs::remove_dir_all(&sessions_dir).ok();
+}

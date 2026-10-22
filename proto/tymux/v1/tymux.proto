@@ -198,6 +198,20 @@ message CreateSessionRequest {
   // and again at every revive. Advertised as capability
   // "create_session.file_args"; ADR-0004.
   repeated ArgSpec arg_specs = 7;
+  // Absolute path of a regular file that becomes the process's stdin, as
+  // `< file` does in a shell. The daemon opens it read-only itself (no shell)
+  // at every spawn and revive, so each run reads it from byte 0 and gets a
+  // real EOF at its end; there is no size limit and the bytes are delivered
+  // unmodified. stdout (and stderr, unless stderr_path is set) stay on the
+  // pty, which remains the controlling terminal, but isatty(0) is false and
+  // anything typed into the pane never reaches the process. A missing file
+  // fails the call (CreateSession: NOT_FOUND, ReviveSession:
+  // FAILED_PRECONDITION); an unreadable one is FAILED_PRECONDITION, and a
+  // relative path or a non-regular file (directory, FIFO, device) is
+  // INVALID_ARGUMENT. Empty means "stdin stays on the pty" (the default).
+  // Persisted and re-opened on revive. Advertised as capability
+  // "create_session.stdin_file"; ADR-0005.
+  string stdin_path = 8;
 }
 
 // One argv entry.

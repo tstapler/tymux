@@ -7,6 +7,7 @@ package integration
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -907,7 +908,7 @@ func TestCreateSessionResolvesFileArgsAndRedirectsStderr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Detect: %v", err)
 	}
-	for _, c := range []string{capabilities.StderrRedirect, capabilities.FileArgs} {
+	for _, c := range []string{capabilities.StderrRedirect, capabilities.FileArgs, capabilities.StdinFile} {
 		if !caps.Has(c) {
 			t.Fatalf("daemon does not advertise %q", c)
 		}
@@ -963,6 +964,98 @@ func TestCreateSessionReportsMissingArgFileAsNotFound(t *testing.T) {
 		ArgSpecs: []*tymuxv1.ArgSpec{
 			{Source: &tymuxv1.ArgSpec_FileContentsPath{FileContentsPath: filepath.Join(t.TempDir(), "absent")}},
 		},
+	}))
+	if connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("got %v, want NotFound", err)
+	}
+}
+
+// waitForPaneExit returns once the pane's process has exited: either the
+// attach stream reports it, or (the process was quicker than the attach) the
+// daemon refuses the attach because the pane already exited.
+func waitForPaneExit(t *testing.T, client tymuxv1connect.TymuxServiceClient, paneID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream := client.Attach(ctx)
+	if err := stream.Send(&tymuxv1.AttachRequest{Payload: &tymuxv1.AttachRequest_PaneId{PaneId: paneID}}); err != nil {
+		t.Fatalf("send pane_id: %v", err)
+	}
+	for {
+		event, err := stream.Receive()
+		if connect.CodeOf(err) == connect.CodeFailedPrecondition {
+			return
+		}
+		if err != nil {
+			t.Fatalf("pane never reported an exit after EOF on stdin: %v", err)
+		}
+		if _, ok := event.GetPayload().(*tymuxv1.AttachEvent_Exited); ok {
+			return
+		}
+	}
+}
+
+// TestCreateSessionFeedsStdinPathToTheProcessUntilEOF is the one-shot agent
+// shape: a prompt far past the 128 KiB argv cap arrives on stdin byte for
+// byte, the process sees EOF, and its stdout is still on the pty.
+func TestCreateSessionFeedsStdinPathToTheProcessUntilEOF(t *testing.T) {
+	addr := startDaemon(t)
+	client := newClient(addr, "")
+	ctx := context.Background()
+
+	caps, err := capabilities.Detect(ctx, client)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if !caps.Has(capabilities.StdinFile) {
+		t.Fatalf("daemon does not advertise %q", capabilities.StdinFile)
+	}
+
+	dir := t.TempDir()
+	in, out := filepath.Join(dir, "prompt.bin"), filepath.Join(dir, "out.bin")
+	payload := make([]byte, 2<<20)
+	for i := range payload {
+		payload[i] = byte(i * 7 / 3) // all byte values, including NUL and ^D
+	}
+	if err := os.WriteFile(in, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{
+		Name:      "go-stdin",
+		Command:   "/bin/sh",
+		Args:      []string{"-c", `cat > "$1"; i=no; o=no; [ -t 0 ] && i=yes; [ -t 1 ] && o=yes; echo "stdin-tty=$i stdout-tty=$o" > "$1.tty"`, "sh", out},
+		StdinPath: in,
+	}))
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	paneID := firstPaneID(t, created.Msg)
+	waitForPaneExit(t, client, paneID)
+
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("stdin differs from file: got %d bytes, want %d", len(got), len(payload))
+	}
+	tty, err := os.ReadFile(out + ".tty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "stdin-tty=no stdout-tty=yes\n"; string(tty) != want {
+		t.Fatalf("got %q, want %q", tty, want)
+	}
+}
+
+func TestCreateSessionReportsMissingStdinFileAsNotFound(t *testing.T) {
+	addr := startDaemon(t)
+	client := newClient(addr, "")
+	_, err := client.CreateSession(context.Background(), connect.NewRequest(&tymuxv1.CreateSessionRequest{
+		Name:      "go-stdin-missing",
+		Command:   "/bin/sh",
+		StdinPath: filepath.Join(t.TempDir(), "absent"),
 	}))
 	if connect.CodeOf(err) != connect.CodeNotFound {
 		t.Fatalf("got %v, want NotFound", err)

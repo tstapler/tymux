@@ -617,6 +617,7 @@ impl TymuxService for TymuxDaemon {
                         .map(arg_spec_from_proto)
                         .collect::<Result<_, _>>()?,
                     stderr_path: Some(req.stderr_path).filter(|p| !p.is_empty()),
+                    stdin_path: Some(req.stdin_path).filter(|p| !p.is_empty()),
                 },
                 cwd,
             )
@@ -2369,6 +2370,59 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     }
 
+    /// `stdin_path` over the service API: a file well past the argv cap reaches
+    /// the process as stdin, and the process sees EOF and exits.
+    #[tokio::test]
+    async fn create_session_should_feed_stdin_path_to_the_process_until_eof() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+        let bytes: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+        let input = temp_file("stdin.bin", &bytes);
+        let output = input.with_file_name("out.bin");
+
+        let mut req = create_req("test");
+        req.args = vec!["-c".to_string(), format!("cat > {}", output.display())];
+        req.stdin_path = input.display().to_string();
+        let session = daemon
+            .create_session(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        while !pane.is_exited() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pane never exited after EOF"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(std::fs::read(&output).unwrap() == bytes);
+    }
+
+    #[tokio::test]
+    async fn create_session_should_reject_bad_stdin_path_with_distinct_status_codes() {
+        use tonic::Code;
+        let daemon = test_daemon();
+        let absent = temp_file("present", b"x").with_file_name("absent");
+        let dir = absent.parent().unwrap().to_path_buf();
+        for (path, want) in [
+            (absent.display().to_string(), Code::NotFound),
+            (dir.display().to_string(), Code::InvalidArgument),
+            ("relative.txt".to_string(), Code::InvalidArgument),
+        ] {
+            let mut req = create_req("test");
+            req.stdin_path = path.clone();
+            let err = daemon.create_session(Request::new(req)).await.unwrap_err();
+            assert_eq!(err.code(), want, "{path}: {err}");
+        }
+    }
+
     #[test]
     fn revive_launch_failure_should_map_to_failed_precondition() {
         let status = engine_error_to_status(tymux_core::EngineError::ReviveLaunch {
@@ -2489,7 +2543,11 @@ mod tests {
             .capabilities
             .iter()
             .any(|c| c == "create_session.args_env"));
-        for feature in ["create_session.stderr_redirect", "create_session.file_args"] {
+        for feature in [
+            "create_session.stderr_redirect",
+            "create_session.file_args",
+            "create_session.stdin_file",
+        ] {
             assert!(
                 info.capabilities.iter().any(|c| c == feature),
                 "missing {feature}"

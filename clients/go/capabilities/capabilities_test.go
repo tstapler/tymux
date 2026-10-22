@@ -88,7 +88,7 @@ func TestDetectReturnsEmptySetWhenDaemonPredatesGetServerInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Detect against an old daemon must not fail: %v", err)
 	}
-	for _, c := range []string{capabilities.ArgsEnv, capabilities.StderrRedirect, capabilities.FileArgs} {
+	for _, c := range []string{capabilities.ArgsEnv, capabilities.StderrRedirect, capabilities.FileArgs, capabilities.StdinFile} {
 		if set.Has(c) {
 			t.Errorf("old daemon must not report %q", c)
 		}
@@ -103,6 +103,7 @@ func TestOldDaemonAcceptsButIgnoresNewCreateSessionFields(t *testing.T) {
 		Command:    "/bin/true",
 		Args:       []string{"kept"},
 		StderrPath: "/tmp/err.log",
+		StdinPath:  "/tmp/stdin.txt",
 		ArgSpecs:   []*tymuxv1.ArgSpec{{Source: &tymuxv1.ArgSpec_FileContentsPath{FileContentsPath: "/tmp/prompt"}}},
 	}))
 	if err != nil {
@@ -111,7 +112,7 @@ func TestOldDaemonAcceptsButIgnoresNewCreateSessionFields(t *testing.T) {
 	if got := old.seen.GetArgs(); len(got) != 1 || got[0] != "kept" {
 		t.Errorf("old daemon lost the field it knows: args=%v", got)
 	}
-	if old.seen.GetStderrPath() != "" || len(old.seen.GetArgSpecs()) != 0 {
+	if old.seen.GetStderrPath() != "" || old.seen.GetStdinPath() != "" || len(old.seen.GetArgSpecs()) != 0 {
 		t.Errorf("old daemon unexpectedly saw the new fields: %v", old.seen)
 	}
 }
