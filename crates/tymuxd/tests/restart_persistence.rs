@@ -40,6 +40,16 @@ fn short_unique_socket_path() -> std::path::PathBuf {
         .join("s.sock")
 }
 
+/// Daemon stderr, appended across restarts so a failing test can print it.
+fn daemon_log(sessions_dir: &std::path::Path) -> Stdio {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sessions_dir.join("daemon.log"))
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
+}
+
 fn spawn_daemon(addr: &str, sessions_dir: &std::path::Path) -> DaemonProcess {
     let child = Command::new(env!("CARGO_BIN_EXE_tymuxd"))
         .env("TYMUXD_ADDR", addr)
@@ -50,9 +60,9 @@ fn spawn_daemon(addr: &str, sessions_dir: &std::path::Path) -> DaemonProcess {
         // same uid-scoped default socket and fail to start concurrently —
         // give each spawned daemon its own path.
         .env("TYMUXD_SOCKET_PATH", short_unique_socket_path())
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", "debug")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(daemon_log(sessions_dir))
         .spawn()
         .expect("failed to spawn tymuxd binary");
     DaemonProcess { child }
@@ -267,9 +277,13 @@ async fn revive_should_reread_arg_file_and_fail_clearly_when_it_is_gone() {
             if got.lines().collect::<Vec<_>>() == want {
                 return;
             }
+            let daemon_log = path
+                .parent()
+                .and_then(|dir| std::fs::read_to_string(dir.join("daemon.log")).ok())
+                .unwrap_or_default();
             assert!(
                 std::time::Instant::now() < deadline,
-                "stderr file has {got:?}, want lines {want:?}"
+                "stderr file has {got:?}, want lines {want:?}; daemon log:\n{daemon_log}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
