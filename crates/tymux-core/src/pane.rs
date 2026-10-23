@@ -77,6 +77,7 @@ const KILL_GRACE: Duration = Duration::from_millis(250);
 const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 
 pub use crate::launch::Launch;
+use crate::launch::PreparedLaunch;
 
 /// A single pty-backed terminal. Owns the child process, the pty master
 /// (for resize + writing input), and a `vt100::Parser` that keeps a
@@ -94,6 +95,9 @@ pub struct Pane {
     pub launch: Launch,
     pub cwd: String,
     writer: Mutex<Box<dyn Write + Send>>,
+    /// Write end of the `stdin_stream` pipe; `None` once closed, or when the
+    /// pane was not created with `stdin_stream`.
+    stdin_writer: Mutex<Option<std::fs::File>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
     /// Mirrors the `vt100::Parser` screen's current size, updated by
@@ -154,6 +158,31 @@ pub struct Pane {
     // abandoned; the thread itself already signals exit via `exited` above.
     _reader_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
+
+/// Why [`Pane::write_stdin`] / [`Pane::close_stdin`] failed.
+#[derive(Debug)]
+pub enum StdinError {
+    /// The pane was not created with `stdin_stream`.
+    NotStreaming,
+    /// stdin was already closed.
+    Closed,
+    /// The process closed its stdin or exited.
+    BrokenPipe,
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for StdinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStreaming => write!(f, "pane was not created with stdin_stream"),
+            Self::Closed => write!(f, "stdin is already closed"),
+            Self::BrokenPipe => write!(f, "the process closed its stdin or exited"),
+            Self::Io(e) => write!(f, "writing stdin failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StdinError {}
 
 pub struct PaneSnapshot {
     pub rows: u32,
@@ -249,8 +278,8 @@ impl Pane {
         };
         #[cfg(not(unix))]
         let child = {
-            if prepared.stderr.is_some() {
-                anyhow::bail!("stderr_path is only supported on unix");
+            if prepared.stderr.is_some() || prepared.stdin.is_some() {
+                anyhow::bail!("stderr_path and stdin_path are only supported on unix");
             }
             let mut cmd = CommandBuilder::new(command);
             cmd.args(&prepared.args);
@@ -265,6 +294,14 @@ impl Pane {
         };
         let pid = child.process_id();
         drop(pair.slave);
+        // The pane must not hold the pipe's read end: only then does the
+        // write end see EPIPE once the child exits.
+        let PreparedLaunch {
+            stdin_writer,
+            stdin,
+            ..
+        } = prepared;
+        drop(stdin);
 
         let writer = pair.master.take_writer()?;
         let mut reader = pair.master.try_clone_reader()?;
@@ -285,6 +322,7 @@ impl Pane {
             launch: launch.clone(),
             cwd: effective_cwd,
             writer: Mutex::new(writer),
+            stdin_writer: Mutex::new(stdin_writer),
             master: Mutex::new(pair.master),
             parser: parser.clone(),
             rows: AtomicU32::new(rows as u32),
@@ -440,6 +478,29 @@ impl Pane {
             }
             notified.await;
         }
+    }
+
+    /// Writes `data` to the `stdin_stream` pipe, blocking while the process is
+    /// not reading. Writers are serialized, so one call's bytes stay contiguous.
+    pub fn write_stdin(&self, data: &[u8]) -> std::result::Result<(), StdinError> {
+        let mut guard = self.stdin_writer.lock().unwrap();
+        match guard.as_mut() {
+            Some(pipe) => pipe.write_all(data).map_err(|e| match e.kind() {
+                std::io::ErrorKind::BrokenPipe => StdinError::BrokenPipe,
+                _ => StdinError::Io(e),
+            }),
+            None if self.launch.stdin_stream => Err(StdinError::Closed),
+            None => Err(StdinError::NotStreaming),
+        }
+    }
+
+    /// Sends EOF: closes the `stdin_stream` pipe's write end. Idempotent.
+    pub fn close_stdin(&self) -> std::result::Result<(), StdinError> {
+        if !self.launch.stdin_stream {
+            return Err(StdinError::NotStreaming);
+        }
+        self.stdin_writer.lock().unwrap().take();
+        Ok(())
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
@@ -1189,6 +1250,181 @@ mod tests {
             !screen.contains("ERR-42"),
             "stderr leaked onto the pty: {screen}"
         );
+    }
+
+    fn stdin_launch(script: &str, stdin: &std::path::Path) -> Launch {
+        Launch {
+            args: vec!["-c".into(), script.into(), "sh".into()],
+            stdin_path: Some(stdin.display().to_string()),
+            ..Launch::default()
+        }
+    }
+
+    fn wait_for_exit(pane: &Pane) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pane.is_exited() {
+            assert!(Instant::now() < deadline, "child never saw EOF and exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 3 MiB covering every byte value (NUL, ^C, ^D, 0xff, no trailing newline,
+    /// lines far past the 4096-byte canonical-mode limit): what a pty write
+    /// would mangle must arrive intact, and `cat` only exits on a real EOF.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_deliver_a_stdin_file_over_one_mib_byte_identical_then_eof() {
+        let input = tmp_path("in.bin");
+        let output = tmp_path("out.bin");
+        let bytes: Vec<u8> = (0..3 * 1024 * 1024u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .chain(0..=255u8)
+            .collect();
+        std::fs::write(&input, &bytes).unwrap();
+        let launch = Launch {
+            args: vec!["-c".into(), "exec cat > \"$OUT\"".into()],
+            env: [("OUT".to_string(), output.display().to_string())].into(),
+            stdin_path: Some(input.display().to_string()),
+            ..Launch::default()
+        };
+        let pane = Pane::spawn_launch("/bin/sh", &launch, None, None, 24, 80).unwrap();
+        wait_for_exit(&pane);
+        assert_eq!(pane.exit_code(), Some(0));
+        let got = std::fs::read(&output).unwrap();
+        assert_eq!(got.len(), bytes.len());
+        assert!(got == bytes, "stdin bytes differ from the file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_with_stdin_file_should_keep_the_tty_on_stdout_but_not_stdin() {
+        let input = tmp_path("in.txt");
+        std::fs::write(&input, "hello\n").unwrap();
+        let script = "if [ -t 0 ]; then echo STDIN-TTY; else echo STDIN-NOTTY; fi; \
+                      if [ -t 1 ]; then echo STDOUT-TTY; fi; \
+                      if [ -t 2 ]; then echo STDERR-TTY; fi; \
+                      read -r line; echo GOT-$line; \
+                      if read -r more; then echo MORE; else echo EOF-SEEN; fi";
+        let pane = Pane::spawn_launch("/bin/sh", &stdin_launch(script, &input), None, None, 24, 80)
+            .unwrap();
+        for expected in [
+            "STDIN-NOTTY",
+            "STDOUT-TTY",
+            "STDERR-TTY",
+            "GOT-hello",
+            "EOF-SEEN",
+        ] {
+            assert!(wait_for_grid_text(&pane, expected), "missing {expected}");
+        }
+        // /proc/self/stat field 7 (tty_nr) is nonzero only with a controlling
+        // terminal; SIGWINCH reaches the child through it.
+        if std::path::Path::new("/proc/self/stat").exists() {
+            let ctty = "read -r l < /proc/self/stat; set -- $l; \
+                        if [ \"$7\" != 0 ]; then echo CTTY-$((20+22)); else echo NOCTTY-$((20+22)); fi";
+            let pane =
+                Pane::spawn_launch("/bin/sh", &stdin_launch(ctty, &input), None, None, 24, 80)
+                    .unwrap();
+            assert!(
+                wait_for_grid_text(&pane, "CTTY-42"),
+                "lost the controlling tty"
+            );
+        }
+    }
+
+    fn stream_launch(script: &str, env_out: &std::path::Path) -> Launch {
+        Launch {
+            args: vec!["-c".into(), script.into()],
+            env: [("OUT".to_string(), env_out.display().to_string())].into(),
+            stdin_stream: true,
+            ..Launch::default()
+        }
+    }
+
+    /// Chunks written after the process started arrive in order and
+    /// byte-identical; `cat` exits only on the EOF that `close_stdin` sends.
+    #[cfg(unix)]
+    #[test]
+    fn write_stdin_should_stream_over_one_mib_in_chunks_then_eof_on_close() {
+        let output = tmp_path("stream-out.bin");
+        let bytes: Vec<u8> = (0..3 * 1024 * 1024u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+            .collect();
+        let script =
+            "if [ -t 0 ]; then echo TTY > \"$OUT.tty\"; else echo NOTTY > \"$OUT.tty\"; fi; \
+                      exec cat > \"$OUT\"";
+        let pane = Pane::spawn_launch(
+            "/bin/sh",
+            &stream_launch(script, &output),
+            None,
+            None,
+            24,
+            80,
+        )
+        .unwrap();
+        for chunk in bytes.chunks(100_003) {
+            pane.write_stdin(chunk).unwrap();
+        }
+        assert!(!pane.is_exited(), "cat must wait for EOF");
+        pane.close_stdin().unwrap();
+        wait_for_exit(&pane);
+        assert_eq!(pane.exit_code(), Some(0));
+        assert!(std::fs::read(&output).unwrap() == bytes);
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.tty", output.display())).unwrap(),
+            "NOTTY\n"
+        );
+        assert!(matches!(
+            pane.write_stdin(b"x"),
+            Err(crate::StdinError::Closed)
+        ));
+        pane.close_stdin().unwrap(); // idempotent
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_stdin_should_report_not_streaming_and_broken_pipe() {
+        let plain = Pane::spawn_launch("/bin/sh", &Launch::default(), None, None, 24, 80).unwrap();
+        assert!(matches!(
+            plain.write_stdin(b"x"),
+            Err(crate::StdinError::NotStreaming)
+        ));
+        assert!(matches!(
+            plain.close_stdin(),
+            Err(crate::StdinError::NotStreaming)
+        ));
+
+        let out = tmp_path("unused");
+        let gone = Pane::spawn_launch(
+            "/bin/sh",
+            &stream_launch("exit 0", &out),
+            None,
+            None,
+            24,
+            80,
+        )
+        .unwrap();
+        wait_for_exit(&gone);
+        assert!(matches!(
+            gone.write_stdin(&[0u8; 1 << 20]),
+            Err(crate::StdinError::BrokenPipe)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_should_fail_before_starting_anything_when_the_stdin_file_is_missing() {
+        let err = Pane::spawn_launch(
+            "/bin/sh",
+            &stdin_launch("true", &tmp_path("absent")),
+            None,
+            None,
+            24,
+            80,
+        )
+        .err()
+        .expect("spawn must fail");
+        let launch_err = err.downcast_ref::<crate::launch::LaunchError>().unwrap();
+        assert_eq!(launch_err.kind(), crate::launch::LaunchErrorKind::NotFound);
     }
 
     #[cfg(unix)]

@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file tymux/v1/tymux.proto.
  */
 export const file_tymux_v1_tymux: GenFile = /*@__PURE__*/
-  fileDesc("ChR0eW11eC92MS90eW11eC5wcm90bxIIdHltdXgudjEibAoHU2Vzc2lvbhIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiEKB3dpbmRvd3MYAyADKAsyEC50eW11eC52MS5XaW5kb3cSJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcyJECgZXaW5kb3cSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIgCgZsYXlvdXQYAyABKAsyEC50eW11eC52MS5MYXlvdXQiUgoGTGF5b3V0Eh4KBHBhbmUYASABKAsyDi50eW11eC52MS5QYW5lSAASIAoFc3BsaXQYAiABKAsyDy50eW11eC52MS5TcGxpdEgAQgYKBG5vZGUiXAoFU3BsaXQSKgoLb3JpZW50YXRpb24YASABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhInCghjaGlsZHJlbhgCIAMoCzIVLnR5bXV4LnYxLkxheW91dENoaWxkIj4KC0xheW91dENoaWxkEiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBINCgVyYXRpbxgCIAEoAiJhCgRQYW5lEgoKAmlkGAEgASgJEgwKBHJvd3MYAiABKA0SDAoEY29scxgDIAEoDRIkCghsaXZlbmVzcxgEIAEoDjISLnR5bXV4LnYxLkxpdmVuZXNzEgsKA2N3ZBgFIAEoCSLtAQoUQ3JlYXRlU2Vzc2lvblJlcXVlc3QSDAoEbmFtZRgBIAEoCRIPCgdjb21tYW5kGAIgASgJEgsKA2N3ZBgDIAEoCRIMCgRhcmdzGAQgAygJEjQKA2VudhgFIAMoCzInLnR5bXV4LnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0LkVudkVudHJ5EhMKC3N0ZGVycl9wYXRoGAYgASgJEiQKCWFyZ19zcGVjcxgHIAMoCzIRLnR5bXV4LnYxLkFyZ1NwZWMaKgoIRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJECgdBcmdTcGVjEhEKB2xpdGVyYWwYASABKAlIABIcChJmaWxlX2NvbnRlbnRzX3BhdGgYAiABKAlIAEIICgZzb3VyY2UiFQoTTGlzdFNlc3Npb25zUmVxdWVzdCI7ChRMaXN0U2Vzc2lvbnNSZXNwb25zZRIjCghzZXNzaW9ucxgBIAMoCzIRLnR5bXV4LnYxLlNlc3Npb24iKAoSS2lsbFNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiFQoTS2lsbFNlc3Npb25SZXNwb25zZSIqChRSZXZpdmVTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJImUKFVJldml2ZVNlc3Npb25SZXNwb25zZRIUCgxhbHJlYWR5X2xpdmUYASABKAgSEgoKcGFuZV9jb3VudBgCIAEoDRIiCgdzZXNzaW9uGAMgASgLMhEudHltdXgudjEuU2Vzc2lvbiJgChBTcGxpdFBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSKgoLb3JpZW50YXRpb24YAiABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhIPCgdjb21tYW5kGAMgASgJIiMKEENsb3NlUGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCSKlAQoRQ2xvc2VQYW5lUmVzcG9uc2USGAoQd2luZG93X2Nsb3NlZF9pZBgBIAEoCRIaChJ3aW5kb3dfY2xvc2VkX25hbWUYAiABKAkSGQoRc2Vzc2lvbl9jbG9zZWRfaWQYAyABKAkSGwoTc2Vzc2lvbl9jbG9zZWRfbmFtZRgEIAEoCRIiCgdzZXNzaW9uGAUgASgLMhEudHltdXgudjEuU2Vzc2lvbiI6ChNDcmVhdGVXaW5kb3dSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSDwoHY29tbWFuZBgCIAEoCSInChJXYXRjaFdpbmRvd1JlcXVlc3QSEQoJd2luZG93X2lkGAEgASgJIlQKEVdpbmRvd0xheW91dEV2ZW50EiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBIdChVhdHRhY2hlZF9jbGllbnRfY291bnQYAiABKA0iQAoSQ2FwdHVyZVBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSGQoRc2Nyb2xsYmFja19vZmZzZXQYAiABKA0iUQoXU2VhcmNoU2Nyb2xsYmFja1JlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIPCgdwYXR0ZXJuGAIgASgJEhQKDHN0YXJ0X29mZnNldBgDIAEoDSJHChhTZWFyY2hTY3JvbGxiYWNrUmVzcG9uc2USDQoFZm91bmQYASABKAgSDgoGb2Zmc2V0GAIgASgNEgwKBGxpbmUYAyABKAkipgEKDFBhbmVTbmFwc2hvdBIPCgdwYW5lX2lkGAEgASgJEgwKBHJvd3MYAiABKA0SDAoEY29scxgDIAEoDRIbCgRncmlkGAQgAygLMg0udHltdXgudjEuUm93EhIKCmN1cnNvcl9yb3cYBSABKA0SEgoKY3Vyc29yX2NvbBgGIAEoDRIkCghsaXZlbmVzcxgHIAEoDjISLnR5bXV4LnYxLkxpdmVuZXNzIiQKA1JvdxIdCgVjZWxscxgBIAMoCzIOLnR5bXV4LnYxLkNlbGwiOwoEQ2VsbBIMCgR0ZXh0GAEgASgJEgoKAmZnGAIgASgNEgoKAmJnGAMgASgNEg0KBWF0dHJzGAQgASgNIpQBCg1BdHRhY2hSZXF1ZXN0EhEKB3BhbmVfaWQYASABKAlIABIPCgVpbnB1dBgCIAEoDEgAEiIKBnJlc2l6ZRgDIAEoCzIQLnR5bXV4LnYxLlJlc2l6ZUgAEhwKD3Jlc3VtZV9mcm9tX3NlcRgEIAEoBEgBiAEBQgkKB3BheWxvYWRCEgoQX3Jlc3VtZV9mcm9tX3NlcSIkCgZSZXNpemUSDAoEcm93cxgBIAEoDRIMCgRjb2xzGAIgASgNIigKCkV4aXRTdGF0dXMSEQoEY29kZRgBIAEoBUgAiAEBQgcKBV9jb2RlIigKC091dHB1dENodW5rEgsKA3NlcRgBIAEoBBIMCgRkYXRhGAIgASgMIisKC0dhcEV4Y2VlZGVkEhwKFG9sZGVzdF9hdmFpbGFibGVfc2VxGAEgASgEIgsKCUhlYXJ0YmVhdCKcAgoLQXR0YWNoRXZlbnQSEAoGb3V0cHV0GAEgASgMSAASKgoIc25hcHNob3QYAiABKAsyFi50eW11eC52MS5QYW5lU25hcHNob3RIABImCgZleGl0ZWQYAyABKAsyFC50eW11eC52MS5FeGl0U3RhdHVzSAASFAoKb3V0cHV0X2dhcBgEIAEoCEgAEi0KDGdhcF9leGNlZWRlZBgFIAEoCzIVLnR5bXV4LnYxLkdhcEV4Y2VlZGVkSAASKAoJaGVhcnRiZWF0GAYgASgLMhMudHltdXgudjEuSGVhcnRiZWF0SAASLQoMb3V0cHV0X2NodW5rGAcgASgLMhUudHltdXgudjEuT3V0cHV0Q2h1bmtIAEIJCgdwYXlsb2FkIjcKFEdldFNlcnZlckluZm9SZXF1ZXN0Eh8KF2NsaWVudF9wcm90b2NvbF92ZXJzaW9uGAEgASgNIpgBCgpTZXJ2ZXJJbmZvEg8KB3ZlcnNpb24YASABKAkSGAoQcHJvdG9jb2xfdmVyc2lvbhgCIAEoDRIjChttaW5fY2xpZW50X3Byb3RvY29sX3ZlcnNpb24YAyABKA0SFAoMY2FwYWJpbGl0aWVzGAQgAygJEgsKA3BpZBgFIAEoDRIXCg9zdGFydGVkX2F0X3VuaXgYBiABKAMqSgoITGl2ZW5lc3MSGAoUTElWRU5FU1NfVU5TUEVDSUZJRUQQABIRCg1MSVZFTkVTU19MSVZFEAESEQoNTElWRU5FU1NfREVBRBACKmAKC09yaWVudGF0aW9uEhsKF09SSUVOVEFUSU9OX1VOU1BFQ0lGSUVEEAASGgoWT1JJRU5UQVRJT05fSE9SSVpPTlRBTBABEhgKFE9SSUVOVEFUSU9OX1ZFUlRJQ0FMEAIy9AYKDFR5bXV4U2VydmljZRJFCg1HZXRTZXJ2ZXJJbmZvEh4udHltdXgudjEuR2V0U2VydmVySW5mb1JlcXVlc3QaFC50eW11eC52MS5TZXJ2ZXJJbmZvEkIKDUNyZWF0ZVNlc3Npb24SHi50eW11eC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdBoRLnR5bXV4LnYxLlNlc3Npb24STQoMTGlzdFNlc3Npb25zEh0udHltdXgudjEuTGlzdFNlc3Npb25zUmVxdWVzdBoeLnR5bXV4LnYxLkxpc3RTZXNzaW9uc1Jlc3BvbnNlEkoKC0tpbGxTZXNzaW9uEhwudHltdXgudjEuS2lsbFNlc3Npb25SZXF1ZXN0Gh0udHltdXgudjEuS2lsbFNlc3Npb25SZXNwb25zZRJQCg1SZXZpdmVTZXNzaW9uEh4udHltdXgudjEuUmV2aXZlU2Vzc2lvblJlcXVlc3QaHy50eW11eC52MS5SZXZpdmVTZXNzaW9uUmVzcG9uc2USQwoLQ2FwdHVyZVBhbmUSHC50eW11eC52MS5DYXB0dXJlUGFuZVJlcXVlc3QaFi50eW11eC52MS5QYW5lU25hcHNob3QSWQoQU2VhcmNoU2Nyb2xsYmFjaxIhLnR5bXV4LnYxLlNlYXJjaFNjcm9sbGJhY2tSZXF1ZXN0GiIudHltdXgudjEuU2VhcmNoU2Nyb2xsYmFja1Jlc3BvbnNlEjoKCVNwbGl0UGFuZRIaLnR5bXV4LnYxLlNwbGl0UGFuZVJlcXVlc3QaES50eW11eC52MS5TZXNzaW9uEkQKCUNsb3NlUGFuZRIaLnR5bXV4LnYxLkNsb3NlUGFuZVJlcXVlc3QaGy50eW11eC52MS5DbG9zZVBhbmVSZXNwb25zZRJACgxDcmVhdGVXaW5kb3cSHS50eW11eC52MS5DcmVhdGVXaW5kb3dSZXF1ZXN0GhEudHltdXgudjEuU2Vzc2lvbhJKCgtXYXRjaFdpbmRvdxIcLnR5bXV4LnYxLldhdGNoV2luZG93UmVxdWVzdBobLnR5bXV4LnYxLldpbmRvd0xheW91dEV2ZW50MAESPAoGQXR0YWNoEhcudHltdXgudjEuQXR0YWNoUmVxdWVzdBoVLnR5bXV4LnYxLkF0dGFjaEV2ZW50KAEwAUKWAQoMY29tLnR5bXV4LnYxQgpUeW11eFByb3RvUAFaOWdpdGh1Yi5jb20vdHN0YXBsZXIvdHltdXgvY2xpZW50cy9nby9nZW4vdHltdXgvdjE7dHltdXh2MaICA1RYWKoCCFR5bXV4LlYxygIIVHltdXhcVjHiAhRUeW11eFxWMVxHUEJNZXRhZGF0YeoCCVR5bXV4OjpWMWIGcHJvdG8z");
+  fileDesc("ChR0eW11eC92MS90eW11eC5wcm90bxIIdHltdXgudjEibAoHU2Vzc2lvbhIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiEKB3dpbmRvd3MYAyADKAsyEC50eW11eC52MS5XaW5kb3cSJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcyJECgZXaW5kb3cSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIgCgZsYXlvdXQYAyABKAsyEC50eW11eC52MS5MYXlvdXQiUgoGTGF5b3V0Eh4KBHBhbmUYASABKAsyDi50eW11eC52MS5QYW5lSAASIAoFc3BsaXQYAiABKAsyDy50eW11eC52MS5TcGxpdEgAQgYKBG5vZGUiXAoFU3BsaXQSKgoLb3JpZW50YXRpb24YASABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhInCghjaGlsZHJlbhgCIAMoCzIVLnR5bXV4LnYxLkxheW91dENoaWxkIj4KC0xheW91dENoaWxkEiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBINCgVyYXRpbxgCIAEoAiJhCgRQYW5lEgoKAmlkGAEgASgJEgwKBHJvd3MYAiABKA0SDAoEY29scxgDIAEoDRIkCghsaXZlbmVzcxgEIAEoDjISLnR5bXV4LnYxLkxpdmVuZXNzEgsKA2N3ZBgFIAEoCSKXAgoUQ3JlYXRlU2Vzc2lvblJlcXVlc3QSDAoEbmFtZRgBIAEoCRIPCgdjb21tYW5kGAIgASgJEgsKA2N3ZBgDIAEoCRIMCgRhcmdzGAQgAygJEjQKA2VudhgFIAMoCzInLnR5bXV4LnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0LkVudkVudHJ5EhMKC3N0ZGVycl9wYXRoGAYgASgJEiQKCWFyZ19zcGVjcxgHIAMoCzIRLnR5bXV4LnYxLkFyZ1NwZWMSEgoKc3RkaW5fcGF0aBgIIAEoCRIUCgxzdGRpbl9zdHJlYW0YCSABKAgaKgoIRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJECgdBcmdTcGVjEhEKB2xpdGVyYWwYASABKAlIABIcChJmaWxlX2NvbnRlbnRzX3BhdGgYAiABKAlIAEIICgZzb3VyY2UiFQoTTGlzdFNlc3Npb25zUmVxdWVzdCI7ChRMaXN0U2Vzc2lvbnNSZXNwb25zZRIjCghzZXNzaW9ucxgBIAMoCzIRLnR5bXV4LnYxLlNlc3Npb24iKAoSS2lsbFNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiFQoTS2lsbFNlc3Npb25SZXNwb25zZSIqChRSZXZpdmVTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJImUKFVJldml2ZVNlc3Npb25SZXNwb25zZRIUCgxhbHJlYWR5X2xpdmUYASABKAgSEgoKcGFuZV9jb3VudBgCIAEoDRIiCgdzZXNzaW9uGAMgASgLMhEudHltdXgudjEuU2Vzc2lvbiJgChBTcGxpdFBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSKgoLb3JpZW50YXRpb24YAiABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhIPCgdjb21tYW5kGAMgASgJIiMKEENsb3NlUGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCSKlAQoRQ2xvc2VQYW5lUmVzcG9uc2USGAoQd2luZG93X2Nsb3NlZF9pZBgBIAEoCRIaChJ3aW5kb3dfY2xvc2VkX25hbWUYAiABKAkSGQoRc2Vzc2lvbl9jbG9zZWRfaWQYAyABKAkSGwoTc2Vzc2lvbl9jbG9zZWRfbmFtZRgEIAEoCRIiCgdzZXNzaW9uGAUgASgLMhEudHltdXgudjEuU2Vzc2lvbiI6ChNDcmVhdGVXaW5kb3dSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSDwoHY29tbWFuZBgCIAEoCSInChJXYXRjaFdpbmRvd1JlcXVlc3QSEQoJd2luZG93X2lkGAEgASgJIlQKEVdpbmRvd0xheW91dEV2ZW50EiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBIdChVhdHRhY2hlZF9jbGllbnRfY291bnQYAiABKA0iQAoSQ2FwdHVyZVBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSGQoRc2Nyb2xsYmFja19vZmZzZXQYAiABKA0iUQoXU2VhcmNoU2Nyb2xsYmFja1JlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIPCgdwYXR0ZXJuGAIgASgJEhQKDHN0YXJ0X29mZnNldBgDIAEoDSJHChhTZWFyY2hTY3JvbGxiYWNrUmVzcG9uc2USDQoFZm91bmQYASABKAgSDgoGb2Zmc2V0GAIgASgNEgwKBGxpbmUYAyABKAkipgEKDFBhbmVTbmFwc2hvdBIPCgdwYW5lX2lkGAEgASgJEgwKBHJvd3MYAiABKA0SDAoEY29scxgDIAEoDRIbCgRncmlkGAQgAygLMg0udHltdXgudjEuUm93EhIKCmN1cnNvcl9yb3cYBSABKA0SEgoKY3Vyc29yX2NvbBgGIAEoDRIkCghsaXZlbmVzcxgHIAEoDjISLnR5bXV4LnYxLkxpdmVuZXNzIiQKA1JvdxIdCgVjZWxscxgBIAMoCzIOLnR5bXV4LnYxLkNlbGwiOwoEQ2VsbBIMCgR0ZXh0GAEgASgJEgoKAmZnGAIgASgNEgoKAmJnGAMgASgNEg0KBWF0dHJzGAQgASgNIpQBCg1BdHRhY2hSZXF1ZXN0EhEKB3BhbmVfaWQYASABKAlIABIPCgVpbnB1dBgCIAEoDEgAEiIKBnJlc2l6ZRgDIAEoCzIQLnR5bXV4LnYxLlJlc2l6ZUgAEhwKD3Jlc3VtZV9mcm9tX3NlcRgEIAEoBEgBiAEBQgkKB3BheWxvYWRCEgoQX3Jlc3VtZV9mcm9tX3NlcSJSChFXcml0ZVN0ZGluUmVxdWVzdBIRCgdwYW5lX2lkGAEgASgJSAASDgoEZGF0YRgCIAEoDEgAEg8KBWNsb3NlGAMgASgISABCCQoHcGF5bG9hZCIrChJXcml0ZVN0ZGluUmVzcG9uc2USFQoNYnl0ZXNfd3JpdHRlbhgBIAEoBCIkCgZSZXNpemUSDAoEcm93cxgBIAEoDRIMCgRjb2xzGAIgASgNIigKCkV4aXRTdGF0dXMSEQoEY29kZRgBIAEoBUgAiAEBQgcKBV9jb2RlIigKC091dHB1dENodW5rEgsKA3NlcRgBIAEoBBIMCgRkYXRhGAIgASgMIisKC0dhcEV4Y2VlZGVkEhwKFG9sZGVzdF9hdmFpbGFibGVfc2VxGAEgASgEIgsKCUhlYXJ0YmVhdCKcAgoLQXR0YWNoRXZlbnQSEAoGb3V0cHV0GAEgASgMSAASKgoIc25hcHNob3QYAiABKAsyFi50eW11eC52MS5QYW5lU25hcHNob3RIABImCgZleGl0ZWQYAyABKAsyFC50eW11eC52MS5FeGl0U3RhdHVzSAASFAoKb3V0cHV0X2dhcBgEIAEoCEgAEi0KDGdhcF9leGNlZWRlZBgFIAEoCzIVLnR5bXV4LnYxLkdhcEV4Y2VlZGVkSAASKAoJaGVhcnRiZWF0GAYgASgLMhMudHltdXgudjEuSGVhcnRiZWF0SAASLQoMb3V0cHV0X2NodW5rGAcgASgLMhUudHltdXgudjEuT3V0cHV0Q2h1bmtIAEIJCgdwYXlsb2FkIjcKFEdldFNlcnZlckluZm9SZXF1ZXN0Eh8KF2NsaWVudF9wcm90b2NvbF92ZXJzaW9uGAEgASgNIpgBCgpTZXJ2ZXJJbmZvEg8KB3ZlcnNpb24YASABKAkSGAoQcHJvdG9jb2xfdmVyc2lvbhgCIAEoDRIjChttaW5fY2xpZW50X3Byb3RvY29sX3ZlcnNpb24YAyABKA0SFAoMY2FwYWJpbGl0aWVzGAQgAygJEgsKA3BpZBgFIAEoDRIXCg9zdGFydGVkX2F0X3VuaXgYBiABKAMqSgoITGl2ZW5lc3MSGAoUTElWRU5FU1NfVU5TUEVDSUZJRUQQABIRCg1MSVZFTkVTU19MSVZFEAESEQoNTElWRU5FU1NfREVBRBACKmAKC09yaWVudGF0aW9uEhsKF09SSUVOVEFUSU9OX1VOU1BFQ0lGSUVEEAASGgoWT1JJRU5UQVRJT05fSE9SSVpPTlRBTBABEhgKFE9SSUVOVEFUSU9OX1ZFUlRJQ0FMEAIyvwcKDFR5bXV4U2VydmljZRJFCg1HZXRTZXJ2ZXJJbmZvEh4udHltdXgudjEuR2V0U2VydmVySW5mb1JlcXVlc3QaFC50eW11eC52MS5TZXJ2ZXJJbmZvEkIKDUNyZWF0ZVNlc3Npb24SHi50eW11eC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdBoRLnR5bXV4LnYxLlNlc3Npb24STQoMTGlzdFNlc3Npb25zEh0udHltdXgudjEuTGlzdFNlc3Npb25zUmVxdWVzdBoeLnR5bXV4LnYxLkxpc3RTZXNzaW9uc1Jlc3BvbnNlEkoKC0tpbGxTZXNzaW9uEhwudHltdXgudjEuS2lsbFNlc3Npb25SZXF1ZXN0Gh0udHltdXgudjEuS2lsbFNlc3Npb25SZXNwb25zZRJQCg1SZXZpdmVTZXNzaW9uEh4udHltdXgudjEuUmV2aXZlU2Vzc2lvblJlcXVlc3QaHy50eW11eC52MS5SZXZpdmVTZXNzaW9uUmVzcG9uc2USQwoLQ2FwdHVyZVBhbmUSHC50eW11eC52MS5DYXB0dXJlUGFuZVJlcXVlc3QaFi50eW11eC52MS5QYW5lU25hcHNob3QSWQoQU2VhcmNoU2Nyb2xsYmFjaxIhLnR5bXV4LnYxLlNlYXJjaFNjcm9sbGJhY2tSZXF1ZXN0GiIudHltdXgudjEuU2VhcmNoU2Nyb2xsYmFja1Jlc3BvbnNlEjoKCVNwbGl0UGFuZRIaLnR5bXV4LnYxLlNwbGl0UGFuZVJlcXVlc3QaES50eW11eC52MS5TZXNzaW9uEkQKCUNsb3NlUGFuZRIaLnR5bXV4LnYxLkNsb3NlUGFuZVJlcXVlc3QaGy50eW11eC52MS5DbG9zZVBhbmVSZXNwb25zZRJACgxDcmVhdGVXaW5kb3cSHS50eW11eC52MS5DcmVhdGVXaW5kb3dSZXF1ZXN0GhEudHltdXgudjEuU2Vzc2lvbhJKCgtXYXRjaFdpbmRvdxIcLnR5bXV4LnYxLldhdGNoV2luZG93UmVxdWVzdBobLnR5bXV4LnYxLldpbmRvd0xheW91dEV2ZW50MAESPAoGQXR0YWNoEhcudHltdXgudjEuQXR0YWNoUmVxdWVzdBoVLnR5bXV4LnYxLkF0dGFjaEV2ZW50KAEwARJJCgpXcml0ZVN0ZGluEhsudHltdXgudjEuV3JpdGVTdGRpblJlcXVlc3QaHC50eW11eC52MS5Xcml0ZVN0ZGluUmVzcG9uc2UoAUKWAQoMY29tLnR5bXV4LnYxQgpUeW11eFByb3RvUAFaOWdpdGh1Yi5jb20vdHN0YXBsZXIvdHltdXgvY2xpZW50cy9nby9nZW4vdHltdXgvdjE7dHltdXh2MaICA1RYWKoCCFR5bXV4LlYxygIIVHltdXhcVjHiAhRUeW11eFxWMVxHUEJNZXRhZGF0YeoCCVR5bXV4OjpWMWIGcHJvdG8z");
 
 /**
  * @generated from message tymux.v1.Session
@@ -257,6 +257,39 @@ export type CreateSessionRequest = Message<"tymux.v1.CreateSessionRequest"> & {
    * @generated from field: repeated tymux.v1.ArgSpec arg_specs = 7;
    */
   argSpecs: ArgSpec[];
+
+  /**
+   * Absolute path of a regular file that becomes the process's stdin, as
+   * `< file` does in a shell. The daemon opens it read-only itself (no shell)
+   * at every spawn and revive, so each run reads it from byte 0 and gets a
+   * real EOF at its end; there is no size limit and the bytes are delivered
+   * unmodified. stdout (and stderr, unless stderr_path is set) stay on the
+   * pty, which remains the controlling terminal, but isatty(0) is false and
+   * anything typed into the pane never reaches the process. A missing file
+   * fails the call (CreateSession: NOT_FOUND, ReviveSession:
+   * FAILED_PRECONDITION); an unreadable one is FAILED_PRECONDITION, and a
+   * relative path or a non-regular file (directory, FIFO, device) is
+   * INVALID_ARGUMENT. Empty means "stdin stays on the pty" (the default).
+   * Persisted and re-opened on revive. Advertised as capability
+   * "create_session.stdin_file"; ADR-0005.
+   *
+   * @generated from field: string stdin_path = 8;
+   */
+  stdinPath: string;
+
+  /**
+   * Start the process with stdin on a pipe the daemon keeps open, to be fed
+   * later through the WriteStdin RPC; the process sees EOF when a WriteStdin
+   * `close` arrives (or the pane is discarded). stdout, stderr and the
+   * controlling tty stay on the pty as with stdin_path, and isatty(0) is
+   * false. Mutually exclusive with stdin_path (INVALID_ARGUMENT). Persisted;
+   * on revive the pipe is recreated empty and open, and the client must
+   * stream its input again (the bytes are never stored). Advertised as
+   * capability "create_session.stdin_stream"; ADR-0006.
+   *
+   * @generated from field: bool stdin_stream = 9;
+   */
+  stdinStream: boolean;
 };
 
 /**
@@ -822,6 +855,66 @@ export const AttachRequestSchema: GenMessage<AttachRequest> = /*@__PURE__*/
   messageDesc(file_tymux_v1_tymux, 26);
 
 /**
+ * @generated from message tymux.v1.WriteStdinRequest
+ */
+export type WriteStdinRequest = Message<"tymux.v1.WriteStdinRequest"> & {
+  /**
+   * @generated from oneof tymux.v1.WriteStdinRequest.payload
+   */
+  payload: {
+    /**
+     * first message only: which pane's stdin to write
+     *
+     * @generated from field: string pane_id = 1;
+     */
+    value: string;
+    case: "paneId";
+  } | {
+    /**
+     * appended to the process's stdin, unmodified
+     *
+     * @generated from field: bytes data = 2;
+     */
+    value: Uint8Array;
+    case: "data";
+  } | {
+    /**
+     * send EOF: close the pipe's write end (must be true)
+     *
+     * @generated from field: bool close = 3;
+     */
+    value: boolean;
+    case: "close";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message tymux.v1.WriteStdinRequest.
+ * Use `create(WriteStdinRequestSchema)` to create a new message.
+ */
+export const WriteStdinRequestSchema: GenMessage<WriteStdinRequest> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 27);
+
+/**
+ * @generated from message tymux.v1.WriteStdinResponse
+ */
+export type WriteStdinResponse = Message<"tymux.v1.WriteStdinResponse"> & {
+  /**
+   * Total bytes this call wrote to the pipe.
+   *
+   * @generated from field: uint64 bytes_written = 1;
+   */
+  bytesWritten: bigint;
+};
+
+/**
+ * Describes the message tymux.v1.WriteStdinResponse.
+ * Use `create(WriteStdinResponseSchema)` to create a new message.
+ */
+export const WriteStdinResponseSchema: GenMessage<WriteStdinResponse> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 28);
+
+/**
  * @generated from message tymux.v1.Resize
  */
 export type Resize = Message<"tymux.v1.Resize"> & {
@@ -841,7 +934,7 @@ export type Resize = Message<"tymux.v1.Resize"> & {
  * Use `create(ResizeSchema)` to create a new message.
  */
 export const ResizeSchema: GenMessage<Resize> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 27);
+  messageDesc(file_tymux_v1_tymux, 29);
 
 /**
  * ADR-001: an absent `code` (proto3 field presence, not a separate
@@ -863,7 +956,7 @@ export type ExitStatus = Message<"tymux.v1.ExitStatus"> & {
  * Use `create(ExitStatusSchema)` to create a new message.
  */
 export const ExitStatusSchema: GenMessage<ExitStatus> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 28);
+  messageDesc(file_tymux_v1_tymux, 30);
 
 /**
  * Epic 1.1: a single sequenced output chunk. `seq` is the daemon's
@@ -891,7 +984,7 @@ export type OutputChunk = Message<"tymux.v1.OutputChunk"> & {
  * Use `create(OutputChunkSchema)` to create a new message.
  */
 export const OutputChunkSchema: GenMessage<OutputChunk> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 29);
+  messageDesc(file_tymux_v1_tymux, 31);
 
 /**
  * Epic 1.1: sent instead of a resumed OutputChunk stream when the
@@ -915,7 +1008,7 @@ export type GapExceeded = Message<"tymux.v1.GapExceeded"> & {
  * Use `create(GapExceededSchema)` to create a new message.
  */
 export const GapExceededSchema: GenMessage<GapExceeded> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 30);
+  messageDesc(file_tymux_v1_tymux, 32);
 
 /**
  * Epic 1.1: an empty keepalive event sent on an application-level
@@ -933,7 +1026,7 @@ export type Heartbeat = Message<"tymux.v1.Heartbeat"> & {
  * Use `create(HeartbeatSchema)` to create a new message.
  */
 export const HeartbeatSchema: GenMessage<Heartbeat> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 31);
+  messageDesc(file_tymux_v1_tymux, 33);
 
 /**
  * @generated from message tymux.v1.AttachEvent
@@ -1018,7 +1111,7 @@ export type AttachEvent = Message<"tymux.v1.AttachEvent"> & {
  * Use `create(AttachEventSchema)` to create a new message.
  */
 export const AttachEventSchema: GenMessage<AttachEvent> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 32);
+  messageDesc(file_tymux_v1_tymux, 34);
 
 /**
  * @generated from message tymux.v1.GetServerInfoRequest
@@ -1038,7 +1131,7 @@ export type GetServerInfoRequest = Message<"tymux.v1.GetServerInfoRequest"> & {
  * Use `create(GetServerInfoRequestSchema)` to create a new message.
  */
 export const GetServerInfoRequestSchema: GenMessage<GetServerInfoRequest> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 33);
+  messageDesc(file_tymux_v1_tymux, 35);
 
 /**
  * @generated from message tymux.v1.ServerInfo
@@ -1095,7 +1188,7 @@ export type ServerInfo = Message<"tymux.v1.ServerInfo"> & {
  * Use `create(ServerInfoSchema)` to create a new message.
  */
 export const ServerInfoSchema: GenMessage<ServerInfo> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 34);
+  messageDesc(file_tymux_v1_tymux, 36);
 
 /**
  * Whether a pane's/session's backing process is still running. proto3
@@ -1352,6 +1445,25 @@ export const TymuxService: GenService<{
     methodKind: "bidi_streaming";
     input: typeof AttachRequestSchema;
     output: typeof AttachEventSchema;
+  },
+  /**
+   * Streams bytes into the stdin of a pane created with
+   * CreateSessionRequest.stdin_stream (ADR-0006). First message names the
+   * pane; later messages carry data or a close. Bytes are written in order and
+   * the call returns once every message has been written (or the stream
+   * closed); writes block while the process is not reading, so a slow reader
+   * applies backpressure to the client. The pipe stays open after the stream
+   * ends unless a `close` was sent, so one input can span several calls.
+   * FAILED_PRECONDITION: the pane is dead, was not created with stdin_stream,
+   * stdin is already closed, or the process closed its stdin / exited
+   * (broken pipe). Advertised as capability "create_session.stdin_stream".
+   *
+   * @generated from rpc tymux.v1.TymuxService.WriteStdin
+   */
+  writeStdin: {
+    methodKind: "client_streaming";
+    input: typeof WriteStdinRequestSchema;
+    output: typeof WriteStdinResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_tymux_v1_tymux, 0);

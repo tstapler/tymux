@@ -1711,6 +1711,13 @@ mod tests {
             ) -> Result<tonic::Response<Session>, tonic::Status> {
                 unreachable!("test never issues RPCs")
             }
+            async fn write_stdin(
+                &self,
+                _request: tonic::Request<tonic::Streaming<tymux_proto::v1::WriteStdinRequest>>,
+            ) -> Result<tonic::Response<tymux_proto::v1::WriteStdinResponse>, tonic::Status>
+            {
+                unreachable!("test never issues RPCs")
+            }
             async fn list_sessions(
                 &self,
                 _request: tonic::Request<ListSessionsRequest>,

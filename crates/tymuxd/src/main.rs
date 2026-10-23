@@ -17,15 +17,16 @@ use tymux_core::{
 use tymux_proto::v1::arg_spec;
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
 use tymux_proto::v1::{
-    attach_event, attach_request, ArgSpec, AttachEvent, AttachRequest, CapturePaneRequest,
-    Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse, CreateSessionRequest,
-    CreateWindowRequest, ExitStatus, GapExceeded, GetServerInfoRequest, Heartbeat,
-    KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
+    attach_event, attach_request, write_stdin_request, ArgSpec, AttachEvent, AttachRequest,
+    CapturePaneRequest, Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse,
+    CreateSessionRequest, CreateWindowRequest, ExitStatus, GapExceeded, GetServerInfoRequest,
+    Heartbeat, KillSessionRequest, KillSessionResponse, Layout as ProtoLayout,
     LayoutChild as ProtoLayoutChild, ListSessionsRequest, ListSessionsResponse, Liveness,
     Orientation as ProtoOrientation, OutputChunk, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
     ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest,
     SearchScrollbackResponse, ServerInfo, Session as ProtoSession, Split as ProtoSplit,
     SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
+    WriteStdinRequest, WriteStdinResponse,
 };
 
 mod auth;
@@ -617,6 +618,8 @@ impl TymuxService for TymuxDaemon {
                         .map(arg_spec_from_proto)
                         .collect::<Result<_, _>>()?,
                     stderr_path: Some(req.stderr_path).filter(|p| !p.is_empty()),
+                    stdin_path: Some(req.stdin_path).filter(|p| !p.is_empty()),
+                    stdin_stream: req.stdin_stream,
                 },
                 cwd,
             )
@@ -858,6 +861,52 @@ impl TymuxService for TymuxDaemon {
         Ok(Response::new(
             Box::pin(ReceiverStream::new(rx)) as Self::WatchWindowStream
         ))
+    }
+
+    async fn write_stdin(
+        &self,
+        request: Request<Streaming<WriteStdinRequest>>,
+    ) -> Result<Response<WriteStdinResponse>, Status> {
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("WriteStdin stream closed before pane id"))?;
+        let Some(write_stdin_request::Payload::PaneId(pane_id)) = first.payload else {
+            return Err(Status::invalid_argument(
+                "first WriteStdin message must set pane_id",
+            ));
+        };
+        let pane = resolve_live_pane(&self.engine, parse_uuid(&pane_id)?)?;
+
+        let mut bytes_written = 0u64;
+        while let Some(message) = inbound.message().await? {
+            let pane = pane.clone();
+            let outcome = match message.payload {
+                Some(write_stdin_request::Payload::Data(data)) => {
+                    let len = data.len() as u64;
+                    // Blocks while the process is not reading: off the async
+                    // threads, and the client is held back by the stream's
+                    // flow control meanwhile.
+                    tokio::task::spawn_blocking(move || pane.write_stdin(&data))
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map(|()| len)
+                }
+                Some(write_stdin_request::Payload::Close(true)) => pane.close_stdin().map(|()| 0),
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "WriteStdin messages after the first must set data or close=true",
+                    ))
+                }
+            };
+            match outcome {
+                Ok(n) => bytes_written += n,
+                Err(tymux_core::StdinError::Io(e)) => return Err(Status::internal(e.to_string())),
+                Err(e) => return Err(Status::failed_precondition(e.to_string())),
+            }
+        }
+        Ok(Response::new(WriteStdinResponse { bytes_written }))
     }
 
     type AttachStream = Pin<Box<dyn Stream<Item = Result<AttachEvent, Status>> + Send>>;
@@ -2369,6 +2418,61 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     }
 
+    /// `stdin_path` over the service API: a file well past the argv cap reaches
+    /// the process as stdin, and the process sees EOF and exits.
+    #[tokio::test]
+    async fn create_session_should_feed_stdin_path_to_the_process_until_eof() {
+        let daemon = test_daemon();
+        let bytes: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+        let input = temp_file("stdin.bin", &bytes);
+        let output = input.with_file_name("out.bin");
+
+        let mut req = create_req("test");
+        req.args = vec!["-c".to_string(), format!("cat > {}", output.display())];
+        req.stdin_path = input.display().to_string();
+        daemon.create_session(Request::new(req)).await.unwrap();
+
+        // Waits on the output file, not the pane: the pane may already have
+        // exited. Equality means `cat` read every byte.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while std::fs::read(&output).unwrap_or_default() != bytes {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stdin never arrived intact"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(std::fs::read(&output).unwrap() == bytes);
+    }
+
+    #[tokio::test]
+    async fn create_session_should_reject_bad_stdin_path_with_distinct_status_codes() {
+        use tonic::Code;
+        let daemon = test_daemon();
+        let absent = temp_file("present", b"x").with_file_name("absent");
+        let dir = absent.parent().unwrap().to_path_buf();
+        for (path, want) in [
+            (absent.display().to_string(), Code::NotFound),
+            (dir.display().to_string(), Code::InvalidArgument),
+            ("relative.txt".to_string(), Code::InvalidArgument),
+        ] {
+            let mut req = create_req("test");
+            req.stdin_path = path.clone();
+            let err = daemon.create_session(Request::new(req)).await.unwrap_err();
+            assert_eq!(err.code(), want, "{path}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_should_reject_stdin_path_combined_with_stdin_stream() {
+        let daemon = test_daemon();
+        let mut req = create_req("test");
+        req.stdin_path = temp_file("in", b"x").display().to_string();
+        req.stdin_stream = true;
+        let err = daemon.create_session(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+    }
+
     #[test]
     fn revive_launch_failure_should_map_to_failed_precondition() {
         let status = engine_error_to_status(tymux_core::EngineError::ReviveLaunch {
@@ -2489,7 +2593,12 @@ mod tests {
             .capabilities
             .iter()
             .any(|c| c == "create_session.args_env"));
-        for feature in ["create_session.stderr_redirect", "create_session.file_args"] {
+        for feature in [
+            "create_session.stderr_redirect",
+            "create_session.file_args",
+            "create_session.stdin_file",
+            "create_session.stdin_stream",
+        ] {
             assert!(
                 info.capabilities.iter().any(|c| c == feature),
                 "missing {feature}"

@@ -30,7 +30,9 @@ use crate::launch::{Launch, PreparedLaunch};
 
 /// Spawns `program` with the pty slave behind `master_fd` as stdin/stdout and
 /// controlling terminal, in a new session. Stderr is the slave too, unless
-/// `prepared.stderr` is set, in which case it is that file.
+/// `prepared.stderr` is set, in which case it is that file; likewise stdin is
+/// `prepared.stdin` when set (the slave is still the controlling terminal and
+/// stdout).
 pub(crate) fn spawn_on_pty(
     master_fd: RawFd,
     program: &str,
@@ -72,15 +74,7 @@ pub(crate) fn spawn_on_pty(
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         let slave = slave_path(master_fd).context("failed to find pty slave")?;
-        let child = posix::spawn(
-            &resolved,
-            program,
-            &prepared.args,
-            &env,
-            &dir,
-            &slave,
-            prepared.stderr.as_ref(),
-        )?;
+        let child = posix::spawn(&resolved, program, prepared, &env, &dir, &slave)?;
         Ok(Box::new(child))
     }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -107,12 +101,15 @@ fn spawn_with_command(
     cmd.current_dir(dir);
     cmd.env_clear();
     cmd.envs(env);
-    cmd.stdin(Stdio::from(slave.try_clone()?))
-        .stdout(Stdio::from(slave.try_clone()?))
-        .stderr(match &prepared.stderr {
-            Some(file) => Stdio::from(file.try_clone()?),
-            None => Stdio::from(slave),
-        });
+    cmd.stdin(match &prepared.stdin {
+        Some(file) => Stdio::from(file.try_clone()?),
+        None => Stdio::from(slave.try_clone()?),
+    })
+    .stdout(Stdio::from(slave.try_clone()?))
+    .stderr(match &prepared.stderr {
+        Some(file) => Stdio::from(file.try_clone()?),
+        None => Stdio::from(slave),
+    });
 
     // SAFETY: the closure calls only async-signal-safe libc functions and
     // allocates nothing.
@@ -131,9 +128,9 @@ fn spawn_with_command(
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            // Fd 0 is the slave by now; without this SIGWINCH never reaches
-            // the child.
-            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+            // Fd 1 is always the slave (fd 0 is the stdin file when set);
+            // without this SIGWINCH never reaches the child.
+            if libc::ioctl(1, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             close_inherited_fds();
@@ -288,15 +285,14 @@ mod posix {
     pub(super) fn spawn(
         resolved: &OsStr,
         arg0: &str,
-        args: &[String],
+        prepared: &PreparedLaunch,
         env: &[(OsString, OsString)],
         dir: &Path,
         slave: &Path,
-        stderr: Option<&File>,
     ) -> Result<PosixChild> {
         let path = cstr(resolved)?;
         let mut argv_owned = vec![cstr(OsStr::new(arg0))?];
-        for a in args {
+        for a in &prepared.args {
             argv_owned.push(cstr(OsStr::new(a))?);
         }
         let mut argv: Vec<*mut libc::c_char> =
@@ -316,17 +312,26 @@ mod posix {
 
         // Above fd 2, so the addopen/dup2 of the slave onto 0..=2 below cannot
         // clobber it if the daemon itself runs with a closed stdio fd.
-        let stderr_fd = stderr
-            .map(|f| {
-                let fd = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-                if fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: fcntl just returned this fd and nothing else owns it.
-                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-            })
+        let dup_above_stdio = |f: &File| {
+            let fd = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fcntl just returned this fd and nothing else owns it.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        };
+        let stderr_fd = prepared
+            .stderr
+            .as_ref()
+            .map(dup_above_stdio)
             .transpose()
             .context("failed to duplicate the stderr file descriptor")?;
+        let stdin_fd = prepared
+            .stdin
+            .as_ref()
+            .map(dup_above_stdio)
+            .transpose()
+            .context("failed to duplicate the stdin file descriptor")?;
 
         let dir_c = cstr(dir.as_os_str())?;
         let slave_c = cstr(slave.as_os_str())?;
@@ -385,6 +390,15 @@ mod posix {
                     2,
                 ))?,
                 None => check(libc::posix_spawn_file_actions_adddup2(&mut fa.0, 0, 2))?,
+            }
+            // After the slave was opened as the controlling terminal and
+            // copied to 1 and 2, so replacing fd 0 here keeps the tty.
+            if let Some(fd) = &stdin_fd {
+                check(libc::posix_spawn_file_actions_adddup2(
+                    &mut fa.0,
+                    fd.as_raw_fd(),
+                    0,
+                ))?;
             }
             // Constant-time close of everything inherited above fd 2.
             check(libc::posix_spawn_file_actions_addclosefrom_np(&mut fa.0, 3))?;

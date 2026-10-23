@@ -13,6 +13,7 @@ use tymux_proto::v1::layout::Node;
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
     CreateSessionRequest, ListSessionsRequest, Liveness, Orientation, SplitPaneRequest,
+    WriteStdinRequest,
 };
 
 struct DaemonProcess {
@@ -333,6 +334,223 @@ async fn revive_should_reread_arg_file_and_fail_clearly_when_it_is_gone() {
         assert_eq!(session.liveness, Liveness::Dead as i32);
     }
     wait_for_stderr_lines(&stderr_file, &["value-one", "value-two"]).await;
+
+    std::fs::remove_dir_all(&sessions_dir).ok();
+}
+
+/// A `stdin_path` pane is replayed on revive: the file is re-opened and read
+/// from byte 0 again (seeing its current contents), and a deleted file
+/// refuses the revive instead of starting the process on empty input.
+#[tokio::test]
+async fn revive_should_replay_stdin_file_and_fail_clearly_when_it_is_gone() {
+    use tymux_proto::v1::ReviveSessionRequest;
+
+    let addr = "127.0.0.1:17422";
+    let sessions_dir =
+        std::env::temp_dir().join(format!("tymuxd-restart-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let stdin_file = sessions_dir.join("input.txt");
+    let log = sessions_dir.join("seen.log");
+    std::fs::write(&stdin_file, "input-one\n").unwrap();
+
+    async fn wait_for_log(path: &std::path::Path, want: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(path).unwrap_or_default();
+            if got == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log has {got:?}, want {want:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let session_id = {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let id = client
+            .create_session(CreateSessionRequest {
+                name: "stdin-file".to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("cat >> {}; sleep 30", log.display()),
+                ],
+                stdin_path: stdin_file.display().to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .id;
+        // Dropping the daemon SIGHUPs the child: let it read the file first.
+        wait_for_log(&log, "input-one\n").await;
+        id
+    };
+
+    std::fs::write(&stdin_file, "input-two\n").unwrap();
+    {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let revived = client
+            .revive_session(ReviveSessionRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(revived.pane_count, 1);
+        wait_for_log(&log, "input-one\ninput-two\n").await;
+    }
+
+    std::fs::remove_file(&stdin_file).unwrap();
+    {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let status = client
+            .revive_session(ReviveSessionRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+        assert!(
+            status.message().contains("input.txt"),
+            "error must name the missing file: {status}"
+        );
+        let listed = client
+            .list_sessions(ListSessionsRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let session = listed.sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(session.liveness, Liveness::Dead as i32);
+    }
+    wait_for_log(&log, "input-one\ninput-two\n").await;
+
+    std::fs::remove_dir_all(&sessions_dir).ok();
+}
+
+fn stdin_messages(pane_id: &str, data: &[u8], close: bool) -> Vec<WriteStdinRequest> {
+    use tymux_proto::v1::write_stdin_request::Payload;
+    let mut messages = vec![WriteStdinRequest {
+        payload: Some(Payload::PaneId(pane_id.to_string())),
+    }];
+    if !data.is_empty() {
+        messages.push(WriteStdinRequest {
+            payload: Some(Payload::Data(data.to_vec())),
+        });
+    }
+    if close {
+        messages.push(WriteStdinRequest {
+            payload: Some(Payload::Close(true)),
+        });
+    }
+    messages
+}
+
+fn first_pane_id(session: &tymux_proto::v1::Session) -> String {
+    match session.windows[0]
+        .layout
+        .as_ref()
+        .unwrap()
+        .node
+        .as_ref()
+        .unwrap()
+    {
+        Node::Pane(p) => p.id.clone(),
+        other => panic!("expected a single pane, got {other:?}"),
+    }
+}
+
+/// `stdin_stream`: a pane fed over WriteStdin sees EOF on close; after a
+/// daemon restart and revive the pipe is open and empty again (the old bytes
+/// are not replayed) and must be fed anew.
+#[tokio::test]
+async fn write_stdin_should_feed_a_stream_pane_and_need_refeeding_after_revive() {
+    use tymux_proto::v1::ReviveSessionRequest;
+
+    let addr = "127.0.0.1:17423";
+    let sessions_dir =
+        std::env::temp_dir().join(format!("tymuxd-restart-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let log = sessions_dir.join("seen.log");
+
+    async fn wait_for_log(path: &std::path::Path, want: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(path).unwrap_or_default();
+            if got == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log has {got:?}, want {want:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    let (session_id, pane_id) = {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let session = client
+            .create_session(CreateSessionRequest {
+                name: "stdin-stream".to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), format!("cat >> {}", log.display())],
+                stdin_stream: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = first_pane_id(&session);
+        // Fed in two calls: the pipe stays open until `close`.
+        let resp = client
+            .write_stdin(tokio_stream::iter(stdin_messages(
+                &pane_id, b"one\n", false,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.bytes_written, 4);
+        client
+            .write_stdin(tokio_stream::iter(stdin_messages(&pane_id, b"and\n", true)))
+            .await
+            .unwrap();
+        wait_for_log(&log, "one\nand\n").await;
+        (session.id, pane_id)
+    };
+
+    let _daemon = spawn_daemon(addr, &sessions_dir);
+    let mut client = wait_for_daemon(addr).await;
+    // Dead pane: refused, not queued.
+    let status = client
+        .write_stdin(tokio_stream::iter(stdin_messages(&pane_id, b"x", false)))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+
+    client
+        .revive_session(ReviveSessionRequest { session_id })
+        .await
+        .unwrap();
+    wait_for_log(&log, "one\nand\n").await; // nothing replayed
+    client
+        .write_stdin(tokio_stream::iter(stdin_messages(&pane_id, b"two\n", true)))
+        .await
+        .unwrap();
+    wait_for_log(&log, "one\nand\ntwo\n").await;
+
+    // Closed: further writes are refused.
+    let status = client
+        .write_stdin(tokio_stream::iter(stdin_messages(&pane_id, b"late", false)))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
 
     std::fs::remove_dir_all(&sessions_dir).ok();
 }
