@@ -39,6 +39,16 @@ fn short_unique_socket_path() -> std::path::PathBuf {
         .join("s.sock")
 }
 
+/// Daemon stderr, appended across restarts so a failing test can print it.
+fn daemon_log(sessions_dir: &std::path::Path) -> Stdio {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sessions_dir.join("daemon.log"))
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
+}
+
 fn spawn_daemon(addr: &str, sessions_dir: &std::path::Path) -> DaemonProcess {
     let child = Command::new(env!("CARGO_BIN_EXE_tymuxd"))
         .env("TYMUXD_ADDR", addr)
@@ -51,7 +61,7 @@ fn spawn_daemon(addr: &str, sessions_dir: &std::path::Path) -> DaemonProcess {
         .env("TYMUXD_SOCKET_PATH", short_unique_socket_path())
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(daemon_log(sessions_dir))
         .spawn()
         .expect("failed to spawn tymuxd binary");
     DaemonProcess { child }
@@ -233,10 +243,28 @@ async fn revive_should_reread_arg_file_and_fail_clearly_when_it_is_gone() {
     let stderr_file = sessions_dir.join("stderr.log");
     std::fs::write(&arg_file, "value-one").unwrap();
 
+    async fn wait_for_stderr_lines(path: &std::path::Path, want: &[&str]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(path).unwrap_or_default();
+            if got.lines().collect::<Vec<_>>() == want {
+                return;
+            }
+            let daemon_log = path
+                .parent()
+                .and_then(|dir| std::fs::read_to_string(dir.join("daemon.log")).ok())
+                .unwrap_or_default();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stderr file has {got:?}, want lines {want:?}; daemon log:\n{daemon_log}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
     let session_id = {
         let _daemon = spawn_daemon(addr, &sessions_dir);
         let mut client = wait_for_daemon(addr).await;
-        client
+        let id = client
             .create_session(CreateSessionRequest {
                 name: "file-args".to_string(),
                 command: "/bin/sh".to_string(),
@@ -256,24 +284,12 @@ async fn revive_should_reread_arg_file_and_fail_clearly_when_it_is_gone() {
             .await
             .unwrap()
             .into_inner()
-            .id
+            .id;
+        // Dropping the daemon closes the pty and SIGHUPs the child, so wait
+        // for its output first (a slow exec loses this race on macOS).
+        wait_for_stderr_lines(&stderr_file, &["value-one"]).await;
+        id
     };
-
-    async fn wait_for_stderr_lines(path: &std::path::Path, want: &[&str]) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let got = std::fs::read_to_string(path).unwrap_or_default();
-            if got.lines().collect::<Vec<_>>() == want {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "stderr file has {got:?}, want lines {want:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-    wait_for_stderr_lines(&stderr_file, &["value-one"]).await;
 
     // Crash, change the file, restart, revive.
     std::fs::write(&arg_file, "value-two").unwrap();
