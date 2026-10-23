@@ -1,0 +1,13 @@
+[package]
+name = "tymux-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Renders the tymux-vs-tmux benchmark charts from results.json and gates regressions"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

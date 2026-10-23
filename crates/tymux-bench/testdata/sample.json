@@ -1,0 +1,19 @@
+{
+  "env": {"generated_at":"x","tymux_git_sha":"abc1234","tmux_version":"tmux 3.6a","kernel":"Linux 6","cpu":"Test CPU","cores":8,"sessions":200,"bucket_size":100,"session_command":"/bin/cat"},
+  "backends": [
+    {"name":"tymux (gRPC API)","create":[{"live_from":0,"live_to":100,"n":100,"min_ms":0.3,"p50_ms":0.4,"p95_ms":0.6,"max_ms":1},{"live_from":100,"live_to":200,"n":100,"min_ms":0.3,"p50_ms":0.5,"p95_ms":0.7,"max_ms":1}],
+     "kill":{"n":200,"p50_ms":0.1,"p95_ms":0.2},"list_at_max_sessions":{"n":30,"p50_ms":0.3,"p95_ms":0.9},
+     "capture_at_max_sessions":{"n":100,"p50_ms":0.3,"p95_ms":0.5},"keystroke_echo":{"n":200,"p50_ms":0.05,"p95_ms":0.1},
+     "cold_start":{"n":20,"p50_ms":2.7,"p95_ms":3},"reattach":{"n":50,"p50_ms":0.3,"p95_ms":0.5,"gap_free_resumes":50},
+     "server_rss_kib_per_session":146},
+    {"name":"tymux (CLI)","create":[{"live_from":0,"live_to":100,"n":100,"min_ms":2,"p50_ms":2.7,"p95_ms":3.5,"max_ms":5},{"live_from":100,"live_to":200,"n":100,"min_ms":2,"p50_ms":2.8,"p95_ms":3.6,"max_ms":5}],
+     "kill":{"n":200,"p50_ms":2.4,"p95_ms":3},"list_at_max_sessions":{"n":30,"p50_ms":2.7,"p95_ms":3},"capture_at_max_sessions":{"n":100,"p50_ms":2.9,"p95_ms":3.4}},
+    {"name":"tmux (CLI)","create":[{"live_from":0,"live_to":100,"n":100,"min_ms":1.5,"p50_ms":1.9,"p95_ms":2.3,"max_ms":3},{"live_from":100,"live_to":200,"n":100,"min_ms":1.5,"p50_ms":2.1,"p95_ms":2.4,"max_ms":3}],
+     "kill":{"n":200,"p50_ms":1.5,"p95_ms":1.8},"list_at_max_sessions":{"n":30,"p50_ms":2.1,"p95_ms":2.7},"capture_at_max_sessions":{"n":100,"p50_ms":1.4,"p95_ms":1.9},
+     "cold_start":{"n":20,"p50_ms":5.3,"p95_ms":5.9},"server_rss_kib_per_session":14},
+    {"name":"tmux (control mode)","create":[{"live_from":0,"live_to":100,"n":100,"min_ms":0.4,"p50_ms":0.5,"p95_ms":0.7,"max_ms":1},{"live_from":100,"live_to":200,"n":100,"min_ms":0.5,"p50_ms":0.7,"p95_ms":0.9,"max_ms":1}],
+     "kill":{"n":200,"p50_ms":0.11,"p95_ms":0.23},"list_at_max_sessions":{"n":30,"p50_ms":0.65,"p95_ms":0.83},"capture_at_max_sessions":{"n":100,"p50_ms":0.06,"p95_ms":0.1},
+     "keystroke_echo":{"n":200,"p50_ms":0.12,"p95_ms":0.2},"cold_start":{"n":20,"p50_ms":7.6,"p95_ms":7.9},"reattach":{"n":50,"p50_ms":1.4,"p95_ms":1.7,"gap_free_resumes":0},
+     "server_rss_kib_per_session":14}
+  ]
+}
