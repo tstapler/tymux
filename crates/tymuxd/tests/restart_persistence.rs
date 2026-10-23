@@ -337,26 +337,6 @@ async fn revive_should_replay_stdin_file_and_fail_clearly_when_it_is_gone() {
     let log = sessions_dir.join("seen.log");
     std::fs::write(&stdin_file, "input-one\n").unwrap();
 
-    let session_id = {
-        let _daemon = spawn_daemon(addr, &sessions_dir);
-        let mut client = wait_for_daemon(addr).await;
-        client
-            .create_session(CreateSessionRequest {
-                name: "stdin-file".to_string(),
-                command: "/bin/sh".to_string(),
-                args: vec![
-                    "-c".to_string(),
-                    format!("cat >> {}; sleep 30", log.display()),
-                ],
-                stdin_path: stdin_file.display().to_string(),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .id
-    };
-
     async fn wait_for_log(path: &std::path::Path, want: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -371,7 +351,28 @@ async fn revive_should_replay_stdin_file_and_fail_clearly_when_it_is_gone() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
-    wait_for_log(&log, "input-one\n").await;
+    let session_id = {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let id = client
+            .create_session(CreateSessionRequest {
+                name: "stdin-file".to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("cat >> {}; sleep 30", log.display()),
+                ],
+                stdin_path: stdin_file.display().to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .id;
+        // Dropping the daemon SIGHUPs the child: let it read the file first.
+        wait_for_log(&log, "input-one\n").await;
+        id
+    };
 
     std::fs::write(&stdin_file, "input-two\n").unwrap();
     {
