@@ -1,7 +1,7 @@
 // Package capabilities feature-detects optional tymuxd behavior (ADR-0003).
 //
 // A daemon silently ignores request fields it does not know, so sending
-// CreateSessionRequest.stderr_path, arg_specs or stdin_path to an older daemon succeeds
+// CreateSessionRequest.stderr_path, arg_specs, stdin_path or stdin_stream to an older daemon succeeds
 // and does nothing. Gate each use on Has.
 package capabilities
 
@@ -20,6 +20,7 @@ const (
 	StderrRedirect = "create_session.stderr_redirect" // CreateSessionRequest.stderr_path
 	FileArgs       = "create_session.file_args"       // CreateSessionRequest.arg_specs
 	StdinFile      = "create_session.stdin_file"      // CreateSessionRequest.stdin_path
+	StdinStream    = "create_session.stdin_stream"    // CreateSessionRequest.stdin_stream, WriteStdin RPC
 )
 
 // Set is the capabilities a daemon advertises.

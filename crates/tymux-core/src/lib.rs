@@ -16,7 +16,7 @@ pub use layout::{
     LayoutError, LayoutNode, Orientation, PtyRect, RemoveOutcome, MIN_PANE_COLS, MIN_PANE_ROWS,
     RECOMMENDED_SPLIT_MIN_ROWS,
 };
-pub use pane::{CellSnapshot, Pane, PaneSnapshot};
+pub use pane::{CellSnapshot, Pane, PaneSnapshot, StdinError};
 pub use persistence::{
     default_sessions_dir, FsPersistenceBackend, NullPersistenceBackend, PersistedLayoutNode,
     PersistedPaneRecord, PersistedSessionRecord, PersistedWindowRecord, PersistenceBackend,

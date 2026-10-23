@@ -81,7 +81,7 @@ With (a) out, an enum would have a single useful value. If another mode is ever 
 ## What is not supported
 
 - Typing the file into an interactive program (option (a)), or leaving stdin interactive while also supplying a file.
-- Streaming or appending to the program's stdin after spawn: the file is the whole input, EOF comes with its end.
+- Streaming or appending to the program's stdin after spawn: the file is the whole input, EOF comes with its end. Streaming is [ADR-0006](0006-write-stdin-stream.md).
 - Non-regular sources (FIFO, socket, device, directory).
 - Windows: the field is rejected on non-unix builds, like `stderr_path`.
 - On non-glibc unix hosts the spawn path is `Command` + `pre_exec`, which now takes the controlling terminal from

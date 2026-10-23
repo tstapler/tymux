@@ -104,6 +104,18 @@ service TymuxService {
   //    keeps retrying on this schedule has a real chance of reconnecting
   //    before the daemon gives up on the pane's grace period.
   rpc Attach(stream AttachRequest) returns (stream AttachEvent);
+
+  // Streams bytes into the stdin of a pane created with
+  // CreateSessionRequest.stdin_stream (ADR-0006). First message names the
+  // pane; later messages carry data or a close. Bytes are written in order and
+  // the call returns once every message has been written (or the stream
+  // closed); writes block while the process is not reading, so a slow reader
+  // applies backpressure to the client. The pipe stays open after the stream
+  // ends unless a `close` was sent, so one input can span several calls.
+  // FAILED_PRECONDITION: the pane is dead, was not created with stdin_stream,
+  // stdin is already closed, or the process closed its stdin / exited
+  // (broken pipe). Advertised as capability "create_session.stdin_stream".
+  rpc WriteStdin(stream WriteStdinRequest) returns (WriteStdinResponse);
 }
 
 // Whether a pane's/session's backing process is still running. proto3
@@ -212,6 +224,15 @@ message CreateSessionRequest {
   // Persisted and re-opened on revive. Advertised as capability
   // "create_session.stdin_file"; ADR-0005.
   string stdin_path = 8;
+  // Start the process with stdin on a pipe the daemon keeps open, to be fed
+  // later through the WriteStdin RPC; the process sees EOF when a WriteStdin
+  // `close` arrives (or the pane is discarded). stdout, stderr and the
+  // controlling tty stay on the pty as with stdin_path, and isatty(0) is
+  // false. Mutually exclusive with stdin_path (INVALID_ARGUMENT). Persisted;
+  // on revive the pipe is recreated empty and open, and the client must
+  // stream its input again (the bytes are never stored). Advertised as
+  // capability "create_session.stdin_stream"; ADR-0006.
+  bool stdin_stream = 9;
 }
 
 // One argv entry.
@@ -357,6 +378,19 @@ message AttachRequest {
   // PaneSnapshot. See the Attach RPC's doc comment above for the full
   // reconnect contract.
   optional uint64 resume_from_seq = 4;
+}
+
+message WriteStdinRequest {
+  oneof payload {
+    string pane_id = 1; // first message only: which pane's stdin to write
+    bytes data = 2;     // appended to the process's stdin, unmodified
+    bool close = 3;     // send EOF: close the pipe's write end (must be true)
+  }
+}
+
+message WriteStdinResponse {
+  // Total bytes this call wrote to the pipe.
+  uint64 bytes_written = 1;
 }
 
 message Resize {

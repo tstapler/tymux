@@ -66,6 +66,8 @@ const (
 	TymuxServiceWatchWindowProcedure = "/tymux.v1.TymuxService/WatchWindow"
 	// TymuxServiceAttachProcedure is the fully-qualified name of the TymuxService's Attach RPC.
 	TymuxServiceAttachProcedure = "/tymux.v1.TymuxService/Attach"
+	// TymuxServiceWriteStdinProcedure is the fully-qualified name of the TymuxService's WriteStdin RPC.
+	TymuxServiceWriteStdinProcedure = "/tymux.v1.TymuxService/WriteStdin"
 )
 
 // TymuxServiceClient is a client for the tymux.v1.TymuxService service.
@@ -165,6 +167,17 @@ type TymuxServiceClient interface {
 	//     keeps retrying on this schedule has a real chance of reconnecting
 	//     before the daemon gives up on the pane's grace period.
 	Attach(context.Context) *connect.BidiStreamForClient[v1.AttachRequest, v1.AttachEvent]
+	// Streams bytes into the stdin of a pane created with
+	// CreateSessionRequest.stdin_stream (ADR-0006). First message names the
+	// pane; later messages carry data or a close. Bytes are written in order and
+	// the call returns once every message has been written (or the stream
+	// closed); writes block while the process is not reading, so a slow reader
+	// applies backpressure to the client. The pipe stays open after the stream
+	// ends unless a `close` was sent, so one input can span several calls.
+	// FAILED_PRECONDITION: the pane is dead, was not created with stdin_stream,
+	// stdin is already closed, or the process closed its stdin / exited
+	// (broken pipe). Advertised as capability "create_session.stdin_stream".
+	WriteStdin(context.Context) *connect.ClientStreamForClient[v1.WriteStdinRequest, v1.WriteStdinResponse]
 }
 
 // NewTymuxServiceClient constructs a client for the tymux.v1.TymuxService service. By default, it
@@ -250,6 +263,12 @@ func NewTymuxServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 			connect.WithSchema(tymuxServiceMethods.ByName("Attach")),
 			connect.WithClientOptions(opts...),
 		),
+		writeStdin: connect.NewClient[v1.WriteStdinRequest, v1.WriteStdinResponse](
+			httpClient,
+			baseURL+TymuxServiceWriteStdinProcedure,
+			connect.WithSchema(tymuxServiceMethods.ByName("WriteStdin")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -267,6 +286,7 @@ type tymuxServiceClient struct {
 	createWindow     *connect.Client[v1.CreateWindowRequest, v1.Session]
 	watchWindow      *connect.Client[v1.WatchWindowRequest, v1.WindowLayoutEvent]
 	attach           *connect.Client[v1.AttachRequest, v1.AttachEvent]
+	writeStdin       *connect.Client[v1.WriteStdinRequest, v1.WriteStdinResponse]
 }
 
 // GetServerInfo calls tymux.v1.TymuxService.GetServerInfo.
@@ -327,6 +347,11 @@ func (c *tymuxServiceClient) WatchWindow(ctx context.Context, req *connect.Reque
 // Attach calls tymux.v1.TymuxService.Attach.
 func (c *tymuxServiceClient) Attach(ctx context.Context) *connect.BidiStreamForClient[v1.AttachRequest, v1.AttachEvent] {
 	return c.attach.CallBidiStream(ctx)
+}
+
+// WriteStdin calls tymux.v1.TymuxService.WriteStdin.
+func (c *tymuxServiceClient) WriteStdin(ctx context.Context) *connect.ClientStreamForClient[v1.WriteStdinRequest, v1.WriteStdinResponse] {
+	return c.writeStdin.CallClientStream(ctx)
 }
 
 // TymuxServiceHandler is an implementation of the tymux.v1.TymuxService service.
@@ -426,6 +451,17 @@ type TymuxServiceHandler interface {
 	//     keeps retrying on this schedule has a real chance of reconnecting
 	//     before the daemon gives up on the pane's grace period.
 	Attach(context.Context, *connect.BidiStream[v1.AttachRequest, v1.AttachEvent]) error
+	// Streams bytes into the stdin of a pane created with
+	// CreateSessionRequest.stdin_stream (ADR-0006). First message names the
+	// pane; later messages carry data or a close. Bytes are written in order and
+	// the call returns once every message has been written (or the stream
+	// closed); writes block while the process is not reading, so a slow reader
+	// applies backpressure to the client. The pipe stays open after the stream
+	// ends unless a `close` was sent, so one input can span several calls.
+	// FAILED_PRECONDITION: the pane is dead, was not created with stdin_stream,
+	// stdin is already closed, or the process closed its stdin / exited
+	// (broken pipe). Advertised as capability "create_session.stdin_stream".
+	WriteStdin(context.Context, *connect.ClientStream[v1.WriteStdinRequest]) (*connect.Response[v1.WriteStdinResponse], error)
 }
 
 // NewTymuxServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -507,6 +543,12 @@ func NewTymuxServiceHandler(svc TymuxServiceHandler, opts ...connect.HandlerOpti
 		connect.WithSchema(tymuxServiceMethods.ByName("Attach")),
 		connect.WithHandlerOptions(opts...),
 	)
+	tymuxServiceWriteStdinHandler := connect.NewClientStreamHandler(
+		TymuxServiceWriteStdinProcedure,
+		svc.WriteStdin,
+		connect.WithSchema(tymuxServiceMethods.ByName("WriteStdin")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/tymux.v1.TymuxService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case TymuxServiceGetServerInfoProcedure:
@@ -533,6 +575,8 @@ func NewTymuxServiceHandler(svc TymuxServiceHandler, opts ...connect.HandlerOpti
 			tymuxServiceWatchWindowHandler.ServeHTTP(w, r)
 		case TymuxServiceAttachProcedure:
 			tymuxServiceAttachHandler.ServeHTTP(w, r)
+		case TymuxServiceWriteStdinProcedure:
+			tymuxServiceWriteStdinHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -588,4 +632,8 @@ func (UnimplementedTymuxServiceHandler) WatchWindow(context.Context, *connect.Re
 
 func (UnimplementedTymuxServiceHandler) Attach(context.Context, *connect.BidiStream[v1.AttachRequest, v1.AttachEvent]) error {
 	return connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.Attach is not implemented"))
+}
+
+func (UnimplementedTymuxServiceHandler) WriteStdin(context.Context, *connect.ClientStream[v1.WriteStdinRequest]) (*connect.Response[v1.WriteStdinResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.WriteStdin is not implemented"))
 }

@@ -88,7 +88,7 @@ func TestDetectReturnsEmptySetWhenDaemonPredatesGetServerInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Detect against an old daemon must not fail: %v", err)
 	}
-	for _, c := range []string{capabilities.ArgsEnv, capabilities.StderrRedirect, capabilities.FileArgs, capabilities.StdinFile} {
+	for _, c := range []string{capabilities.ArgsEnv, capabilities.StderrRedirect, capabilities.FileArgs, capabilities.StdinFile, capabilities.StdinStream} {
 		if set.Has(c) {
 			t.Errorf("old daemon must not report %q", c)
 		}
@@ -99,12 +99,13 @@ func TestDetectReturnsEmptySetWhenDaemonPredatesGetServerInfo(t *testing.T) {
 func TestOldDaemonAcceptsButIgnoresNewCreateSessionFields(t *testing.T) {
 	client, old := startOldDaemon(t)
 	_, err := client.CreateSession(context.Background(), connect.NewRequest(&tymuxv1.CreateSessionRequest{
-		Name:       "x",
-		Command:    "/bin/true",
-		Args:       []string{"kept"},
-		StderrPath: "/tmp/err.log",
-		StdinPath:  "/tmp/stdin.txt",
-		ArgSpecs:   []*tymuxv1.ArgSpec{{Source: &tymuxv1.ArgSpec_FileContentsPath{FileContentsPath: "/tmp/prompt"}}},
+		Name:        "x",
+		Command:     "/bin/true",
+		Args:        []string{"kept"},
+		StderrPath:  "/tmp/err.log",
+		StdinPath:   "/tmp/stdin.txt",
+		StdinStream: true,
+		ArgSpecs:    []*tymuxv1.ArgSpec{{Source: &tymuxv1.ArgSpec_FileContentsPath{FileContentsPath: "/tmp/prompt"}}},
 	}))
 	if err != nil {
 		t.Fatalf("old daemon rejected the request: %v", err)
@@ -112,7 +113,19 @@ func TestOldDaemonAcceptsButIgnoresNewCreateSessionFields(t *testing.T) {
 	if got := old.seen.GetArgs(); len(got) != 1 || got[0] != "kept" {
 		t.Errorf("old daemon lost the field it knows: args=%v", got)
 	}
-	if old.seen.GetStderrPath() != "" || old.seen.GetStdinPath() != "" || len(old.seen.GetArgSpecs()) != 0 {
+	if old.seen.GetStderrPath() != "" || old.seen.GetStdinPath() != "" || old.seen.GetStdinStream() || len(old.seen.GetArgSpecs()) != 0 {
 		t.Errorf("old daemon unexpectedly saw the new fields: %v", old.seen)
+	}
+}
+
+// WriteStdin does not exist on an old daemon: UNIMPLEMENTED, which a client
+// that skipped the capability check would otherwise mistake for a pane error.
+func TestOldDaemonAnswersWriteStdinUnimplemented(t *testing.T) {
+	client, _ := startOldDaemon(t)
+	stream := client.WriteStdin(context.Background())
+	_ = stream.Send(&tymuxv1.WriteStdinRequest{Payload: &tymuxv1.WriteStdinRequest_PaneId{PaneId: "p"}})
+	_, err := stream.CloseAndReceive()
+	if connect.CodeOf(err) != connect.CodeUnimplemented {
+		t.Fatalf("got %v, want Unimplemented", err)
 	}
 }

@@ -908,7 +908,7 @@ func TestCreateSessionResolvesFileArgsAndRedirectsStderr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Detect: %v", err)
 	}
-	for _, c := range []string{capabilities.StderrRedirect, capabilities.FileArgs, capabilities.StdinFile} {
+	for _, c := range []string{capabilities.StderrRedirect, capabilities.FileArgs, capabilities.StdinFile, capabilities.StdinStream} {
 		if !caps.Has(c) {
 			t.Fatalf("daemon does not advertise %q", c)
 		}
@@ -1059,5 +1059,116 @@ func TestCreateSessionReportsMissingStdinFileAsNotFound(t *testing.T) {
 	}))
 	if connect.CodeOf(err) != connect.CodeNotFound {
 		t.Fatalf("got %v, want NotFound", err)
+	}
+}
+
+// streamStdin sends data in chunks, then optionally closes the pipe, over one
+// WriteStdin call.
+func streamStdin(client tymuxv1connect.TymuxServiceClient, paneID string, data []byte, chunk int, closePipe bool) (uint64, error) {
+	stream := client.WriteStdin(context.Background())
+	if err := stream.Send(&tymuxv1.WriteStdinRequest{Payload: &tymuxv1.WriteStdinRequest_PaneId{PaneId: paneID}}); err != nil {
+		return 0, err
+	}
+	for len(data) > 0 {
+		n := min(chunk, len(data))
+		if err := stream.Send(&tymuxv1.WriteStdinRequest{Payload: &tymuxv1.WriteStdinRequest_Data{Data: data[:n]}}); err != nil {
+			break // the real error is on CloseAndReceive
+		}
+		data = data[n:]
+	}
+	if closePipe {
+		_ = stream.Send(&tymuxv1.WriteStdinRequest{Payload: &tymuxv1.WriteStdinRequest_Close{Close: true}})
+	}
+	resp, err := stream.CloseAndReceive()
+	if err != nil {
+		return 0, err
+	}
+	return resp.Msg.GetBytesWritten(), nil
+}
+
+// TestWriteStdinStreamsIntoARunningProcessUntilClose is the "start the
+// process, then stream the input" shape: nothing is read until the client
+// sends it, and the process only sees EOF on close.
+func TestWriteStdinStreamsIntoARunningProcessUntilClose(t *testing.T) {
+	addr := startDaemon(t)
+	client := newClient(addr, "")
+	ctx := context.Background()
+
+	caps, err := capabilities.Detect(ctx, client)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if !caps.Has(capabilities.StdinStream) {
+		t.Fatalf("daemon does not advertise %q", capabilities.StdinStream)
+	}
+
+	out := filepath.Join(t.TempDir(), "out.bin")
+	payload := make([]byte, 3<<20)
+	for i := range payload {
+		payload[i] = byte(i * 7 / 3)
+	}
+	created, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{
+		Name:        "go-stdin-stream",
+		Command:     "/bin/sh",
+		Args:        []string{"-c", `i=no; [ -t 0 ] && i=yes; echo "stdin-tty=$i" > "$1.tty"; cat > "$1"`, "sh", out},
+		StdinStream: true,
+	}))
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	paneID := firstPaneID(t, created.Msg)
+
+	// Two calls: the first leaves the pipe open.
+	half := len(payload) / 2
+	if n, err := streamStdin(client, paneID, payload[:half], 64<<10, false); err != nil || n != uint64(half) {
+		t.Fatalf("first WriteStdin: n=%d err=%v", n, err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got, _ := os.ReadFile(out); len(got) == len(payload) {
+		t.Fatal("process finished before EOF was sent")
+	}
+	if n, err := streamStdin(client, paneID, payload[half:], 64<<10, true); err != nil || n != uint64(len(payload)-half) {
+		t.Fatalf("second WriteStdin: n=%d err=%v", n, err)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		got, _ := os.ReadFile(out)
+		if bytes.Equal(got, payload) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stdin differs: got %d bytes, want %d", len(got), len(payload))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if tty, _ := os.ReadFile(out + ".tty"); string(tty) != "stdin-tty=no\n" {
+		t.Fatalf("got %q, want stdin-tty=no", tty)
+	}
+
+	// Closed (and the process gone): further writes are refused.
+	if _, err := streamStdin(client, paneID, []byte("late"), 4, false); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("write after close: got %v, want FailedPrecondition", err)
+	}
+}
+
+func TestWriteStdinRejectsPanesWithoutStdinStreamAndConflictingCreate(t *testing.T) {
+	addr := startDaemon(t)
+	client := newClient(addr, "")
+	ctx := context.Background()
+
+	plain, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{Name: "plain", Command: "/bin/sh"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := streamStdin(client, firstPaneID(t, plain.Msg), []byte("x"), 1, false); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("got %v, want FailedPrecondition", err)
+	}
+
+	_, err = client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{
+		Name: "both", Command: "/bin/sh", StdinStream: true, StdinPath: "/etc/hostname",
+	}))
+	if connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("stdin_path+stdin_stream: got %v, want InvalidArgument", err)
 	}
 }

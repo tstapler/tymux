@@ -39,6 +39,10 @@ pub struct Launch {
     /// Absolute path of a regular file that becomes the child's stdin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin_path: Option<String>,
+    /// Stdin is a pipe the daemon keeps the write end of, fed via `WriteStdin`.
+    /// Exclusive with `stdin_path`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stdin_stream: bool,
 }
 
 /// A [`Launch`] with files read and opened, ready to hand to `exec`.
@@ -46,7 +50,11 @@ pub struct Launch {
 pub struct PreparedLaunch {
     pub args: Vec<String>,
     pub stderr: Option<File>,
+    /// The child's stdin: the `stdin_path` file, or a pipe's read end. Drop it
+    /// once the child is spawned so the pipe breaks when the child exits.
     pub stdin: Option<File>,
+    /// Write end of the `stdin_stream` pipe, kept by the pane.
+    pub stdin_writer: Option<File>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +102,8 @@ pub enum LaunchError {
     StdinNotRegular {
         path: String,
     },
+    StdinConflict,
+    StdinPipe(std::io::Error),
 }
 
 impl LaunchError {
@@ -103,15 +113,17 @@ impl LaunchError {
             | Self::ArgTooLarge { .. }
             | Self::ArgNotUtf8 { .. }
             | Self::ArgHasNul { .. }
-            | Self::StdinNotRegular { .. } => LaunchErrorKind::Invalid,
+            | Self::StdinNotRegular { .. }
+            | Self::StdinConflict => LaunchErrorKind::Invalid,
             Self::ArgFileRead { source, .. } | Self::StdinOpen { source, .. }
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 LaunchErrorKind::NotFound
             }
-            Self::ArgFileRead { .. } | Self::StderrOpen { .. } | Self::StdinOpen { .. } => {
-                LaunchErrorKind::Precondition
-            }
+            Self::ArgFileRead { .. }
+            | Self::StderrOpen { .. }
+            | Self::StdinOpen { .. }
+            | Self::StdinPipe(_) => LaunchErrorKind::Precondition,
         }
     }
 }
@@ -155,6 +167,8 @@ impl std::fmt::Display for LaunchError {
             Self::StdinNotRegular { path } => {
                 write!(f, "stdin_path {path:?} is not a regular file")
             }
+            Self::StdinConflict => write!(f, "stdin_path and stdin_stream are mutually exclusive"),
+            Self::StdinPipe(source) => write!(f, "cannot create the stdin pipe: {source}"),
         }
     }
 }
@@ -164,7 +178,8 @@ impl std::error::Error for LaunchError {
         match self {
             Self::ArgFileRead { source, .. }
             | Self::StderrOpen { source, .. }
-            | Self::StdinOpen { source, .. } => Some(source),
+            | Self::StdinOpen { source, .. }
+            | Self::StdinPipe(source) => Some(source),
             _ => None,
         }
     }
@@ -263,11 +278,28 @@ impl Launch {
             });
         }
         let stderr = self.stderr_path.as_deref().map(open_stderr).transpose()?;
-        let stdin = self.stdin_path.as_deref().map(open_stdin).transpose()?;
+        if self.stdin_stream && self.stdin_path.is_some() {
+            return Err(LaunchError::StdinConflict);
+        }
+        let mut stdin = self.stdin_path.as_deref().map(open_stdin).transpose()?;
+        let mut stdin_writer = None;
+        if self.stdin_stream {
+            #[cfg(unix)]
+            {
+                let (reader, writer) = std::io::pipe().map_err(LaunchError::StdinPipe)?;
+                stdin = Some(File::from(std::os::fd::OwnedFd::from(reader)));
+                stdin_writer = Some(File::from(std::os::fd::OwnedFd::from(writer)));
+            }
+            #[cfg(not(unix))]
+            return Err(LaunchError::StdinPipe(std::io::Error::from(
+                std::io::ErrorKind::Unsupported,
+            )));
+        }
         Ok(PreparedLaunch {
             args,
             stderr,
             stdin,
+            stdin_writer,
         })
     }
 }
@@ -435,11 +467,24 @@ mod tests {
     }
 
     #[test]
+    fn prepare_should_reject_stdin_path_with_stdin_stream() {
+        let launch = Launch {
+            stdin_path: Some("/etc/hostname".into()),
+            stdin_stream: true,
+            ..Launch::default()
+        };
+        let err = launch.prepare().unwrap_err();
+        assert!(matches!(err, LaunchError::StdinConflict), "{err}");
+        assert_eq!(err.kind(), LaunchErrorKind::Invalid);
+    }
+
+    #[test]
     fn launch_should_deserialize_records_written_before_the_new_fields() {
         let old = r#"{"args":["-c","true"],"env":{"K":"V"}}"#;
         let launch: Launch = serde_json::from_str(old).unwrap();
         assert!(launch.arg_specs.is_empty());
         assert_eq!(launch.stderr_path, None);
         assert_eq!(launch.stdin_path, None);
+        assert!(!launch.stdin_stream);
     }
 }
