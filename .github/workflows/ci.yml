@@ -229,7 +229,7 @@ jobs:
           restore-keys: bench-main-
       - name: compare with main (advisory)
         if: github.event_name == 'pull_request'
-        uses: tstapler/benchdiff@03845d60bd136fe36f365cf8f6ac4a6f9ae86257 # main
+        uses: tstapler/benchdiff@3921c948d6d9cbc538a62d3808d979c06cc13a94 # v0.1.0
         with:
           head: ${{ runner.temp }}/head.json
           base: ${{ hashFiles('bench-base/benchdiff.json') != '' && 'bench-base/benchdiff.json' || '' }}
