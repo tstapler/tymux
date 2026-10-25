@@ -1,7 +1,9 @@
 //! `tymux-bench render [--check]` regenerates (or verifies) the charts and
 //! README table from `docs/benchmarks/results.json`; `tymux-bench gate`
-//! fails when a fresh run regressed against it. Run from the repo root.
+//! fails when a fresh run regressed against it; `tymux-bench export` converts a
+//! run to benchdiff JSON for the CI comparison. Run from the repo root.
 
+mod export;
 mod gate;
 mod render;
 mod results;
@@ -39,6 +41,13 @@ enum Cmd {
     Gate {
         #[arg(long, default_value = "docs/benchmarks/results.json")]
         results: PathBuf,
+    },
+    /// Convert a run into benchdiff canonical JSON (stdout unless --out).
+    Export {
+        #[arg(long, default_value = "docs/benchmarks/results.json")]
+        results: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -106,6 +115,19 @@ fn main() -> Result<()> {
                 write_if_changed(&readme, &new_readme)?;
             }
             Ok(())
+        }
+        Cmd::Export { results, out } => {
+            let doc = export::to_benchdiff(&Results::load(&results)?);
+            let text = serde_json::to_string_pretty(&doc)? + "\n";
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))
+                }
+                None => {
+                    print!("{text}");
+                    Ok(())
+                }
+            }
         }
         Cmd::Gate { results } => {
             let rows = gate::evaluate(&Results::load(&results)?);
