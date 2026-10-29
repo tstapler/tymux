@@ -1,9 +1,11 @@
 //! Replays the stapler-squad fidelity corpus (`*.ansi`) through this crate at 24x80 and diffs the
 //! screen against golden grids captured from xterm.js (`golden/<area>/<case>.json`).
 //!
-//! Skipped unless `TYMUX_FIDELITY_DIR` points at the `testdata/fidelity` directory (it lives in the
-//! stapler-squad repo, not here). `TYMUX_FIDELITY_FILTER=<substring>` limits the cases and
-//! `TYMUX_FIDELITY_VERBOSE=1` prints each failing case's first differing cells.
+//! Runs the vendored subset in `tests/fixtures/fidelity/` by default. The full corpus (and the
+//! oracle that regenerates the goldens) lives in the stapler-squad repo under
+//! `session/tymux/testdata/fidelity`; point `TYMUX_FIDELITY_DIR` at it to run everything. The
+//! subset is a copy and may lag the full corpus. `TYMUX_FIDELITY_FILTER=<substring>` limits the
+//! cases and `TYMUX_FIDELITY_VERBOSE=1` prints each failing case's first differing cells.
 //!
 //! A golden may also carry a `state` object (title, modes, cursor, scroll region, tab stops,
 //! charsets; see the oracle's `collectState`), compared key by key when present.
@@ -266,10 +268,10 @@ const XTERM_JS_QUIRKS: &[&str] = &[
 
 #[test]
 fn screen_matches_xterm_js_golden_grids() {
-    let Some(dir) = std::env::var_os("TYMUX_FIDELITY_DIR").map(PathBuf::from) else {
-        eprintln!("TYMUX_FIDELITY_DIR unset; skipping the golden-grid comparison");
-        return;
-    };
+    let dir = std::env::var_os("TYMUX_FIDELITY_DIR").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fidelity"),
+        PathBuf::from,
+    );
     let filter = std::env::var("TYMUX_FIDELITY_FILTER").unwrap_or_default();
     let verbose = std::env::var_os("TYMUX_FIDELITY_VERBOSE").is_some();
     let mut failing = vec![];
@@ -327,6 +329,10 @@ fn screen_matches_xterm_js_golden_grids() {
             failing.push(format!("{name} ({} cells)", diffs.len()));
         }
     }
+    assert!(
+        total > 0,
+        "no corpus cases found under {dir:?} (filter {filter:?})"
+    );
     assert!(
         failing.is_empty(),
         "{}/{total} cases differ from xterm.js:\n  {}",

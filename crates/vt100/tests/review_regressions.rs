@@ -313,3 +313,56 @@ fn hyperlink_table_keeps_links_referenced_from_scrollback_and_the_alternate_scre
         Some(("https://scrollback/".into(), "sb".into()))
     );
 }
+
+// contents_formatted / contents_diff must reproduce faint (SGR 2) and bold independently:
+// SGR 22 clears both, so dropping either needs 22 plus re-setting the survivor.
+
+fn intensity_row(p: &Parser, cols: u16) -> Vec<(bool, bool)> {
+    (0..cols)
+        .map(|c| {
+            let cell = p.screen().cell(0, c).unwrap();
+            (cell.bold(), cell.dim())
+        })
+        .collect()
+}
+
+const INTENSITY_SAMPLE: &[u8] =
+    b"\x1b[2mf\x1b[0mp\x1b[1mb\x1b[2mB\x1b[22mn\x1b[1;2mc\x1b[22;2md\x1b[22;1me\x1b[0mz";
+
+#[test]
+fn contents_formatted_round_trips_bold_and_faint_transitions() {
+    let mut src = Parser::new(2, 20, 0);
+    src.process(INTENSITY_SAMPLE);
+    let mut copy = Parser::new(2, 20, 0);
+    copy.process(&src.screen().contents_formatted());
+    assert_eq!(intensity_row(&copy, 10), intensity_row(&src, 10));
+    // sanity: the sample really exercises the transitions
+    assert_eq!(
+        intensity_row(&src, 10),
+        [
+            (false, true),
+            (false, false),
+            (true, false),
+            (true, true),
+            (false, false),
+            (true, true),
+            (false, true),
+            (true, false),
+            (false, false),
+            (false, false)
+        ][..10]
+    );
+}
+
+#[test]
+fn contents_diff_round_trips_a_faint_cell_becoming_bold_and_back() {
+    let mut src = Parser::new(2, 20, 0);
+    src.process(b"\x1b[2mabc\x1b[0m");
+    let before = src.screen().clone();
+    let mut copy = Parser::new(2, 20, 0);
+    copy.process(&before.contents_formatted());
+
+    src.process(b"\x1b[1;1H\x1b[1ma\x1b[22;2m\x1b[1;3Hc\x1b[1;2H\x1b[0mb");
+    copy.process(&src.screen().contents_diff(&before));
+    assert_eq!(intensity_row(&copy, 3), intensity_row(&src, 3));
+}
