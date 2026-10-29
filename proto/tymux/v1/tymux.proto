@@ -349,6 +349,13 @@ message PaneSnapshot {
   uint32 cursor_row = 5;
   uint32 cursor_col = 6;
   Liveness liveness = 7;
+  // OSC 8 hyperlink targets; Cell.hyperlink is a 1-based index into this table (0 = none).
+  repeated Hyperlink hyperlinks = 8;
+}
+
+message Hyperlink {
+  string uri = 1;
+  string id = 2; // OSC 8 `id=` parameter; empty when the program gave none
 }
 
 message Row {
@@ -359,7 +366,14 @@ message Cell {
   string text = 1; // one grapheme cluster
   uint32 fg = 2;
   uint32 bg = 3;
-  uint32 attrs = 4; // bitflags: 1=bold, 2=underline, 4=reverse, 8=italic
+  // bitflags: 1=bold, 2=underline, 4=reverse, 8=italic, 16=faint, 32=strikethrough,
+  // 64=blink, 128=conceal, 256=overline. Bold and faint are independent (SGR 1/2, both cleared by 22).
+  uint32 attrs = 4;
+  // Meaningful only when the underline bit is set: 0=single, 1=double, 2=curly, 3=dotted, 4=dashed.
+  uint32 underline_style = 5;
+  // Underline color (SGR 58), packed like fg/bg; 0 = same as the text color.
+  uint32 underline_color = 6;
+  uint32 hyperlink = 7; // 1-based index into PaneSnapshot.hyperlinks; 0 = none
 }
 
 message AttachRequest {
