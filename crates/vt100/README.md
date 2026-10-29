@@ -33,18 +33,28 @@ to it to run everything, and note the subset is a copy that may lag it. `TYMUX_F
 
 ## Known deviations
 
-Where this fork and xterm differ on purpose or by omission (xterm column is its documented
-behavior):
+Where this fork and xterm differ, on purpose or by omission. "xterm.js" is the reference terminal
+the fork is tested against (`tests/fidelity_golden.rs`); xterm behavior is from its source
+(`charproc.c`, xterm 412) or ctlseqs unless marked unverified.
 
-| Area | This fork | xterm |
+| Area | This fork | xterm / xterm.js |
 |---|---|---|
-| REP count | clamped to one screenful (rows x cols) per call | repeats the character literally, Ps times |
-| RI, SD blank rows | default attributes (what xterm.js does) | background-color erase with the current background |
-| Tab stops | kept per screen (primary and alternate each have their own) | one table shared by both screens |
-| RI above the top margin | not verified against xterm; may scroll where xterm only moves up | moves the cursor up one row, no scroll |
+| REP count | clamped to one screenful (rows x cols) per call | xterm repeats literally, Ps times |
+| SD (`CSI T`) blank rows | default attributes, as xterm.js does | xterm.js: default attributes (RI and IL/DL/SU use the current background) |
+| Tab stops | kept per screen (primary and alternate each have their own) | xterm: one table shared by both screens (unverified) |
 | ICH on the second half of a wide character | the shifted blank keeps the continuation marker | not verified |
-| Unknown SCS final (`ESC ( K`) | designates ASCII, as xterm.js does | selects the matching NRCS set when it has one (not implemented here) |
+| CBT while a wrap is pending | steps back from the last column | xterm.js lands the next character on the next row (an xterm.js quirk, left alone) |
+| Unknown SCS final (`ESC ( K`) | designates ASCII, as xterm.js does | xterm: selects the matching NRCS set when it has one (not implemented here) |
 | Invalid UTF-8 | prints U+FFFD per ill-formed sequence | xterm prints U+FFFD; xterm.js drops the bytes |
 | C1 U+008D (RI) as UTF-8 | acts as RI | xterm acts as RI; xterm.js ignores it |
-| DECSC/DECRC | saves DECOM and charset designations | same; xterm.js saves neither |
-| GR shifts (LS1R/LS2R/LS3R), 96-char sets (`ESC - . /`) | ignored | honored (GR has no effect in UTF-8 mode) |
+| DECSC/DECRC | saves DECOM and charset designations | same in xterm; xterm.js saves neither |
+| DECSTR (`CSI ! p`) | resets cursor style, cursor visibility, margins, origin, IRM, DECCKM/DECKPAM, charsets, SGR and the saved cursor; leaves bracketed paste, focus reporting and mouse modes | the same set (xterm `ReallyReset`, soft branch); only RIS clears the rest |
+| OSC titles with 15 or more `;` | truncated: vte keeps 16 OSC parameters | xterm.js keeps the whole title |
+| GR shifts (LS1R/LS2R/LS3R), 96-char sets (`ESC - . /`) | ignored | honored by xterm (GR has no effect in UTF-8 mode) |
+| Unicode width table | `unicode-width` (newer than Unicode 11) | the web terminal loads xterm.js's Unicode 11 table; the corpus matches today, but emoji added after Unicode 11 would lay out differently |
+
+Matching xterm.js on purpose: a pending wrap is cleared by ICH/DCH/ECH/DECRC/CSI u/IND/VPA and
+every cursor move; alternate-screen switches (`?47`, `?1047`, `?1049`) carry the cursor across
+instead of homing it; RI blanks with the current background and never scrolls from above the top
+margin; a wide character that wraps blanks the last column with the current attributes; with DECAWM
+off the cursor parks at `cols` after a last-column write.
