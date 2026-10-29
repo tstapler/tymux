@@ -1,7 +1,15 @@
 use crate::term::BufWrite as _;
 
+/// How many discarded rows (or one cleared screen's worth) re-arm hyperlink compaction after a
+/// futile scan; see `Screen::osc8`.
+pub const MIN_REARM_ROWS: u64 = 16;
+
 #[derive(Clone, Debug)]
 pub struct Grid {
+    /// Running count of rows whose contents were thrown away (evicted from scrollback, scrolled
+    /// off with no scrollback) plus a screenful per clear/erase-all: the events that can drop the
+    /// last reference to a hyperlink. Monotonic.
+    freed_rows: u64,
     size: Size,
     pos: Pos,
     saved_pos: Pos,
@@ -27,6 +35,7 @@ fn default_tab_stops(cols: u16) -> Vec<bool> {
 impl Grid {
     pub fn new(size: Size, scrollback_len: usize) -> Self {
         Self {
+            freed_rows: 0,
             size,
             pos: Pos::default(),
             saved_pos: Pos::default(),
@@ -71,6 +80,7 @@ impl Grid {
     }
 
     pub fn clear(&mut self) {
+        self.freed_rows += u64::from(self.size.rows).max(MIN_REARM_ROWS);
         self.pos = Pos::default();
         self.saved_pos = Pos::default();
         for row in self.drawing_rows_mut() {
@@ -225,6 +235,10 @@ impl Grid {
     pub fn drawing_cell_mut(&mut self, pos: Pos) -> Option<&mut crate::Cell> {
         self.drawing_row_mut(pos.row)
             .and_then(|r| r.get_mut(pos.col))
+    }
+
+    pub fn freed_rows(&self) -> u64 {
+        self.freed_rows
     }
 
     pub fn scrollback_len(&self) -> usize {
@@ -458,6 +472,7 @@ impl Grid {
     }
 
     pub fn erase_all(&mut self, attrs: crate::attrs::Attrs) {
+        self.freed_rows += u64::from(self.size.rows).max(MIN_REARM_ROWS);
         for row in self.drawing_rows_mut() {
             row.clear(attrs);
         }
@@ -587,10 +602,13 @@ impl Grid {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
+                    self.freed_rows += 1;
                 }
                 if self.scrollback_offset > 0 {
                     self.scrollback_offset = self.scrollback.len().min(self.scrollback_offset + 1);
                 }
+            } else {
+                self.freed_rows += 1;
             }
         }
     }

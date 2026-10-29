@@ -175,6 +175,9 @@ pub struct Screen {
     compact_skip: u32,
     /// How many OSC 8s the next skip covers; doubles after each futile compaction.
     compact_delay: u32,
+    /// `freed_rows()` when the last futile scan ran: the backoff lapses once enough rows have been
+    /// discarded since, because the scan might now reclaim something.
+    compact_freed_mark: u64,
     title: String,
     /// DECSCUSR 0-6.
     cursor_style: u8,
@@ -203,6 +206,7 @@ impl Screen {
             hyperlinks: vec![],
             compact_skip: 0,
             compact_delay: 0,
+            compact_freed_mark: 0,
             title: String::new(),
             cursor_style: 0,
 
@@ -901,6 +905,10 @@ impl Screen {
                     // A futile scan (every entry is still on screen or in scrollback) costs a
                     // pass over every stored cell, so back off exponentially instead of repeating
                     // it for each new URI; a scan that reclaims something resets the backoff.
+                    if self.freed_rows() - self.compact_freed_mark >= crate::grid::MIN_REARM_ROWS {
+                        self.compact_skip = 0;
+                        self.compact_delay = 0;
+                    }
                     if self.compact_skip > 0 {
                         self.compact_skip -= 1;
                     } else if self.compact_hyperlinks() {
@@ -908,6 +916,7 @@ impl Screen {
                     } else {
                         self.compact_delay = (self.compact_delay * 2).clamp(1, MAX_COMPACT_SKIP);
                         self.compact_skip = self.compact_delay;
+                        self.compact_freed_mark = self.freed_rows();
                     }
                 }
                 // still full: every entry is on screen, so leave the text unlinked rather than
@@ -931,6 +940,10 @@ impl Screen {
             }
         };
         self.attrs.hyperlink = u32::try_from(index + 1).unwrap_or(0);
+    }
+
+    fn freed_rows(&self) -> u64 {
+        self.grid.freed_rows() + self.alternate_grid.freed_rows()
     }
 
     /// Drops table entries no cell (visible, alternate screen or scrollback) and no saved or
@@ -1150,11 +1163,12 @@ impl Screen {
         if !autowrap {
             // DECAWM off: the cursor sticks at the last column and later characters overwrite it
             if pos.col > size.cols - width {
+                // xterm.js pulls the cursor back onto the last column even when it then drops a
+                // wide character that doesn't fit, so no wrap is left pending
+                self.grid_mut().col_set(size.cols - 1);
                 if width > 1 {
-                    // a wide character that doesn't fit is dropped, as in xterm.js
                     return;
                 }
-                self.grid_mut().col_set(size.cols - width);
             }
         } else if pos.col > size.cols - width {
             let last_cell = self
@@ -1669,7 +1683,11 @@ impl Screen {
                 [1004] => self.set_mode(MODE_FOCUS_EVENTS),
                 [1049] => {
                     self.decsc();
-                    self.alternate_grid.clear();
+                    // already on the alternate screen: keep it (and its cursor) as xterm.js does,
+                    // instead of wiping and homing it
+                    if !self.mode(MODE_ALTERNATE_SCREEN) {
+                        self.alternate_grid.clear();
+                    }
                     self.enter_alternate_grid();
                 }
                 [2004] => self.set_mode(MODE_BRACKETED_PASTE),

@@ -152,3 +152,69 @@ fn titles_with_semicolons_are_kept_whole() {
     assert_eq!(parse(2, 20, b"\x1b]0;x;y\x1b\\").screen().title(), "x;y");
     assert_eq!(parse(2, 20, b"\x1b]2;x;\x7fy\x07").screen().title(), "x;y");
 }
+
+// Final-review regressions.
+
+// The futile-compaction backoff must lapse once something that can free link references happened
+// (scrollback eviction, a screen clear), or links are dropped after the table has room again.
+#[test]
+fn hyperlink_backoff_lapses_after_scrollback_is_evicted() {
+    let link = |n: usize| format!("\x1b]8;id=i{n};https://e.com/{n}\x1b\\x\x1b]8;;\x1b\\");
+    let mut p = Parser::new(24, 80, 6000);
+    for n in 0..4096 {
+        p.process(format!("{}\r\n", link(n)).as_bytes());
+    }
+    // every entry is live in scrollback: these are dropped and the backoff grows
+    for n in 10_000..11_100 {
+        p.process(format!("{}\r\n", link(n)).as_bytes());
+    }
+    // evict the whole scrollback, so every old link is now unreferenced
+    p.process("\r\n".repeat(6100).as_bytes());
+    let mut unlinked = 0;
+    for n in 20_000..21_200 {
+        p.process(b"\x1b[24;1H");
+        p.process(link(n).as_bytes());
+        if p.screen().cell(23, 0).unwrap().hyperlink() == 0 {
+            unlinked += 1;
+        }
+    }
+    assert_eq!(unlinked, 0, "links dropped although the table had room");
+}
+
+#[test]
+fn hyperlink_backoff_lapses_after_the_screen_is_cleared() {
+    let link = |n: usize| format!("\x1b]8;id=i{n};https://e.com/{n}\x1b\\x\x1b]8;;\x1b\\");
+    let mut p = Parser::new(24, 80, 6000);
+    for n in 0..4096 {
+        p.process(format!("{}\r\n", link(n)).as_bytes());
+    }
+    for n in 10_000..11_100 {
+        p.process(format!("{}\r\n", link(n)).as_bytes());
+    }
+    // the scrollback is unreachable history once the viewport and its history are erased
+    p.process(b"\x1b[3J\x1b[2J\x1b[H");
+    p.process(&"\r\n".repeat(6100).into_bytes());
+    p.process(b"\x1b[24;1H");
+    p.process(link(99_999).as_bytes());
+    assert_ne!(p.screen().cell(23, 0).unwrap().hyperlink(), 0);
+}
+
+// 2. ?1049h while the alternate screen is already active keeps the cursor.
+#[test]
+fn alt_screen_1049_while_already_alternate_keeps_the_cursor() {
+    let p = parse(3, 10, b"ab\x1b[?1047h\x1b[?1049h\x1b[?1047l");
+    assert_eq!(p.screen().cursor_position(), (0, 2));
+}
+
+// 3. With DECAWM off a wide character at the last column is dropped without parking the cursor
+// past the edge (xterm.js: col 15 of 16, no pending wrap).
+#[test]
+fn decawm_off_wide_char_at_the_last_column_leaves_no_pending_wrap() {
+    let p = parse(
+        2,
+        16,
+        &[&b"x".repeat(16)[..], "\x1b[?7l😀".as_bytes()].concat(),
+    );
+    assert_eq!(p.screen().cursor_position(), (0, 15));
+    assert!(!p.screen().cursor_pending_wrap());
+}
