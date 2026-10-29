@@ -165,7 +165,11 @@ pub struct Screen {
     charsets: Charsets,
     saved_charsets: Charsets,
     /// The previous graphic character, for REP; cleared by anything else.
-    last_cluster: Option<String>,
+    /// The repeatable character (REP) and any combining marks that joined it. Kept as a char plus
+    /// a reusable buffer so printing never allocates.
+    last_base: char,
+    last_marks: String,
+    last_cluster_live: bool,
     hyperlinks: Vec<(String, String)>,
     /// New-URI OSC 8s still to skip before compaction is tried again (see `osc8`).
     compact_skip: u32,
@@ -193,7 +197,9 @@ impl Screen {
 
             charsets: Charsets::default(),
             saved_charsets: Charsets::default(),
-            last_cluster: None,
+            last_base: ' ',
+            last_marks: String::new(),
+            last_cluster_live: false,
             hyperlinks: vec![],
             compact_skip: 0,
             compact_delay: 0,
@@ -852,7 +858,7 @@ impl Screen {
 
     // OSC 8 ; params ; URI. An empty URI ends the link.
     pub(crate) fn osc8(&mut self, params: &[u8], uri: &[u8]) {
-        self.last_cluster = None;
+        self.last_cluster_live = false;
         if uri.is_empty() {
             self.attrs.hyperlink = 0;
             return;
@@ -969,7 +975,7 @@ impl Screen {
 
     // SCS: ESC ( ) * + <final> designates G0..G3.
     pub(crate) fn scs(&mut self, slot: u8, final_byte: u8) {
-        self.last_cluster = None;
+        self.last_cluster_live = false;
         // xterm.js maps an unknown final (NRCS such as `K`, or garbage) to ASCII instead of
         // keeping the previous designation; match the browser.
         let set = Charset::from_final(final_byte).unwrap_or(Charset::Ascii);
@@ -986,36 +992,41 @@ impl Screen {
 
     // SI (0x0F) selects G0 into GL, SO (0x0E) selects G1.
     pub(crate) fn shift(&mut self, g: usize) {
-        self.last_cluster = None;
+        self.last_cluster_live = false;
         self.charsets.gl = g;
     }
 
     // ESC N / ESC O: the next character comes from G2 / G3.
     pub(crate) fn single_shift(&mut self, g: usize) {
-        self.last_cluster = None;
+        self.last_cluster_live = false;
         self.charsets.single_shift = Some(g);
     }
 
     // anything that isn't a printed character breaks REP's "preceding graphic character"
     pub(crate) fn break_rep(&mut self) {
-        self.last_cluster = None;
+        self.last_cluster_live = false;
     }
 
     // CSI Ps b
     pub(crate) fn rep(&mut self, count: u16) {
-        let Some(cluster) = self.last_cluster.clone() else {
+        if !self.last_cluster_live {
             return;
-        };
+        }
+        // draw() never touches the cluster, so the marks can be taken for the loop and put back
+        let base = self.last_base;
+        let marks = std::mem::take(&mut self.last_marks);
         // bound a hostile `CSI 65535 b` to one screenful of work per call
         let (rows, cols) = self.size();
         let max = usize::from(rows) * usize::from(cols);
         for _ in 0..usize::from(count).min(max) {
-            for c in cluster.chars() {
+            self.draw(base);
+            for c in marks.chars() {
                 self.draw(c);
             }
         }
         // xterm.js consumes the preceding character: a second REP in a row repeats nothing
-        self.last_cluster = None;
+        self.last_marks = marks;
+        self.last_cluster_live = false;
     }
 
     fn set_mode(&mut self, mode: u16) {
@@ -1060,15 +1071,19 @@ impl Screen {
             .unwrap_or(self.charsets.gl);
         let c = self.charsets.g[g].map(c);
         self.draw(c);
-        match c.width() {
+        match char_width(c) {
             None => {}
             // a combining mark joins the previous cluster, which REP repeats whole
             Some(0) => {
-                if let Some(cluster) = &mut self.last_cluster {
-                    cluster.push(c);
+                if self.last_cluster_live {
+                    self.last_marks.push(c);
                 }
             }
-            Some(_) => self.last_cluster = Some(c.to_string()),
+            Some(_) => {
+                self.last_base = c;
+                self.last_marks.clear();
+                self.last_cluster_live = true;
+            }
         }
     }
 
@@ -1089,7 +1104,7 @@ impl Screen {
         if c == '\u{feff}' {
             return;
         }
-        let width = if c == '\u{ad}' { Some(1) } else { c.width() };
+        let width = char_width(c);
         if width.is_none() && (u32::from(c)) < 256 {
             // don't even try to draw control characters
             return;
@@ -1099,6 +1114,19 @@ impl Screen {
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+
+        if width == 1 && pos.col < size.cols && !self.mode(MODE_INSERT) {
+            // Common case: a single-width character landing inside the row on a plain cell needs
+            // none of the wrap / wide-character repair below.
+            let grid = self.grid_mut();
+            if let Some(cell) = grid.drawing_cell_mut(pos) {
+                if !cell.is_wide() && !cell.is_wide_continuation() {
+                    cell.set(c, attrs);
+                    grid.col_inc(1);
+                    return;
+                }
+            }
+        }
 
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
@@ -1395,7 +1423,7 @@ impl Screen {
         self.saved_attrs = crate::attrs::Attrs::default();
         self.charsets = Charsets::default();
         self.saved_charsets = Charsets::default();
-        self.last_cluster = None;
+        self.last_cluster_live = false;
         self.cursor_style = 0;
         self.clear_mode(
             MODE_INSERT
@@ -1807,6 +1835,17 @@ impl Screen {
     // CSI r
     pub(crate) fn decstbm(&mut self, (top, bottom): (u16, u16)) {
         self.grid_mut().set_scroll_region(top - 1, bottom - 1);
+    }
+}
+
+/// Display width of `c` in cells (U+00AD takes one in xterm.js; unicode-width calls it zero).
+/// Printable ASCII is by far the commonest input, so it skips the table lookup.
+#[inline]
+fn char_width(c: char) -> Option<usize> {
+    match c {
+        ' '..='~' => Some(1),
+        '\u{ad}' => Some(1),
+        _ => c.width(),
     }
 }
 
