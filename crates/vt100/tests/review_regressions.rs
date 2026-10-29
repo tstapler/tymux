@@ -140,3 +140,89 @@ fn dch_and_ech_with_a_huge_count_are_clamped_to_the_row() {
     same_after("\x1b[65535P", "\x1b[500P");
     same_after("\x1b[65535X", "\x1b[500X");
 }
+
+// OSC strings are stored and later forwarded to other terminals, so their size is capped and
+// control bytes (C0, DEL, C1) never make it in. Bidi/scheme validation is the consumer's job.
+
+fn link_of(p: &Parser, row: u16, col: u16) -> Option<(String, String)> {
+    let idx = p.screen().cell(row, col)?.hyperlink();
+    if idx == 0 {
+        return None;
+    }
+    p.screen()
+        .hyperlink(idx)
+        .map(|(u, i)| (u.to_string(), i.to_string()))
+}
+
+#[test]
+fn title_is_capped_at_1kib_on_a_char_boundary() {
+    let mut p = Parser::new(5, 40, 0);
+    // 3-byte chars so 1024 is not a multiple of the char width
+    p.process(format!("\x1b]2;{}\x07", "€".repeat(2000)).as_bytes());
+    let t = p.screen().title();
+    assert!(t.len() <= 1024, "{}", t.len());
+    assert!(t.len() > 1000);
+    assert!(t.chars().all(|c| c == '€'));
+}
+
+#[test]
+fn title_drops_control_characters_including_del() {
+    // vte already discards C0 bytes inside an OSC, and the parser turns C1 code points into
+    // their controls before OSC parsing, so DEL is the control that reaches the title.
+    let mut p = Parser::new(5, 40, 0);
+    p.process("\x1b]2;a\u{7f}b\u{1}c\x07".as_bytes());
+    assert_eq!(p.screen().title(), "abc");
+}
+
+#[test]
+fn over_long_uri_is_rejected_not_stored() {
+    let mut p = Parser::new(5, 40, 0);
+    let uri = format!("https://e.com/{}", "a".repeat(9000));
+    p.process(format!("\x1b]8;;{uri}\x1b\\x\x1b]8;;\x1b\\").as_bytes());
+    assert_eq!(link_of(&p, 0, 0), None);
+    // the boundary itself is accepted
+    let ok = format!(
+        "https://e.com/{}",
+        "a".repeat(8192 - "https://e.com/".len())
+    );
+    p.process(format!("\x1b]8;;{ok}\x1b\\y\x1b]8;;\x1b\\").as_bytes());
+    assert_eq!(link_of(&p, 0, 1).map(|l| l.0.len()), Some(8192));
+}
+
+#[test]
+fn uri_and_id_with_control_bytes_are_rejected() {
+    let mut p = Parser::new(5, 40, 0);
+    p.process("\x1b]8;;https://e.com/\u{7f}x\x1b\\a\x1b]8;;\x1b\\".as_bytes());
+    assert_eq!(link_of(&p, 0, 0), None);
+    p.process("\x1b]8;id=a\u{7f}b;https://e.com/\x1b\\b\x1b]8;;\x1b\\".as_bytes());
+    assert_eq!(link_of(&p, 0, 1), None);
+}
+
+#[test]
+fn over_long_id_is_rejected() {
+    let mut p = Parser::new(5, 40, 0);
+    p.process(
+        format!(
+            "\x1b]8;id={};https://e.com/\x1b\\a\x1b]8;;\x1b\\",
+            "i".repeat(257)
+        )
+        .as_bytes(),
+    );
+    assert_eq!(link_of(&p, 0, 0), None);
+    p.process(
+        format!(
+            "\x1b]8;id={};https://e.com/\x1b\\b\x1b]8;;\x1b\\",
+            "i".repeat(256)
+        )
+        .as_bytes(),
+    );
+    assert_eq!(link_of(&p, 0, 1).map(|l| l.1.len()), Some(256));
+}
+
+#[test]
+fn a_rejected_link_closes_the_previous_one() {
+    let mut p = Parser::new(5, 40, 0);
+    p.process("\x1b]8;;https://ok/\x1b\\a\x1b]8;;https://e.com/\u{7f}\x1b\\b".as_bytes());
+    assert!(link_of(&p, 0, 0).is_some());
+    assert_eq!(link_of(&p, 0, 1), None);
+}

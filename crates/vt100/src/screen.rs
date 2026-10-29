@@ -2,6 +2,13 @@ use crate::term::BufWrite as _;
 use unicode_width::UnicodeWidthChar as _;
 
 const MAX_HYPERLINKS: usize = 4096;
+/// Caps on OSC strings we store (and a consumer may forward to another terminal). Over-long
+/// titles are truncated on a char boundary; over-long OSC 8 URIs and ids are rejected outright
+/// since a cut URI would link somewhere the program never named. The consumer still owns bidi
+/// and scheme validation.
+pub const MAX_TITLE_BYTES: usize = 1024;
+pub const MAX_URI_BYTES: usize = 8192;
+pub const MAX_LINK_ID_BYTES: usize = 256;
 
 const MODE_APPLICATION_KEYPAD: u16 = 0b0000_0001;
 const MODE_APPLICATION_CURSOR: u16 = 0b0000_0010;
@@ -830,12 +837,23 @@ impl Screen {
             return;
         }
         let (Ok(uri), Ok(params)) = (std::str::from_utf8(uri), std::str::from_utf8(params)) else {
+            self.attrs.hyperlink = 0;
             return;
         };
         let id = params
             .split(':')
             .find_map(|kv| kv.strip_prefix("id="))
             .unwrap_or("");
+        // Reject, and end any open link, rather than store something truncated or carrying
+        // control bytes (see MAX_URI_BYTES).
+        if uri.len() > MAX_URI_BYTES
+            || id.len() > MAX_LINK_ID_BYTES
+            || uri.chars().any(char::is_control)
+            || id.chars().any(char::is_control)
+        {
+            self.attrs.hyperlink = 0;
+            return;
+        }
         let existing = self
             .hyperlinks
             .iter()
@@ -1662,8 +1680,19 @@ impl Screen {
         }
     }
 
+    // Control characters (C0, DEL, C1) are dropped so a title can't smuggle escapes onward.
     pub(crate) fn set_title(&mut self, title: &[u8]) {
-        self.title = String::from_utf8_lossy(title).into_owned();
+        let mut out = String::new();
+        for c in String::from_utf8_lossy(title)
+            .chars()
+            .filter(|c| !c.is_control())
+        {
+            if out.len() + c.len_utf8() > MAX_TITLE_BYTES {
+                break;
+            }
+            out.push(c);
+        }
+        self.title = out;
     }
 
     // CSI r
