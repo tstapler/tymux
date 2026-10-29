@@ -1142,21 +1142,14 @@ impl Screen {
                 .unwrap()
                 .is_wide()
             {
-                let next_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
-                        row: pos.row,
-                        col: pos.col + 1,
-                    })
-                    // pos.row is valid because we assume self.grid().pos() to
-                    // always have a valid row value. pos.col is valid because
-                    // we called col_wrap() immediately before this, which
-                    // ensures that self.grid().pos().col has a valid value.
-                    // pos.col + 1 is valid because the cell at pos.col is a
-                    // wide character, so it must have the second half of the
-                    // wide character after it.
-                    .unwrap();
-                next_cell.set(' ', attrs);
+                // A wide character's second half normally follows it; a resize or insert can
+                // leave a lone first half in the last column, which has no second half to blank.
+                if let Some(next_cell) = self.grid_mut().drawing_cell_mut(crate::grid::Pos {
+                    row: pos.row,
+                    col: pos.col + 1,
+                }) {
+                    next_cell.set(' ', attrs);
+                }
             }
 
             let cell = self
@@ -1188,21 +1181,9 @@ impl Screen {
                         row: pos.row,
                         col: pos.col + 1,
                     };
-                    let next_next_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(next_next_pos)
-                        // pos.row is valid because we assume
-                        // self.grid().pos() to always have a valid row value.
-                        // pos.col is valid because we called col_wrap()
-                        // earlier, which ensures that self.grid().pos().col
-                        // has a valid value. this is true even though we just
-                        // called col_inc, because this branch only happens if
-                        // width > 1, and col_wrap takes width into account.
-                        // pos.col + 1 is valid because the cell at pos.col is
-                        // wide, and so it must have the second half of the
-                        // wide character after it.
-                        .unwrap();
-                    next_next_cell.clear(attrs);
+                    if let Some(next_next_cell) = self.grid_mut().drawing_cell_mut(next_next_pos) {
+                        next_next_cell.clear(attrs);
+                    }
                     if next_next_pos.col == size.cols - 1 {
                         self.grid_mut()
                             .drawing_row_mut(pos.row)

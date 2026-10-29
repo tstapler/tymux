@@ -75,7 +75,15 @@ impl Row {
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::Cell) {
-        self.cells.resize(usize::from(len), cell);
+        self.cells.resize(usize::from(len), cell.clone());
+        // Truncating can cut a wide character's second half off, which would leave a lone
+        // first half in the last column; `Screen::draw` relies on a first half always having
+        // its continuation cell after it.
+        if let Some(last) = self.cells.last_mut() {
+            if last.is_wide() {
+                *last = cell;
+            }
+        }
         self.wrapped = false;
     }
 
