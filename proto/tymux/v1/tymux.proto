@@ -351,6 +351,39 @@ message PaneSnapshot {
   Liveness liveness = 7;
   // OSC 8 hyperlink targets; Cell.hyperlink is a 1-based index into this table (0 = none).
   repeated Hyperlink hyperlinks = 8;
+  // Terminal state a redraw must restore so input keeps working after a (re)attach.
+  string title = 9;                // OSC 0/2 window title
+  TerminalModes modes = 10;
+  bool cursor_hidden = 11;         // DECTCEM (?25l)
+  uint32 cursor_style = 12;        // DECSCUSR 0-6
+  bool alt_screen = 13;            // grid is the alternate screen (?1049/?1047/?47)
+  uint32 scroll_top = 14;          // DECSTBM, 1-based; 0 with scroll_bottom 0 = whole screen
+  uint32 scroll_bottom = 15;
+  repeated uint32 tab_stops = 16;  // 0-based columns with a tab stop (HTS/TBC)
+  Charsets charsets = 17;
+}
+
+message TerminalModes {
+  bool app_cursor_keys = 1;  // DECCKM ?1
+  bool app_keypad = 2;       // DECKPAM / DECKPNM
+  bool bracketed_paste = 3;  // ?2004
+  bool focus_events = 4;     // ?1004
+  uint32 mouse_mode = 5;     // 0 off, 1 X10 (?9), 2 normal (?1000), 3 button (?1002), 4 any (?1003)
+  uint32 mouse_encoding = 6; // 0 default, 1 utf8 (?1005), 2 sgr (?1006), 3 urxvt (?1015)
+  bool reverse_video = 7;    // DECSCNM ?5
+  bool origin = 8;           // DECOM ?6
+  bool no_autowrap = 9;      // DECAWM ?7 reset
+  bool insert = 10;          // IRM 4
+  bool newline = 11;         // LNM 20
+}
+
+// SCS designations: 0 = ASCII (B), 1 = DEC special graphics (0), 2 = UK (A).
+message Charsets {
+  uint32 g0 = 1;
+  uint32 g1 = 2;
+  uint32 g2 = 3;
+  uint32 g3 = 4;
+  uint32 gl = 5; // active GL set, 0-3 (SO/SI/LS2/LS3)
 }
 
 message Hyperlink {
