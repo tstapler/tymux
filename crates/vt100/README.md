@@ -42,8 +42,8 @@ behavior):
 | RI, SD blank rows | default attributes (what xterm.js does) | background-color erase with the current background |
 | Tab stops | kept per screen (primary and alternate each have their own) | one table shared by both screens |
 | RI above the top margin | not verified against xterm; may scroll where xterm only moves up | moves the cursor up one row, no scroll |
-| ICH on the second half of a wide character | the shifted blank keeps the continuation marker | blanks the split pair |
-| Unknown SCS final (`ESC ( K`) | designates ASCII, as xterm.js does | selects the matching NRCS set when it has one |
+| ICH on the second half of a wide character | the shifted blank keeps the continuation marker | not verified |
+| Unknown SCS final (`ESC ( K`) | designates ASCII, as xterm.js does | selects the matching NRCS set when it has one (not implemented here) |
 | Invalid UTF-8 | prints U+FFFD per ill-formed sequence | xterm prints U+FFFD; xterm.js drops the bytes |
 | C1 U+008D (RI) as UTF-8 | acts as RI | xterm acts as RI; xterm.js ignores it |
 | DECSC/DECRC | saves DECOM and charset designations | same; xterm.js saves neither |
