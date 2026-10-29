@@ -1558,17 +1558,20 @@ type PaneSnapshot struct {
 	// OSC 8 hyperlink targets; Cell.hyperlink is a 1-based index into this table (0 = none).
 	Hyperlinks []*Hyperlink `protobuf:"bytes,8,rep,name=hyperlinks,proto3" json:"hyperlinks,omitempty"`
 	// Terminal state a redraw must restore so input keeps working after a (re)attach.
-	Title         string         `protobuf:"bytes,9,opt,name=title,proto3" json:"title,omitempty"` // OSC 0/2 window title
-	Modes         *TerminalModes `protobuf:"bytes,10,opt,name=modes,proto3" json:"modes,omitempty"`
-	CursorHidden  bool           `protobuf:"varint,11,opt,name=cursor_hidden,json=cursorHidden,proto3" json:"cursor_hidden,omitempty"` // DECTCEM (?25l)
-	CursorStyle   uint32         `protobuf:"varint,12,opt,name=cursor_style,json=cursorStyle,proto3" json:"cursor_style,omitempty"`    // DECSCUSR 0-6
-	AltScreen     bool           `protobuf:"varint,13,opt,name=alt_screen,json=altScreen,proto3" json:"alt_screen,omitempty"`          // grid is the alternate screen (?1049/?1047/?47)
-	ScrollTop     uint32         `protobuf:"varint,14,opt,name=scroll_top,json=scrollTop,proto3" json:"scroll_top,omitempty"`          // DECSTBM, 1-based; 0 with scroll_bottom 0 = whole screen
-	ScrollBottom  uint32         `protobuf:"varint,15,opt,name=scroll_bottom,json=scrollBottom,proto3" json:"scroll_bottom,omitempty"`
-	TabStops      []uint32       `protobuf:"varint,16,rep,packed,name=tab_stops,json=tabStops,proto3" json:"tab_stops,omitempty"` // 0-based columns with a tab stop (HTS/TBC)
-	Charsets      *Charsets      `protobuf:"bytes,17,opt,name=charsets,proto3" json:"charsets,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Title        string         `protobuf:"bytes,9,opt,name=title,proto3" json:"title,omitempty"` // OSC 0/2 window title
+	Modes        *TerminalModes `protobuf:"bytes,10,opt,name=modes,proto3" json:"modes,omitempty"`
+	CursorHidden bool           `protobuf:"varint,11,opt,name=cursor_hidden,json=cursorHidden,proto3" json:"cursor_hidden,omitempty"` // DECTCEM (?25l)
+	CursorStyle  uint32         `protobuf:"varint,12,opt,name=cursor_style,json=cursorStyle,proto3" json:"cursor_style,omitempty"`    // DECSCUSR 0-6
+	AltScreen    bool           `protobuf:"varint,13,opt,name=alt_screen,json=altScreen,proto3" json:"alt_screen,omitempty"`          // grid is the alternate screen (?1049/?1047/?47)
+	ScrollTop    uint32         `protobuf:"varint,14,opt,name=scroll_top,json=scrollTop,proto3" json:"scroll_top,omitempty"`          // DECSTBM, 1-based; 0 with scroll_bottom 0 = whole screen
+	ScrollBottom uint32         `protobuf:"varint,15,opt,name=scroll_bottom,json=scrollBottom,proto3" json:"scroll_bottom,omitempty"`
+	TabStops     []uint32       `protobuf:"varint,16,rep,packed,name=tab_stops,json=tabStops,proto3" json:"tab_stops,omitempty"` // 0-based columns with a tab stop (HTS/TBC)
+	Charsets     *Charsets      `protobuf:"bytes,17,opt,name=charsets,proto3" json:"charsets,omitempty"`
+	// The cursor sits past the last column (cursor_col is clamped to cols-1); the next printed
+	// character wraps to the next row, or overwrites the last column when DECAWM is off.
+	CursorPendingWrap bool `protobuf:"varint,18,opt,name=cursor_pending_wrap,json=cursorPendingWrap,proto3" json:"cursor_pending_wrap,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *PaneSnapshot) Reset() {
@@ -1718,6 +1721,13 @@ func (x *PaneSnapshot) GetCharsets() *Charsets {
 		return x.Charsets
 	}
 	return nil
+}
+
+func (x *PaneSnapshot) GetCursorPendingWrap() bool {
+	if x != nil {
+		return x.CursorPendingWrap
+	}
+	return false
 }
 
 type TerminalModes struct {
@@ -3032,7 +3042,7 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x18SearchScrollbackResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\rR\x06offset\x12\x12\n" +
-	"\x04line\x18\x03 \x01(\tR\x04line\"\xd2\x04\n" +
+	"\x04line\x18\x03 \x01(\tR\x04line\"\x82\x05\n" +
 	"\fPaneSnapshot\x12\x17\n" +
 	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12\x12\n" +
 	"\x04rows\x18\x02 \x01(\rR\x04rows\x12\x12\n" +
@@ -3057,7 +3067,8 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"scroll_top\x18\x0e \x01(\rR\tscrollTop\x12#\n" +
 	"\rscroll_bottom\x18\x0f \x01(\rR\fscrollBottom\x12\x1b\n" +
 	"\ttab_stops\x18\x10 \x03(\rR\btabStops\x12.\n" +
-	"\bcharsets\x18\x11 \x01(\v2\x12.tymux.v1.CharsetsR\bcharsets\"\xf8\x02\n" +
+	"\bcharsets\x18\x11 \x01(\v2\x12.tymux.v1.CharsetsR\bcharsets\x12.\n" +
+	"\x13cursor_pending_wrap\x18\x12 \x01(\bR\x11cursorPendingWrap\"\xf8\x02\n" +
 	"\rTerminalModes\x12&\n" +
 	"\x0fapp_cursor_keys\x18\x01 \x01(\bR\rappCursorKeys\x12\x1d\n" +
 	"\n" +

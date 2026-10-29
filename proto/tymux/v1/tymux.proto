@@ -361,6 +361,9 @@ message PaneSnapshot {
   uint32 scroll_bottom = 15;
   repeated uint32 tab_stops = 16;  // 0-based columns with a tab stop (HTS/TBC)
   Charsets charsets = 17;
+  // The cursor sits past the last column (cursor_col is clamped to cols-1); the next printed
+  // character wraps to the next row, or overwrites the last column when DECAWM is off.
+  bool cursor_pending_wrap = 18;
 }
 
 message TerminalModes {
