@@ -14,9 +14,37 @@ terminal) shows:
   pending-wrap cursor handling, and background-color erase for ED/EL/ECH/ICH/DCH/IL/DL/SU.
 - `contents_formatted`/`contents_diff` emit the new SGR attributes but not OSC 8 links.
 
-`tests/fork_features.rs` and `tests/vt_conformance.rs` cover the additions. `tests/fidelity_golden.rs`
-diffs the screen against xterm.js golden grids kept in the stapler-squad repo; it skips unless
-`TYMUX_FIDELITY_DIR` points at that repo's `session/tymux/testdata/fidelity`
-(`TYMUX_FIDELITY_FILTER=<substring>`, `TYMUX_FIDELITY_VERBOSE=1` to see differing cells).
-Known remaining differences: the Unicode width table (xterm.js defaults to Unicode 6), C1 controls
-sent as UTF-8, and xterm.js dropping SGR 4 inside an OSC 8 link.
+Limits (`screen.rs`): OSC titles are capped at 1 KiB (truncated on a char boundary), OSC 8 URIs
+at 8 KiB and ids at 256 bytes (over-long ones are rejected, which also ends any open link);
+control bytes (C0, DEL, C1) are dropped from titles and make a link invalid. Bidi and URI-scheme
+validation are the consumer's job. The hyperlink table holds 4096 entries; when full it reclaims
+entries no cell (visible, alternate screen, scrollback) or saved attribute set references. An
+OSC 8 that reaches vte's 16-parameter limit may have lost the tail of a URI containing `;`, so it
+is treated as invalid. Count-driven operations (ICH/DCH/ECH, SU/SD, IL/DL) clamp to the row or
+scroll-region size.
+
+Tests: `tests/fork_features.rs`, `tests/vt_conformance.rs`, `tests/terminal_state.rs` and
+`tests/review_regressions.rs`. `tests/fidelity_golden.rs` diffs the screen against xterm.js golden
+grids. By default it replays the vendored subset in `tests/fixtures/fidelity/` (the `.ansi` files
+keep their CRs via `.gitattributes`). The full corpus and the oracle that regenerates the goldens
+live in the stapler-squad repo under `session/tymux/testdata/fidelity`; set `TYMUX_FIDELITY_DIR`
+to it to run everything, and note the subset is a copy that may lag it. `TYMUX_FIDELITY_FILTER`,
+`TYMUX_FIDELITY_VERBOSE=1` and `TYMUX_FIDELITY_KNOWN_GAPS=1` narrow or widen the run.
+
+## Known deviations
+
+Where this fork and xterm differ on purpose or by omission (xterm column is its documented
+behavior):
+
+| Area | This fork | xterm |
+|---|---|---|
+| REP count | clamped to one screenful (rows x cols) per call | repeats the character literally, Ps times |
+| RI, SD blank rows | default attributes (what xterm.js does) | background-color erase with the current background |
+| Tab stops | kept per screen (primary and alternate each have their own) | one table shared by both screens |
+| RI above the top margin | not verified against xterm; may scroll where xterm only moves up | moves the cursor up one row, no scroll |
+| ICH on the second half of a wide character | the shifted blank keeps the continuation marker | blanks the split pair |
+| Unknown SCS final (`ESC ( K`) | designates ASCII, as xterm.js does | selects the matching NRCS set when it has one |
+| Invalid UTF-8 | prints U+FFFD per ill-formed sequence | xterm prints U+FFFD; xterm.js drops the bytes |
+| C1 U+008D (RI) as UTF-8 | acts as RI | xterm acts as RI; xterm.js ignores it |
+| DECSC/DECRC | saves DECOM and charset designations | same; xterm.js saves neither |
+| GR shifts (LS1R/LS2R/LS3R), 96-char sets (`ESC - . /`) | ignored | honored (GR has no effect in UTF-8 mode) |

@@ -366,3 +366,16 @@ fn contents_diff_round_trips_a_faint_cell_becoming_bold_and_back() {
     copy.process(&src.screen().contents_diff(&before));
     assert_eq!(intensity_row(&copy, 3), intensity_row(&src, 3));
 }
+
+#[test]
+fn scs_with_an_unknown_final_designates_ascii_like_xterm_js() {
+    // xterm.js: CHARSETS[final] || DEFAULT_CHARSET, so ESC ( K (German NRCS) / ESC ( 1 become
+    // ASCII rather than leaving the previous set in place.
+    let mut p = Parser::new(5, 40, 0);
+    p.process(b"\x1b(0\x1b(K");
+    assert_eq!(p.screen().charsets().0[0], 0);
+    p.process(b"\x1b)0\x1b)1");
+    assert_eq!(p.screen().charsets().0[1], 0);
+    p.process(b"\x1b(0q");
+    assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "\u{2500}");
+}

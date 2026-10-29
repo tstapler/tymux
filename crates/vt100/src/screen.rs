@@ -934,9 +934,9 @@ impl Screen {
     // SCS: ESC ( ) * + <final> designates G0..G3.
     pub(crate) fn scs(&mut self, slot: u8, final_byte: u8) {
         self.last_cluster = None;
-        let Some(set) = Charset::from_final(final_byte) else {
-            return;
-        };
+        // xterm.js maps an unknown final (NRCS such as `K`, or garbage) to ASCII instead of
+        // keeping the previous designation; match the browser.
+        let set = Charset::from_final(final_byte).unwrap_or(Charset::Ascii);
         if let Some(g) = match slot {
             b'(' => Some(0),
             b')' => Some(1),
