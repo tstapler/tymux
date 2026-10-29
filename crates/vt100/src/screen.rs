@@ -2,6 +2,8 @@ use crate::term::BufWrite as _;
 use unicode_width::UnicodeWidthChar as _;
 
 const MAX_HYPERLINKS: usize = 4096;
+/// Upper bound on the futile-compaction backoff, in new-URI OSC 8 sequences.
+const MAX_COMPACT_SKIP: u32 = 1024;
 /// Caps on OSC strings we store (and a consumer may forward to another terminal). Over-long
 /// titles are truncated on a char boundary; over-long OSC 8 URIs and ids are rejected outright
 /// since a cut URI would link somewhere the program never named. The consumer still owns bidi
@@ -165,6 +167,10 @@ pub struct Screen {
     /// The previous graphic character, for REP; cleared by anything else.
     last_cluster: Option<String>,
     hyperlinks: Vec<(String, String)>,
+    /// New-URI OSC 8s still to skip before compaction is tried again (see `osc8`).
+    compact_skip: u32,
+    /// How many OSC 8s the next skip covers; doubles after each futile compaction.
+    compact_delay: u32,
     title: String,
     /// DECSCUSR 0-6.
     cursor_style: u8,
@@ -189,6 +195,8 @@ impl Screen {
             saved_charsets: Charsets::default(),
             last_cluster: None,
             hyperlinks: vec![],
+            compact_skip: 0,
+            compact_delay: 0,
             title: String::new(),
             cursor_style: 0,
 
@@ -875,7 +883,17 @@ impl Screen {
             Some(i) => i,
             None => {
                 if self.hyperlinks.len() >= MAX_HYPERLINKS {
-                    self.compact_hyperlinks();
+                    // A futile scan (every entry is still on screen or in scrollback) costs a
+                    // pass over every stored cell, so back off exponentially instead of repeating
+                    // it for each new URI; a scan that reclaims something resets the backoff.
+                    if self.compact_skip > 0 {
+                        self.compact_skip -= 1;
+                    } else if self.compact_hyperlinks() {
+                        self.compact_delay = 0;
+                    } else {
+                        self.compact_delay = (self.compact_delay * 2).clamp(1, MAX_COMPACT_SKIP);
+                        self.compact_skip = self.compact_delay;
+                    }
                 }
                 // still full: every entry is on screen, so leave the text unlinked rather than
                 // evict a live link
@@ -902,7 +920,7 @@ impl Screen {
 
     /// Drops table entries no cell (visible, alternate screen or scrollback) and no saved or
     /// current attribute set references, and renumbers the cells that remain.
-    fn compact_hyperlinks(&mut self) {
+    fn compact_hyperlinks(&mut self) -> bool {
         let mut live = vec![false; self.hyperlinks.len() + 1];
         let mut mark = |index: u32| {
             if let Some(slot) = live.get_mut(index as usize) {
@@ -912,15 +930,19 @@ impl Screen {
         mark(self.attrs.hyperlink);
         mark(self.saved_attrs.hyperlink);
         for grid in [&mut self.grid, &mut self.alternate_grid] {
-            grid.cells_mut().for_each(|c| mark(c.hyperlink()));
+            grid.cells_mut().for_each(|c| {
+                #[cfg(test)]
+                crate::row::work::CELLS_SCANNED.with(|n| n.set(n.get() + 1));
+                mark(c.hyperlink());
+            });
         }
         live[0] = false;
         if live.iter().all(|l| !l) {
             self.hyperlinks.clear();
-            return;
+            return true;
         }
         if live.iter().skip(1).all(|l| *l) {
-            return; // nothing to reclaim
+            return false; // nothing to reclaim
         }
 
         let mut remap = vec![0u32; live.len()];
@@ -942,6 +964,7 @@ impl Screen {
                 }
             }
         }
+        true
     }
 
     // SCS: ESC ( ) * + <final> designates G0..G3.
@@ -1821,5 +1844,52 @@ fn extended_color(head: &[u16], ps: &[&[u16]], i: &mut usize) -> Option<crate::C
             Some(crate::Color::Rgb(r, g, b))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod hyperlink_compaction_cost {
+    use crate::row::work;
+
+    fn link(n: usize) -> String {
+        format!("\x1b]8;id=i{n};https://e.com/{n}\x1b\\x\x1b]8;;\x1b\\")
+    }
+
+    // When every one of the 4096 entries is still referenced (here: from scrollback), a stream of
+    // further new URIs must not rescan every stored cell for each one. Counting scanned cells
+    // keeps this deterministic.
+    #[test]
+    fn futile_compaction_backs_off_instead_of_rescanning_per_uri() {
+        let mut p = crate::Parser::new(24, 80, 5000);
+        for n in 0..4096 {
+            p.process(format!("{}\r\n", link(n)).as_bytes());
+        }
+        work::reset();
+        for n in 10_000..13_000 {
+            p.process(link(n).as_bytes());
+        }
+        let stored_cells = (24 + 5000) * 80;
+        let scanned = work::cells_scanned();
+        // 3000 uncached rescans would be ~1.2 billion; exponential backoff needs a handful
+        assert!(scanned <= 20 * stored_cells, "scanned {scanned} cells");
+        assert!(
+            scanned >= stored_cells,
+            "compaction should still try at least once"
+        );
+    }
+
+    #[test]
+    fn a_scan_that_reclaims_entries_resets_the_backoff() {
+        let mut p = crate::Parser::new(24, 80, 0);
+        for n in 0..5000 {
+            p.process(b"\x1b[3;1H");
+            p.process(link(n).as_bytes());
+        }
+        // reclaimed, so the table has room and new links work immediately
+        p.process(b"\x1b[5;1H");
+        p.process(link(99_999).as_bytes());
+        let idx = p.screen().cell(4, 0).unwrap().hyperlink();
+        assert_ne!(idx, 0);
+        assert_eq!(p.screen().hyperlink(idx).map(|l| l.1), Some("i99999"));
     }
 }

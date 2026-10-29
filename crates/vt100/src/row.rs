@@ -14,10 +14,15 @@ pub(crate) mod work {
     thread_local! {
         pub static ROWS_ALLOCATED: Cell<usize> = const { Cell::new(0) };
         pub static CELLS_INSERTED: Cell<usize> = const { Cell::new(0) };
+        pub static CELLS_SCANNED: Cell<usize> = const { Cell::new(0) };
     }
     pub fn reset() {
         ROWS_ALLOCATED.with(|c| c.set(0));
         CELLS_INSERTED.with(|c| c.set(0));
+        CELLS_SCANNED.with(|c| c.set(0));
+    }
+    pub fn cells_scanned() -> usize {
+        CELLS_SCANNED.with(Cell::get)
     }
     pub fn rows_allocated() -> usize {
         ROWS_ALLOCATED.with(Cell::get)
