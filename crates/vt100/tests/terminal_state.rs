@@ -219,3 +219,19 @@ fn invalid_utf8_prints_replacement_characters() {
     let p = parse("[\u{fffd}]".as_bytes());
     assert_eq!(p.screen().cell(0, 1).unwrap().contents(), "\u{fffd}");
 }
+
+#[test]
+fn cursor_pending_wrap_is_set_only_past_the_last_column() {
+    // xterm.js reports x == cols while a wrap is pending; the flag exposes that state
+    let p = parse(&[b"\x1b[1;40H".as_slice(), b"x"].concat());
+    assert!(p.screen().cursor_pending_wrap());
+    assert_eq!(p.screen().cursor_position().1, 40);
+    let p = parse(b"\x1b[1;40H");
+    assert!(!p.screen().cursor_pending_wrap());
+    // any cursor movement clears it
+    let p = parse(b"\x1b[1;40Hx\x1b[D");
+    assert!(!p.screen().cursor_pending_wrap());
+    // DECAWM off parks the cursor the same way
+    let p = parse(b"\x1b[?7l\x1b[1;40Hx");
+    assert!(p.screen().cursor_pending_wrap());
+}

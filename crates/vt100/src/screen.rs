@@ -570,6 +570,15 @@ impl Screen {
         (pos.row, pos.col)
     }
 
+    /// Whether the cursor is parked past the last column: the next printed character wraps (or,
+    /// with DECAWM off, overwrites the last column). [`cursor_position`](Self::cursor_position)
+    /// then reports a column equal to the width.
+    #[must_use]
+    pub fn cursor_pending_wrap(&self) -> bool {
+        let grid = self.grid();
+        grid.pos().col >= grid.size().cols
+    }
+
     /// Returns terminal escape sequences sufficient to set the current
     /// cursor state of the terminal.
     ///

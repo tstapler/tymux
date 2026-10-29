@@ -189,7 +189,9 @@ pub struct PaneSnapshot {
     pub cols: u32,
     pub grid: Vec<Vec<CellSnapshot>>,
     pub cursor_row: u32,
+    /// Clamped to `cols - 1`; `cursor_pending_wrap` carries the parked-past-the-edge state.
     pub cursor_col: u32,
+    pub cursor_pending_wrap: bool,
     /// OSC 8 targets as `(uri, id)`; `CellSnapshot::hyperlink` is a 1-based index into this.
     pub hyperlinks: Vec<(String, String)>,
     pub title: String,
@@ -713,6 +715,8 @@ impl Pane {
         }
 
         let (cursor_row, cursor_col) = screen.cursor_position();
+        let cursor_pending_wrap = screen.cursor_pending_wrap();
+        let cursor_col = cursor_col.min(cols.saturating_sub(1));
         let title = screen.title().to_string();
         let modes = terminal_modes(screen);
         let cursor_hidden = screen.hide_cursor();
@@ -742,6 +746,7 @@ impl Pane {
                 grid,
                 cursor_row: cursor_row as u32,
                 cursor_col: cursor_col as u32,
+                cursor_pending_wrap,
                 hyperlinks,
                 title,
                 modes,
@@ -922,6 +927,25 @@ mod tests {
         assert!(snap.tab_stops.contains(&3));
         assert_eq!(snap.charsets.g[1], 1);
         assert!(!snap.alt_screen);
+    }
+
+    #[test]
+    fn snapshot_should_clamp_cursor_col_and_flag_a_pending_wrap() {
+        let pane = Pane::spawn("/bin/sh", 10, 40).unwrap();
+        let forty = "x".repeat(40);
+        pane.write_input(format!("printf '%s' {forty}; exec sleep 60\n").as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = loop {
+            let snap = pane.snapshot();
+            if snap.cursor_pending_wrap {
+                break snap;
+            }
+            assert!(Instant::now() < deadline, "the row never filled");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(snap.cursor_col, 39, "cursor_col must stay inside the grid");
+        assert!(snap.cursor_col < snap.cols);
     }
 
     #[test]

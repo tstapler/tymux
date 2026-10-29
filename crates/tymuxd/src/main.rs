@@ -315,6 +315,7 @@ fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot, live: bool) 
         cols: snap.cols,
         cursor_row: snap.cursor_row,
         cursor_col: snap.cursor_col,
+        cursor_pending_wrap: snap.cursor_pending_wrap,
         grid: snap
             .grid
             .into_iter()
