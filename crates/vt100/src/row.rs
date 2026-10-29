@@ -6,8 +6,31 @@ pub struct Row {
     wrapped: bool,
 }
 
+/// Per-thread tallies the bounded-work tests read: how many rows were allocated and how many
+/// cells were inserted into rows. Compiled out of normal builds.
+#[cfg(test)]
+pub(crate) mod work {
+    use std::cell::Cell;
+    thread_local! {
+        pub static ROWS_ALLOCATED: Cell<usize> = const { Cell::new(0) };
+        pub static CELLS_INSERTED: Cell<usize> = const { Cell::new(0) };
+    }
+    pub fn reset() {
+        ROWS_ALLOCATED.with(|c| c.set(0));
+        CELLS_INSERTED.with(|c| c.set(0));
+    }
+    pub fn rows_allocated() -> usize {
+        ROWS_ALLOCATED.with(Cell::get)
+    }
+    pub fn cells_inserted() -> usize {
+        CELLS_INSERTED.with(Cell::get)
+    }
+}
+
 impl Row {
     pub fn new(cols: u16) -> Self {
+        #[cfg(test)]
+        work::ROWS_ALLOCATED.with(|c| c.set(c.get() + 1));
         Self {
             cells: vec![crate::Cell::new(); usize::from(cols)],
             wrapped: false,
@@ -46,6 +69,8 @@ impl Row {
     }
 
     pub fn insert(&mut self, i: u16, cell: crate::Cell) {
+        #[cfg(test)]
+        work::CELLS_INSERTED.with(|c| c.set(c.get() + 1));
         self.cells.insert(usize::from(i), cell);
         self.wrapped = false;
     }

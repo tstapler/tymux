@@ -500,7 +500,9 @@ impl Grid {
                 .is_wide_continuation();
         let blank = self.blank_cell();
         let row = self.current_row_mut();
-        for _ in 0..count {
+        // Inserting more blanks than the row has columns left changes nothing past that point,
+        // so an unclamped ESC[65535@ would only burn O(count * cols).
+        for _ in 0..count.min(size.cols.saturating_sub(pos.col)) {
             if wide {
                 row.get_mut(pos.col).unwrap().set_wide_continuation(false);
             }
@@ -560,7 +562,8 @@ impl Grid {
     }
 
     pub fn scroll_up(&mut self, count: u16) {
-        for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
+        // scrolling by the region's height already blanks it; more is wasted work
+        for _ in 0..count.min(self.scroll_bottom - self.scroll_top + 1) {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
@@ -577,7 +580,7 @@ impl Grid {
     }
 
     pub fn scroll_down(&mut self, count: u16) {
-        for _ in 0..count {
+        for _ in 0..count.min(self.scroll_bottom - self.scroll_top + 1) {
             self.rows.remove(usize::from(self.scroll_bottom));
             // xterm.js blanks SD / RI rows with default attributes (no background-color erase),
             // unlike scroll up and insert/delete - match the browser's renderer
@@ -839,4 +842,58 @@ pub struct Size {
 pub struct Pos {
     pub row: u16,
     pub col: u16,
+}
+
+#[cfg(test)]
+mod bounded_work {
+    use super::*;
+    use crate::row::work;
+
+    fn grid(rows: u16, cols: u16) -> Grid {
+        let mut g = Grid::new(Size { rows, cols }, 0);
+        g.allocate_rows();
+        g
+    }
+
+    // A huge CSI count must cost no more than the natural bound: these count allocations and
+    // insertions instead of timing, so they are deterministic.
+
+    #[test]
+    fn insert_cells_inserts_at_most_the_remaining_columns() {
+        let mut g = grid(24, 80);
+        g.set_pos(Pos { row: 0, col: 70 });
+        work::reset();
+        g.insert_cells(u16::MAX);
+        assert_eq!(work::cells_inserted(), 10);
+    }
+
+    #[test]
+    fn scroll_up_and_down_allocate_at_most_the_region_height() {
+        let mut g = grid(24, 80);
+        work::reset();
+        g.scroll_up(u16::MAX);
+        assert_eq!(work::rows_allocated(), 24);
+        work::reset();
+        g.scroll_down(u16::MAX);
+        assert_eq!(work::rows_allocated(), 24);
+        g.set_scroll_region(4, 9);
+        work::reset();
+        g.scroll_down(u16::MAX);
+        assert_eq!(work::rows_allocated(), 6);
+        work::reset();
+        g.scroll_up(u16::MAX);
+        assert_eq!(work::rows_allocated(), 6);
+    }
+
+    #[test]
+    fn insert_and_delete_lines_allocate_at_most_the_rows_left_in_the_region() {
+        let mut g = grid(24, 80);
+        g.set_pos(Pos { row: 20, col: 0 });
+        work::reset();
+        g.insert_lines(u16::MAX);
+        assert_eq!(work::rows_allocated(), 4);
+        work::reset();
+        g.delete_lines(u16::MAX);
+        assert_eq!(work::rows_allocated(), 4);
+    }
 }

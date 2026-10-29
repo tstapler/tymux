@@ -47,3 +47,96 @@ fn delete_cells_splitting_a_wide_char_does_not_panic() {
     p.process(b"\x1b[1;3H\x1b[1P");
     p.process(b"\x1b[1;2Hx\x1b[1;1H\x1b[1P\x1b[1;1Hy");
 }
+
+// Count-driven operations must clamp to their natural bound (columns, or the scroll region's
+// height), so a huge count is the same as the bound and costs no more than it. The tests compare
+// the full screen state, so any divergence between the clamped and unclamped path fails.
+
+fn filled(rows: u16, cols: u16) -> Parser {
+    let mut p = Parser::new(rows, cols, 50);
+    for r in 0..rows {
+        p.process(format!("\x1b[{};1H", r + 1).as_bytes());
+        p.process(
+            "0123456789abcdefghijklmnopqrstuvwxyz"
+                .chars()
+                .cycle()
+                .skip(usize::from(r))
+                .take(usize::from(cols))
+                .collect::<String>()
+                .as_bytes(),
+        );
+    }
+    p.process(b"\x1b[3;5H");
+    p
+}
+
+fn same_after(huge: &str, bound: &str) {
+    for (rows, cols) in [(10, 20), (24, 80), (3, 7)] {
+        let (mut a, mut b) = (filled(rows, cols), filled(rows, cols));
+        a.process(huge.as_bytes());
+        b.process(bound.as_bytes());
+        assert_eq!(
+            a.screen().contents_formatted(),
+            b.screen().contents_formatted(),
+            "{huge:?} should equal {bound:?} at {rows}x{cols}"
+        );
+        assert_eq!(a.screen().cursor_position(), b.screen().cursor_position());
+        // scrollback pushed by SU must match too
+        let (mut a, mut b) = (a, b);
+        a.screen_mut().set_scrollback(usize::MAX);
+        b.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(a.screen().scrollback(), b.screen().scrollback());
+    }
+}
+
+#[test]
+fn ich_with_a_huge_count_equals_ich_by_the_remaining_columns() {
+    same_after("\x1b[65535@", "\x1b[200@");
+    // 20 columns, cursor at col 4: 16 remaining
+    let (mut a, mut b) = (filled(10, 20), filled(10, 20));
+    a.process(b"\x1b[65535@");
+    b.process(b"\x1b[16@");
+    assert_eq!(
+        a.screen().contents_formatted(),
+        b.screen().contents_formatted()
+    );
+}
+
+#[test]
+fn su_and_sd_with_a_huge_count_equal_the_region_height() {
+    same_after("\x1b[65535S", "\x1b[500S");
+    same_after("\x1b[65535T", "\x1b[500T");
+    let (mut a, mut b) = (filled(10, 20), filled(10, 20));
+    a.process(b"\x1b[65535S");
+    b.process(b"\x1b[10S");
+    assert_eq!(
+        a.screen().contents_formatted(),
+        b.screen().contents_formatted()
+    );
+    let (mut a, mut b) = (filled(10, 20), filled(10, 20));
+    a.process(b"\x1b[3;7r\x1b[65535T");
+    b.process(b"\x1b[3;7r\x1b[5T");
+    assert_eq!(
+        a.screen().contents_formatted(),
+        b.screen().contents_formatted()
+    );
+}
+
+#[test]
+fn il_and_dl_with_a_huge_count_equal_the_rows_left_in_the_region() {
+    same_after("\x1b[65535L", "\x1b[500L");
+    same_after("\x1b[65535M", "\x1b[500M");
+    let (mut a, mut b) = (filled(10, 20), filled(10, 20));
+    a.process(b"\x1b[65535L");
+    b.process(b"\x1b[8L"); // cursor on row 3 of 10
+    assert_eq!(
+        a.screen().contents_formatted(),
+        b.screen().contents_formatted()
+    );
+}
+
+#[test]
+fn dch_and_ech_with_a_huge_count_are_clamped_to_the_row() {
+    same_after("\x1b[65535P", "\x1b[500P");
+    same_after("\x1b[65535X", "\x1b[500X");
+}
