@@ -157,10 +157,8 @@ fn cases(dir: &Path) -> Vec<PathBuf> {
 
 /// Cases where xterm.js itself deviates from the spec, so a spec-following emulator can't match.
 const XTERM_JS_QUIRKS: &[&str] = &[
-    // xterm.js reports no underline for SGR 4 inside an OSC 8 link, and its emoji widths differ.
+    // xterm.js reports no underline for SGR 4 inside an OSC 8 link.
     "osc/hyperlinks_with_styles",
-    // Unicode 6 width table in xterm.js vs the newer table here (1 cell).
-    "unicode/combining_and_zero_width",
 ];
 
 #[test]
