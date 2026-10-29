@@ -5,6 +5,9 @@
 //! stapler-squad repo, not here). `TYMUX_FIDELITY_FILTER=<substring>` limits the cases and
 //! `TYMUX_FIDELITY_VERBOSE=1` prints each failing case's first differing cells.
 //!
+//! A golden may also carry a `state` object (title, modes, cursor, scroll region, tab stops,
+//! charsets; see the oracle's `collectState`), compared key by key when present.
+//!
 //! Golden cell: `[row, col, text, fg, bg, flags, ulStyle, ulColor, link]`, sparse - an omitted cell is
 //! a blank `[" ", "default", "default", "", "", "default", ""]`.
 use std::collections::BTreeMap;
@@ -138,6 +141,106 @@ fn golden_cells(path: &Path) -> BTreeMap<(u16, u16), Cell> {
     out
 }
 
+/// The terminal state a snapshot carries, in the oracle's `state` shape (proto numbering).
+fn screen_state(p: &Parser) -> serde_json::Value {
+    use serde_json::json;
+    let s = p.screen();
+    let mouse_mode = match s.mouse_protocol_mode() {
+        vt100::MouseProtocolMode::None => 0,
+        vt100::MouseProtocolMode::Press => 1,
+        vt100::MouseProtocolMode::PressRelease => 2,
+        vt100::MouseProtocolMode::ButtonMotion => 3,
+        vt100::MouseProtocolMode::AnyMotion => 4,
+    };
+    let mouse_encoding = match s.mouse_protocol_encoding() {
+        vt100::MouseProtocolEncoding::Default => 0,
+        vt100::MouseProtocolEncoding::Utf8 => 1,
+        vt100::MouseProtocolEncoding::Sgr => 2,
+        vt100::MouseProtocolEncoding::Urxvt => 3,
+    };
+    let (top, bottom) = s.scroll_region();
+    let (g, gl) = s.charsets();
+    let (row, col) = s.cursor_position();
+    json!({
+        "title": s.title(),
+        "modes": {
+            "appCursorKeys": s.application_cursor(),
+            "appKeypad": s.application_keypad(),
+            "bracketedPaste": s.bracketed_paste(),
+            "focusEvents": s.focus_events(),
+            "mouseMode": mouse_mode,
+            "mouseEncoding": mouse_encoding,
+            "reverseVideo": s.reverse_video(),
+            "origin": s.origin_mode(),
+            "noAutowrap": !s.autowrap(),
+            "insert": s.insert_mode(),
+            "newline": s.newline_mode(),
+        },
+        "cursorHidden": s.hide_cursor(),
+        "cursorStyle": s.cursor_style(),
+        "altScreen": s.alternate_screen(),
+        "scrollTop": top,
+        "scrollBottom": bottom,
+        "tabStops": s.tab_stops(),
+        "charsets": {"g0": g[0], "g1": g[1], "g2": g[2], "g3": g[3], "gl": gl},
+        "cursor": {"row": row, "col": col},
+    })
+}
+
+/// Flattens nested objects to `a.b` keys so each differing field reports on its own line.
+fn flatten(prefix: &str, v: &serde_json::Value, out: &mut BTreeMap<String, serde_json::Value>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, v) in m {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten(&key, v, out);
+            }
+        }
+        _ => {
+            out.insert(prefix.to_string(), v.clone());
+        }
+    }
+}
+
+/// `(case, state keys)` where xterm.js deviates from the spec, so its value can't be the oracle.
+const STATE_QUIRKS: &[(&str, &[&str])] = &[
+    // xterm.js neither saves nor restores DECOM with DECSC/DECRC (xterm ctlseqs says it does) and
+    // restores the active charset object instead of the G0 designation.
+    (
+        "cursor/save_restore_decsc",
+        &["modes.origin", "charsets.g0"],
+    ),
+    // xterm.js reads LS1R/LS2R/LS3R (which shift GR, irrelevant in UTF-8) as GL shifts and maps the
+    // 96-character `ESC - . /` designations onto G1-G3.
+    (
+        "parser/esc_sequences",
+        &["charsets.g2", "charsets.g3", "charsets.gl"],
+    ),
+];
+
+fn state_diffs(case: &str, want: &serde_json::Value, got: &serde_json::Value) -> Vec<String> {
+    let quirks: &[&str] = STATE_QUIRKS
+        .iter()
+        .find(|(c, _)| *c == case)
+        .map_or(&[], |(_, keys)| keys);
+    let (mut w, mut g) = (BTreeMap::new(), BTreeMap::new());
+    flatten("", want, &mut w);
+    flatten("", got, &mut g);
+    w.iter()
+        .filter(|(k, v)| !quirks.contains(&k.as_str()) && g.get(*k) != Some(*v))
+        .map(|(k, v)| {
+            format!(
+                "  state.{k}: want {v}, got {}",
+                g.get(k).unwrap_or(&serde_json::Value::Null)
+            )
+        })
+        .collect()
+}
+
 fn cases(dir: &Path) -> Vec<PathBuf> {
     let mut found = vec![];
     let mut stack = vec![dir.join("corpus")];
@@ -189,6 +292,14 @@ fn screen_matches_xterm_js_golden_grids() {
         parser.process(&std::fs::read(&ansi).unwrap());
         let got = screen_cells(&parser);
         let want = golden_cells(&dir.join("golden").join(&rel).with_extension("json"));
+        let golden_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("golden").join(&rel).with_extension("json")).unwrap(),
+        )
+        .unwrap();
+        let mut state_diff = vec![];
+        if golden_json.get("state").is_some() {
+            state_diff = state_diffs(&name, &golden_json["state"], &screen_state(&parser));
+        }
         let diffs: Vec<String> = want
             .iter()
             .filter(|(k, w)| got[k] != **w)
@@ -198,6 +309,7 @@ fn screen_matches_xterm_js_golden_grids() {
                     k.0, k.1, got[k]
                 )
             })
+            .chain(state_diff)
             .collect();
         if !diffs.is_empty() {
             if verbose {
