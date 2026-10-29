@@ -189,7 +189,76 @@ pub struct PaneSnapshot {
     pub cols: u32,
     pub grid: Vec<Vec<CellSnapshot>>,
     pub cursor_row: u32,
+    /// Clamped to `cols - 1`; `cursor_pending_wrap` carries the parked-past-the-edge state.
     pub cursor_col: u32,
+    pub cursor_pending_wrap: bool,
+    /// OSC 8 targets as `(uri, id)`; `CellSnapshot::hyperlink` is a 1-based index into this.
+    pub hyperlinks: Vec<(String, String)>,
+    pub title: String,
+    pub modes: TerminalModes,
+    pub cursor_hidden: bool,
+    /// DECSCUSR 0-6.
+    pub cursor_style: u32,
+    /// The grid is the alternate screen.
+    pub alt_screen: bool,
+    /// DECSTBM 1-based; 0/0 = whole screen.
+    pub scroll_top: u32,
+    pub scroll_bottom: u32,
+    /// 0-based columns with a tab stop.
+    pub tab_stops: Vec<u32>,
+    pub charsets: Charsets,
+}
+
+/// Mirrors proto `TerminalModes`; mouse values use the proto's numbering.
+#[derive(Default)]
+pub struct TerminalModes {
+    pub app_cursor_keys: bool,
+    pub app_keypad: bool,
+    pub bracketed_paste: bool,
+    pub focus_events: bool,
+    /// 0 off, 1 X10, 2 normal, 3 button, 4 any.
+    pub mouse_mode: u32,
+    /// 0 default, 1 utf8, 2 sgr, 3 urxvt.
+    pub mouse_encoding: u32,
+    pub reverse_video: bool,
+    pub origin: bool,
+    pub no_autowrap: bool,
+    pub insert: bool,
+    pub newline: bool,
+}
+
+/// Mirrors proto `Charsets`: 0 ASCII, 1 DEC special graphics, 2 UK.
+#[derive(Default)]
+pub struct Charsets {
+    pub g: [u32; 4],
+    pub gl: u32,
+}
+
+fn terminal_modes(screen: &vt100::Screen) -> TerminalModes {
+    TerminalModes {
+        app_cursor_keys: screen.application_cursor(),
+        app_keypad: screen.application_keypad(),
+        bracketed_paste: screen.bracketed_paste(),
+        focus_events: screen.focus_events(),
+        mouse_mode: match screen.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => 0,
+            vt100::MouseProtocolMode::Press => 1,
+            vt100::MouseProtocolMode::PressRelease => 2,
+            vt100::MouseProtocolMode::ButtonMotion => 3,
+            vt100::MouseProtocolMode::AnyMotion => 4,
+        },
+        mouse_encoding: match screen.mouse_protocol_encoding() {
+            vt100::MouseProtocolEncoding::Default => 0,
+            vt100::MouseProtocolEncoding::Utf8 => 1,
+            vt100::MouseProtocolEncoding::Sgr => 2,
+            vt100::MouseProtocolEncoding::Urxvt => 3,
+        },
+        reverse_video: screen.reverse_video(),
+        origin: screen.origin_mode(),
+        no_autowrap: !screen.autowrap(),
+        insert: screen.insert_mode(),
+        newline: screen.newline_mode(),
+    }
 }
 
 pub struct CellSnapshot {
@@ -197,6 +266,11 @@ pub struct CellSnapshot {
     pub fg: u32,
     pub bg: u32,
     pub attrs: u32,
+    /// 0 single, 1 double, 2 curly, 3 dotted, 4 dashed; meaningful when the underline bit is set.
+    pub underline_style: u32,
+    /// Packed like `fg`; 0 = same as the text color.
+    pub underline_color: u32,
+    pub hyperlink: u32,
 }
 
 impl Pane {
@@ -591,33 +665,7 @@ impl Pane {
     fn snapshot_at_offset_with_seq(&self, offset: usize) -> (PaneSnapshot, u64) {
         let mut parser = self.parser.lock().unwrap();
         parser.screen_mut().set_scrollback(offset);
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-
-        let mut grid = Vec::with_capacity(rows as usize);
-        for row in 0..rows {
-            let mut cells = Vec::with_capacity(cols as usize);
-            for col in 0..cols {
-                let (text, fg, bg, attrs) = match screen.cell(row, col) {
-                    Some(cell) => (
-                        cell.contents().to_string(),
-                        pack_color(cell.fgcolor()),
-                        pack_color(cell.bgcolor()),
-                        pack_attrs(cell),
-                    ),
-                    None => (String::new(), 0, 0, 0),
-                };
-                cells.push(CellSnapshot {
-                    text,
-                    fg,
-                    bg,
-                    attrs,
-                });
-            }
-            grid.push(cells);
-        }
-
-        let (cursor_row, cursor_col) = screen.cursor_position();
+        let snapshot = snapshot_from_screen(parser.screen());
         // Reset the scroll position back to live — this method is a
         // point-in-time query, not a persistent view change; leaving the
         // parser scrolled would corrupt normal (offset-0) reads from any
@@ -628,16 +676,7 @@ impl Pane {
         // `process(..)` (Task 1.3.1a) — so this value and the grid just
         // built above can never disagree about which bytes are reflected.
         let seq = self.output_seq.load(Ordering::SeqCst);
-        (
-            PaneSnapshot {
-                rows: rows as u32,
-                cols: cols as u32,
-                grid,
-                cursor_row: cursor_row as u32,
-                cursor_col: cursor_col as u32,
-            },
-            seq,
-        )
+        (snapshot, seq)
     }
 
     /// Forward-only, next-match search through scrollback for `pattern`
@@ -694,6 +733,93 @@ impl Drop for Pane {
     }
 }
 
+/// Everything a snapshot holds that is computed from the emulator's screen alone (the caller
+/// owns locking and the output sequence). Pure, so it can be tested by feeding bytes to a
+/// `vt100::Parser` with no pty or shell involved.
+fn snapshot_from_screen(screen: &vt100::Screen) -> PaneSnapshot {
+    let (rows, cols) = screen.size();
+
+    let mut grid = Vec::with_capacity(rows as usize);
+    // screen-wide link index -> 1-based index into the snapshot's own table
+    let mut hyperlinks: Vec<(String, String)> = Vec::new();
+    let mut link_index = std::collections::HashMap::new();
+    for row in 0..rows {
+        let mut cells = Vec::with_capacity(cols as usize);
+        for col in 0..cols {
+            let snap = match screen.cell(row, col) {
+                Some(cell) => {
+                    let hyperlink = match cell.hyperlink() {
+                        0 => 0,
+                        screen_idx => *link_index.entry(screen_idx).or_insert_with(|| match screen
+                            .hyperlink(screen_idx)
+                        {
+                            Some((uri, id)) => {
+                                hyperlinks.push((uri.to_string(), id.to_string()));
+                                hyperlinks.len() as u32
+                            }
+                            None => 0,
+                        }),
+                    };
+                    CellSnapshot {
+                        text: cell.contents().to_string(),
+                        fg: pack_color(cell.fgcolor()),
+                        bg: pack_color(cell.bgcolor()),
+                        attrs: pack_attrs(cell),
+                        underline_style: pack_underline_style(cell.underline_style()),
+                        underline_color: pack_color(cell.ulcolor()),
+                        hyperlink,
+                    }
+                }
+                None => CellSnapshot {
+                    text: String::new(),
+                    fg: 0,
+                    bg: 0,
+                    attrs: 0,
+                    underline_style: 0,
+                    underline_color: 0,
+                    hyperlink: 0,
+                },
+            };
+            cells.push(snap);
+        }
+        grid.push(cells);
+    }
+
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let cursor_pending_wrap = screen.cursor_pending_wrap();
+    let cursor_col = cursor_col.min(cols.saturating_sub(1));
+    let title = screen.title().to_string();
+    let modes = terminal_modes(screen);
+    let cursor_hidden = screen.hide_cursor();
+    let cursor_style = u32::from(screen.cursor_style());
+    let alt_screen = screen.alternate_screen();
+    let (scroll_top, scroll_bottom) = screen.scroll_region();
+    let tab_stops = screen.tab_stops().into_iter().map(u32::from).collect();
+    let (g, gl) = screen.charsets();
+    let charsets = Charsets {
+        g: g.map(u32::from),
+        gl: u32::from(gl),
+    };
+    PaneSnapshot {
+        rows: u32::from(rows),
+        cols: u32::from(cols),
+        grid,
+        cursor_row: u32::from(cursor_row),
+        cursor_col: u32::from(cursor_col),
+        cursor_pending_wrap,
+        hyperlinks,
+        title,
+        modes,
+        cursor_hidden,
+        cursor_style,
+        alt_screen,
+        scroll_top: u32::from(scroll_top),
+        scroll_bottom: u32::from(scroll_bottom),
+        tab_stops,
+        charsets,
+    }
+}
+
 /// Packs a vt100 color into one u32: top byte tags the variant so
 /// `Default`/`Idx`/`Rgb` round-trip without a separate enum crossing the
 /// gRPC boundary. 0x00 = default, 0x01 = indexed (low byte = index),
@@ -714,6 +840,21 @@ const ATTR_BOLD: u32 = 1;
 const ATTR_UNDERLINE: u32 = 2;
 const ATTR_REVERSE: u32 = 4;
 const ATTR_ITALIC: u32 = 8;
+const ATTR_FAINT: u32 = 16;
+const ATTR_STRIKE: u32 = 32;
+const ATTR_BLINK: u32 = 64;
+const ATTR_CONCEAL: u32 = 128;
+const ATTR_OVERLINE: u32 = 256;
+
+fn pack_underline_style(style: vt100::UnderlineStyle) -> u32 {
+    match style {
+        vt100::UnderlineStyle::Single => 0,
+        vt100::UnderlineStyle::Double => 1,
+        vt100::UnderlineStyle::Curly => 2,
+        vt100::UnderlineStyle::Dotted => 3,
+        vt100::UnderlineStyle::Dashed => 4,
+    }
+}
 
 fn pack_attrs(cell: &vt100::Cell) -> u32 {
     let mut attrs = 0;
@@ -729,6 +870,21 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
     if cell.italic() {
         attrs |= ATTR_ITALIC;
     }
+    if cell.dim() {
+        attrs |= ATTR_FAINT;
+    }
+    if cell.strikethrough() {
+        attrs |= ATTR_STRIKE;
+    }
+    if cell.blink() {
+        attrs |= ATTR_BLINK;
+    }
+    if cell.conceal() {
+        attrs |= ATTR_CONCEAL;
+    }
+    if cell.overline() {
+        attrs |= ATTR_OVERLINE;
+    }
     attrs
 }
 
@@ -736,6 +892,154 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn terminal_modes_maps_vt100_state_onto_the_proto_numbering() {
+        let mut parser = vt100::Parser::new(5, 20, 0);
+        parser.process(b"\x1b=\x1b[?1h\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1015h\x1b[?5h\x1b[?6h\x1b[?7l\x1b[4h\x1b[20h");
+        let m = terminal_modes(parser.screen());
+        assert!(m.app_cursor_keys && m.app_keypad && m.bracketed_paste && m.focus_events);
+        assert!(m.reverse_video && m.origin && m.no_autowrap && m.insert && m.newline);
+        assert_eq!((m.mouse_mode, m.mouse_encoding), (4, 3));
+        parser.process(b"\x1b[?1003l\x1b[?1015l\x1b[?1000h\x1b[?1006h");
+        let m = terminal_modes(parser.screen());
+        assert_eq!((m.mouse_mode, m.mouse_encoding), (2, 2));
+    }
+
+    /// Feeds `bytes` to a fresh emulator and snapshots it: no pty, shell or timing involved.
+    fn snapshot_of(rows: u16, cols: u16, bytes: &[u8]) -> PaneSnapshot {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(bytes);
+        snapshot_from_screen(parser.screen())
+    }
+
+    #[test]
+    fn snapshot_should_carry_title_cursor_scroll_region_tab_stops_and_charsets() {
+        let snap = snapshot_of(
+            10,
+            40,
+            b"\x1b]2;my title\x07\x1b[5 q\x1b[?25l\x1b[3;7r\x1b[1;4H\x1bH\x1b)0\x0edone",
+        );
+        assert_eq!(snap.title, "my title");
+        assert_eq!(snap.charsets.gl, 1);
+        assert_eq!(snap.cursor_style, 5);
+        assert!(snap.cursor_hidden);
+        assert_eq!((snap.scroll_top, snap.scroll_bottom), (3, 7));
+        assert!(snap.tab_stops.contains(&3));
+        assert_eq!(snap.charsets.g[1], 1);
+        assert!(!snap.alt_screen);
+    }
+
+    #[test]
+    fn snapshot_should_clamp_cursor_col_and_flag_a_pending_wrap() {
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(snap.cursor_col, 39, "cursor_col must stay inside the grid");
+        assert!(snap.cursor_col < snap.cols);
+        assert!(snap.cursor_pending_wrap);
+
+        // any cursor movement clears the pending wrap
+        for mv in [&b"\x1b[C"[..], b"\x1b[D", b"\x1b[1;1H", b"\r"] {
+            let mut p = vt100::Parser::new(10, 40, 0);
+            p.process("x".repeat(40).as_bytes());
+            p.process(mv);
+            let snap = snapshot_from_screen(p.screen());
+            assert!(!snap.cursor_pending_wrap, "{mv:?}");
+            assert!(snap.cursor_col < snap.cols, "{mv:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_should_clamp_the_cursor_after_a_resize_and_across_the_alternate_screen() {
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        parser.screen_mut().set_size(10, 20);
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(snap.cols, 20);
+        assert!(snap.cursor_col < snap.cols);
+        assert!(!snap.cursor_pending_wrap);
+
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        parser.process(b"\x1b[?1049h");
+        let snap = snapshot_from_screen(parser.screen());
+        assert!(snap.alt_screen);
+        assert_eq!(snap.cursor_col, 39, "the carried cursor is still clamped");
+    }
+
+    #[test]
+    fn pack_attrs_should_set_faint_bit_when_cell_is_dim() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[2mdim\x1b[0m plain \x1b[1mbold\x1b[0m");
+        let screen = parser.screen();
+
+        assert_eq!(pack_attrs(screen.cell(0, 0).unwrap()), ATTR_FAINT);
+        assert_eq!(pack_attrs(screen.cell(0, 4).unwrap()), 0);
+        assert_eq!(pack_attrs(screen.cell(0, 10).unwrap()), ATTR_BOLD);
+    }
+
+    #[test]
+    fn pack_attrs_should_set_every_new_flag_bit() {
+        // ECMA-48 SGR 9 / 5 / 8 / 53; bit values are the wire contract in tymux.proto
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[9ma\x1b[0;5mb\x1b[0;8mc\x1b[0;53md\x1b[0;1;2me");
+        let screen = parser.screen();
+
+        assert_eq!(pack_attrs(screen.cell(0, 0).unwrap()), ATTR_STRIKE);
+        assert_eq!(pack_attrs(screen.cell(0, 1).unwrap()), ATTR_BLINK);
+        assert_eq!(pack_attrs(screen.cell(0, 2).unwrap()), ATTR_CONCEAL);
+        assert_eq!(pack_attrs(screen.cell(0, 3).unwrap()), ATTR_OVERLINE);
+        assert_eq!(
+            pack_attrs(screen.cell(0, 4).unwrap()),
+            ATTR_BOLD | ATTR_FAINT
+        );
+    }
+
+    #[test]
+    fn pack_underline_style_should_match_proto_numbering() {
+        use vt100::UnderlineStyle::*;
+        let packed: Vec<u32> = [Single, Double, Curly, Dotted, Dashed]
+            .into_iter()
+            .map(pack_underline_style)
+            .collect();
+        assert_eq!(packed, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn snapshot_should_carry_underline_style_color_and_deduped_hyperlinks() {
+        let snap = snapshot_of(
+            24,
+            80,
+            b"\x1b[4:3;58:2::9:8:7mUL\x1b[0m \x1b]8;;https://a.test\x1b\\LI\x1b]8;;\x1b\\ \x1b]8;;https://a.test\x1b\\NK\x1b]8;;\x1b\\ DONE\r\n",
+        );
+
+        let cells: Vec<&CellSnapshot> = snap
+            .grid
+            .iter()
+            .flatten()
+            .filter(|c| c.text == "U" || c.text == "L" || c.text == "N")
+            .collect();
+        let ul = cells
+            .iter()
+            .find(|c| c.text == "U" && c.attrs & 2 != 0)
+            .expect("underlined U cell");
+        assert_eq!(ul.attrs & 2, 2, "underline bit");
+        assert_eq!(ul.underline_style, 2, "curly");
+        assert_eq!(ul.underline_color, 0x0200_0000 | (9 << 16) | (8 << 8) | 7);
+        assert_eq!(
+            snap.hyperlinks,
+            vec![("https://a.test".to_string(), String::new())]
+        );
+        let linked: Vec<u32> = snap
+            .grid
+            .iter()
+            .flatten()
+            .filter(|c| (c.text == "L" || c.text == "N") && c.hyperlink != 0)
+            .map(|c| c.hyperlink)
+            .collect();
+        assert_eq!(linked, vec![1, 1], "both links dedupe to table entry 1");
+    }
 
     #[test]
     fn is_exited_should_return_false_when_process_still_running() {

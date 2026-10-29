@@ -1,0 +1,3 @@
+# Corpus replay files carry significant CR bytes; never normalize them.
+*.ansi -text
+crates/vt100/tests/fixtures/** -text
