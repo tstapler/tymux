@@ -326,11 +326,19 @@ fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot, live: bool) 
                         fg: c.fg,
                         bg: c.bg,
                         attrs: c.attrs,
+                        underline_style: c.underline_style,
+                        underline_color: c.underline_color,
+                        hyperlink: c.hyperlink,
                     })
                     .collect(),
             })
             .collect(),
         liveness: liveness_of(live) as i32,
+        hyperlinks: snap
+            .hyperlinks
+            .into_iter()
+            .map(|(uri, id)| tymux_proto::v1::Hyperlink { uri, id })
+            .collect(),
     }
 }
 

@@ -190,6 +190,8 @@ pub struct PaneSnapshot {
     pub grid: Vec<Vec<CellSnapshot>>,
     pub cursor_row: u32,
     pub cursor_col: u32,
+    /// OSC 8 targets as `(uri, id)`; `CellSnapshot::hyperlink` is a 1-based index into this.
+    pub hyperlinks: Vec<(String, String)>,
 }
 
 pub struct CellSnapshot {
@@ -197,6 +199,11 @@ pub struct CellSnapshot {
     pub fg: u32,
     pub bg: u32,
     pub attrs: u32,
+    /// 0 single, 1 double, 2 curly, 3 dotted, 4 dashed; meaningful when the underline bit is set.
+    pub underline_style: u32,
+    /// Packed like `fg`; 0 = same as the text color.
+    pub underline_color: u32,
+    pub hyperlink: u32,
 }
 
 impl Pane {
@@ -595,24 +602,47 @@ impl Pane {
         let (rows, cols) = screen.size();
 
         let mut grid = Vec::with_capacity(rows as usize);
+        // screen-wide link index -> 1-based index into the snapshot's own table
+        let mut hyperlinks: Vec<(String, String)> = Vec::new();
+        let mut link_index = std::collections::HashMap::new();
         for row in 0..rows {
             let mut cells = Vec::with_capacity(cols as usize);
             for col in 0..cols {
-                let (text, fg, bg, attrs) = match screen.cell(row, col) {
-                    Some(cell) => (
-                        cell.contents().to_string(),
-                        pack_color(cell.fgcolor()),
-                        pack_color(cell.bgcolor()),
-                        pack_attrs(cell),
-                    ),
-                    None => (String::new(), 0, 0, 0),
+                let snap = match screen.cell(row, col) {
+                    Some(cell) => {
+                        let hyperlink = match cell.hyperlink() {
+                            0 => 0,
+                            screen_idx => *link_index.entry(screen_idx).or_insert_with(|| {
+                                match screen.hyperlink(screen_idx) {
+                                    Some((uri, id)) => {
+                                        hyperlinks.push((uri.to_string(), id.to_string()));
+                                        hyperlinks.len() as u32
+                                    }
+                                    None => 0,
+                                }
+                            }),
+                        };
+                        CellSnapshot {
+                            text: cell.contents().to_string(),
+                            fg: pack_color(cell.fgcolor()),
+                            bg: pack_color(cell.bgcolor()),
+                            attrs: pack_attrs(cell),
+                            underline_style: pack_underline_style(cell.underline_style()),
+                            underline_color: pack_color(cell.ulcolor()),
+                            hyperlink,
+                        }
+                    }
+                    None => CellSnapshot {
+                        text: String::new(),
+                        fg: 0,
+                        bg: 0,
+                        attrs: 0,
+                        underline_style: 0,
+                        underline_color: 0,
+                        hyperlink: 0,
+                    },
                 };
-                cells.push(CellSnapshot {
-                    text,
-                    fg,
-                    bg,
-                    attrs,
-                });
+                cells.push(snap);
             }
             grid.push(cells);
         }
@@ -635,6 +665,7 @@ impl Pane {
                 grid,
                 cursor_row: cursor_row as u32,
                 cursor_col: cursor_col as u32,
+                hyperlinks,
             },
             seq,
         )
@@ -714,6 +745,21 @@ const ATTR_BOLD: u32 = 1;
 const ATTR_UNDERLINE: u32 = 2;
 const ATTR_REVERSE: u32 = 4;
 const ATTR_ITALIC: u32 = 8;
+const ATTR_FAINT: u32 = 16;
+const ATTR_STRIKE: u32 = 32;
+const ATTR_BLINK: u32 = 64;
+const ATTR_CONCEAL: u32 = 128;
+const ATTR_OVERLINE: u32 = 256;
+
+fn pack_underline_style(style: vt100::UnderlineStyle) -> u32 {
+    match style {
+        vt100::UnderlineStyle::Single => 0,
+        vt100::UnderlineStyle::Double => 1,
+        vt100::UnderlineStyle::Curly => 2,
+        vt100::UnderlineStyle::Dotted => 3,
+        vt100::UnderlineStyle::Dashed => 4,
+    }
+}
 
 fn pack_attrs(cell: &vt100::Cell) -> u32 {
     let mut attrs = 0;
@@ -729,6 +775,21 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
     if cell.italic() {
         attrs |= ATTR_ITALIC;
     }
+    if cell.dim() {
+        attrs |= ATTR_FAINT;
+    }
+    if cell.strikethrough() {
+        attrs |= ATTR_STRIKE;
+    }
+    if cell.blink() {
+        attrs |= ATTR_BLINK;
+    }
+    if cell.conceal() {
+        attrs |= ATTR_CONCEAL;
+    }
+    if cell.overline() {
+        attrs |= ATTR_OVERLINE;
+    }
     attrs
 }
 
@@ -736,6 +797,96 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn pack_attrs_should_set_faint_bit_when_cell_is_dim() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[2mdim\x1b[0m plain \x1b[1mbold\x1b[0m");
+        let screen = parser.screen();
+
+        assert_eq!(pack_attrs(screen.cell(0, 0).unwrap()), ATTR_FAINT);
+        assert_eq!(pack_attrs(screen.cell(0, 4).unwrap()), 0);
+        assert_eq!(pack_attrs(screen.cell(0, 10).unwrap()), ATTR_BOLD);
+    }
+
+    #[test]
+    fn pack_attrs_should_set_every_new_flag_bit() {
+        // ECMA-48 SGR 9 / 5 / 8 / 53; bit values are the wire contract in tymux.proto
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[9ma\x1b[0;5mb\x1b[0;8mc\x1b[0;53md\x1b[0;1;2me");
+        let screen = parser.screen();
+
+        assert_eq!(pack_attrs(screen.cell(0, 0).unwrap()), ATTR_STRIKE);
+        assert_eq!(pack_attrs(screen.cell(0, 1).unwrap()), ATTR_BLINK);
+        assert_eq!(pack_attrs(screen.cell(0, 2).unwrap()), ATTR_CONCEAL);
+        assert_eq!(pack_attrs(screen.cell(0, 3).unwrap()), ATTR_OVERLINE);
+        assert_eq!(
+            pack_attrs(screen.cell(0, 4).unwrap()),
+            ATTR_BOLD | ATTR_FAINT
+        );
+    }
+
+    #[test]
+    fn pack_underline_style_should_match_proto_numbering() {
+        use vt100::UnderlineStyle::*;
+        let packed: Vec<u32> = [Single, Double, Curly, Dotted, Dashed]
+            .into_iter()
+            .map(pack_underline_style)
+            .collect();
+        assert_eq!(packed, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn snapshot_should_carry_underline_style_color_and_deduped_hyperlinks() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        // the doubled quote keeps the typed command line from matching the marker we wait for
+        pane.write_input(
+            b"printf '\\033[4:3;58:2::9:8:7mUL\\033[0m \\033]8;;https://a.test\\033\\\\LI\\033]8;;\\033\\\\ \\033]8;;https://a.test\\033\\\\NK\\033]8;;\\033\\\\ DO''NE\\n'\n",
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = loop {
+            let snap = pane.snapshot();
+            let text: String = snap
+                .grid
+                .iter()
+                .flatten()
+                .map(|c| c.text.as_str())
+                .collect();
+            if text.contains("DONE") && text.contains("ULLI NK") || Instant::now() > deadline {
+                break snap;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let cells: Vec<&CellSnapshot> = snap
+            .grid
+            .iter()
+            .flatten()
+            .filter(|c| c.text == "U" || c.text == "L" || c.text == "N")
+            .collect();
+        // the typed command line echoes a plain "U" too; the printed one is the underlined cell
+        let ul = cells
+            .iter()
+            .find(|c| c.text == "U" && c.attrs & 2 != 0)
+            .expect("underlined U cell");
+        assert_eq!(ul.attrs & 2, 2, "underline bit");
+        assert_eq!(ul.underline_style, 2, "curly");
+        assert_eq!(ul.underline_color, 0x0200_0000 | (9 << 16) | (8 << 8) | 7);
+        assert_eq!(
+            snap.hyperlinks,
+            vec![("https://a.test".to_string(), String::new())]
+        );
+        let linked: Vec<u32> = snap
+            .grid
+            .iter()
+            .flatten()
+            .filter(|c| (c.text == "L" || c.text == "N") && c.hyperlink != 0)
+            .map(|c| c.hyperlink)
+            .collect();
+        assert_eq!(linked, vec![1, 1], "both links dedupe to table entry 1");
+    }
 
     #[test]
     fn is_exited_should_return_false_when_process_still_running() {
