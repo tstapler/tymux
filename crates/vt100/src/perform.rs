@@ -1,4 +1,6 @@
 const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+/// vte's own limit on OSC parameters (`MAX_OSC_PARAMS` in vte 0.15); not exported, so mirrored.
+const MAX_OSC_PARAMS: usize = 16;
 const CLIPBOARD_SELECTOR: &[u8] = b"cpqs01234567";
 
 pub struct WrappedScreen<CB: crate::callbacks::Callbacks = ()> {
@@ -224,6 +226,10 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 self.screen.set_title(s);
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
+            // vte keeps at most MAX_OSC_PARAMS parameters, so a full set may have lost the tail of
+            // a URI containing `;`: treat it as invalid and end the link instead of linking a
+            // truncated target.
+            [b"8", ..] if params.len() >= MAX_OSC_PARAMS => self.screen.osc8(b"", b""),
             [b"8", osc8_params, uri @ ..] if !uri.is_empty() => {
                 // vte splits on every `;`, but a URI may contain them
                 self.screen.osc8(osc8_params, &uri.join(&b';'));

@@ -226,3 +226,27 @@ fn a_rejected_link_closes_the_previous_one() {
     assert!(link_of(&p, 0, 0).is_some());
     assert_eq!(link_of(&p, 0, 1), None);
 }
+
+// vte keeps at most 16 OSC parameters and silently drops the rest, so a URI containing many `;`
+// would otherwise become a link to a truncated, wrong target.
+
+#[test]
+fn uri_with_many_semicolons_is_not_silently_truncated() {
+    let mut p = Parser::new(5, 40, 0);
+    let uri = format!("https://e.com/{}", ["p"; 20].join(";"));
+    p.process(format!("\x1b]8;;{uri}\x1b\\x\x1b]8;;\x1b\\").as_bytes());
+    match link_of(&p, 0, 0) {
+        None => {}
+        Some((stored, _)) => assert_eq!(stored, uri, "stored a truncated URI"),
+    }
+}
+
+#[test]
+fn uri_with_a_few_semicolons_still_links() {
+    let mut p = Parser::new(5, 40, 0);
+    p.process(b"\x1b]8;;https://e.com/a;b;c\x1b\\x\x1b]8;;\x1b\\");
+    assert_eq!(
+        link_of(&p, 0, 0).map(|l| l.0),
+        Some("https://e.com/a;b;c".to_string())
+    );
+}
