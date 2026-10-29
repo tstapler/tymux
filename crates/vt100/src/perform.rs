@@ -214,17 +214,20 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
         match params {
-            [b"0", s] => {
-                self.screen.set_title(s);
-                self.callbacks.set_window_icon_name(&mut self.screen, s);
-                self.callbacks.set_window_title(&mut self.screen, s);
+            // vte splits the payload on every `;`, but a title may contain them (xterm.js rejoins)
+            [b"0", rest @ ..] if !rest.is_empty() => {
+                let s = rest.join(&b';');
+                self.screen.set_title(&s);
+                self.callbacks.set_window_icon_name(&mut self.screen, &s);
+                self.callbacks.set_window_title(&mut self.screen, &s);
             }
             [b"1", s] => {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
             }
-            [b"2", s] => {
-                self.screen.set_title(s);
-                self.callbacks.set_window_title(&mut self.screen, s);
+            [b"2", rest @ ..] if !rest.is_empty() => {
+                let s = rest.join(&b';');
+                self.screen.set_title(&s);
+                self.callbacks.set_window_title(&mut self.screen, &s);
             }
             // vte keeps at most MAX_OSC_PARAMS parameters, so a full set may have lost the tail of
             // a URI containing `;`: treat it as invalid and end the link instead of linking a

@@ -150,10 +150,12 @@ fn erase_scroll_and_insert_blank_with_the_current_background() {
 }
 
 #[test]
-fn reverse_index_and_scroll_down_blank_with_default_attributes() {
-    // xterm.js (the reference terminal here) does not BCE on SD / RI
-    let p = parse(b"\x1b[44m\x1b[T\x1b[1;1H\x1bM");
+fn scroll_down_blanks_with_default_attributes_but_reverse_index_erases_with_the_background() {
+    // xterm.js (the reference terminal here): SD uses default attributes, RI background-color erase
+    let p = parse(b"\x1b[44m\x1b[T");
     assert_eq!(p.screen().cell(0, 0).unwrap().bgcolor(), Color::Default);
+    let p = parse(b"\x1b[44m\x1b[1;1H\x1bM");
+    assert_eq!(p.screen().cell(0, 0).unwrap().bgcolor(), Color::Idx(4));
 }
 
 #[test]

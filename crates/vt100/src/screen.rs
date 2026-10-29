@@ -789,14 +789,27 @@ impl Screen {
         }
     }
 
+    // xterm (ToAlternate/FromAlternate) and xterm.js carry the cursor position across the
+    // switch in both directions instead of homing the alternate screen; ?1049 additionally
+    // saves/restores the cursor around it (see decset/decrst).
     fn enter_alternate_grid(&mut self) {
+        if self.mode(MODE_ALTERNATE_SCREEN) {
+            return;
+        }
         self.grid_mut().set_scrollback(0);
+        let pos = self.grid.pos();
         self.set_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_grid.allocate_rows();
+        self.alternate_grid.set_pos_exact(pos);
     }
 
     fn exit_alternate_grid(&mut self) {
+        if !self.mode(MODE_ALTERNATE_SCREEN) {
+            return;
+        }
+        let pos = self.alternate_grid.pos();
         self.clear_mode(MODE_ALTERNATE_SCREEN);
+        self.grid.set_pos_exact(pos);
     }
 
     fn save_cursor(&mut self) {
@@ -1036,14 +1049,11 @@ impl Screen {
         }
     }
 
+    // With DECAWM off the cursor stays parked at `cols` after a character lands in the last
+    // column (xterm.js does the same), which lets a following combining mark find its base cell
+    // at `col - 1`; the next printable character pulls the cursor back to the last column.
     fn draw(&mut self, c: char) {
         self.draw_inner(c);
-        if self.mode(MODE_NO_AUTOWRAP) {
-            let cols = self.grid().size().cols;
-            if self.grid().pos().col >= cols {
-                self.grid_mut().col_set(cols - 1);
-            }
-        }
     }
 
     fn draw_inner(&mut self, c: char) {
@@ -1099,6 +1109,17 @@ impl Screen {
                 .unwrap();
             if last_cell.has_contents() || last_cell.is_wide_continuation() {
                 wrap = true;
+            }
+        }
+        if autowrap && width > 1 && pos.col == size.cols - 1 {
+            // A wide character that can't fit leaves the last column unused; xterm.js blanks it
+            // with the current attributes (so a background or underline run stays unbroken).
+            let blank = crate::attrs::Attrs {
+                hyperlink: 0,
+                ..attrs
+            };
+            if let Some(row) = self.grid_mut().drawing_row_mut(pos.row) {
+                row.erase(size.cols - 1, blank);
             }
         }
         if autowrap {
@@ -1306,6 +1327,8 @@ impl Screen {
 
     // ESC D (IND): down one line, scrolling at the bottom margin; never touches the column
     pub(crate) fn ind(&mut self) {
+        // like xterm.js, IND clears a pending wrap before moving down
+        self.grid_mut().restrict_col();
         self.grid_mut().row_inc_scroll(1);
     }
 
@@ -1350,6 +1373,7 @@ impl Screen {
         self.charsets = Charsets::default();
         self.saved_charsets = Charsets::default();
         self.last_cluster = None;
+        self.cursor_style = 0;
         self.clear_mode(
             MODE_INSERT
                 | MODE_NEWLINE
@@ -1422,8 +1446,7 @@ impl Screen {
 
     // ESC M
     pub(crate) fn ri(&mut self) {
-        self.grid_mut().restrict_col();
-        self.grid_mut().row_dec_scroll(1);
+        self.grid_mut().reverse_index();
     }
 
     // ESC c
@@ -1435,6 +1458,7 @@ impl Screen {
 
     // CSI @
     pub(crate) fn ich(&mut self, count: u16) {
+        self.grid_mut().restrict_col();
         self.grid_mut().insert_cells(count);
     }
 
@@ -1529,6 +1553,7 @@ impl Screen {
 
     // CSI P
     pub(crate) fn dch(&mut self, count: u16) {
+        self.grid_mut().restrict_col();
         self.grid_mut().delete_cells(count);
     }
 
@@ -1539,17 +1564,19 @@ impl Screen {
 
     // CSI T
     pub(crate) fn sd(&mut self, count: u16) {
-        self.grid_mut().scroll_down(count);
+        self.grid_mut().scroll_down(count, false);
     }
 
     // CSI X
     pub(crate) fn ech(&mut self, count: u16) {
+        self.grid_mut().restrict_col();
         let attrs = self.attrs.for_erase();
         self.grid_mut().erase_cells(count, attrs);
     }
 
     // CSI d
     pub(crate) fn vpa(&mut self, row: u16) {
+        self.grid_mut().restrict_col();
         self.grid_mut().row_set(row - 1);
     }
 
@@ -1606,8 +1633,9 @@ impl Screen {
                 }
                 // 1047 clears the alternate screen on the way out; 1048 restores the cursor
                 [1047] => {
-                    self.alternate_grid.clear();
+                    // leave first so the cursor carries back, then wipe the alternate screen
                     self.exit_alternate_grid();
+                    self.alternate_grid.clear();
                 }
                 [1048] => self.decrc(),
                 [1000] => {

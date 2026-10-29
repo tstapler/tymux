@@ -150,6 +150,12 @@ impl Grid {
         self.col_clamp();
     }
 
+    /// Sets the cursor as-is (no origin-mode offset, no clamping), for carrying a position
+    /// between the primary and alternate grids, which always have the same size.
+    pub fn set_pos_exact(&mut self, pos: Pos) {
+        self.pos = pos;
+    }
+
     pub fn save_cursor(&mut self) {
         self.saved_pos = self.pos;
         self.saved_origin_mode = self.origin_mode;
@@ -158,6 +164,8 @@ impl Grid {
     pub fn restore_cursor(&mut self) {
         self.pos = self.saved_pos;
         self.origin_mode = self.saved_origin_mode;
+        // a cursor saved in the pending-wrap state comes back on the last column, wrap cleared
+        self.col_clamp();
     }
 
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
@@ -587,15 +595,17 @@ impl Grid {
         }
     }
 
-    pub fn scroll_down(&mut self, count: u16) {
+    /// `bce` blanks the new rows with the current background (RI); SD (`CSI T`) uses default
+    /// attributes in xterm.js, unlike scroll up and insert/delete.
+    pub fn scroll_down(&mut self, count: u16, bce: bool) {
         for _ in 0..count.min(self.scroll_bottom - self.scroll_top + 1) {
             self.rows.remove(usize::from(self.scroll_bottom));
-            // xterm.js blanks SD / RI rows with default attributes (no background-color erase),
-            // unlike scroll up and insert/delete - match the browser's renderer
-            self.rows.insert(
-                usize::from(self.scroll_top),
-                crate::row::Row::new(self.size.cols),
-            );
+            let blank = if bce {
+                self.new_row()
+            } else {
+                crate::row::Row::new(self.size.cols)
+            };
+            self.rows.insert(usize::from(self.scroll_top), blank);
             // self.scroll_bottom is maintained to always be a valid row
             self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }
@@ -676,14 +686,16 @@ impl Grid {
         self.col_clamp();
     }
 
-    pub fn row_dec_scroll(&mut self, count: u16) {
-        let in_scroll_region = self.in_scroll_region();
-        // need to account for clamping by both row_clamp_top and by
-        // saturating_sub
-        let extra_lines = count.saturating_sub(self.pos.row);
-        self.pos.row = self.pos.row.saturating_sub(count);
-        let lines = self.row_clamp_top(in_scroll_region);
-        self.scroll_down(lines + extra_lines);
+    /// RI (ESC M): at the top margin the region scrolls down, blanking the new row with the
+    /// current background (like xterm / xterm.js); anywhere else the cursor just moves up one row,
+    /// stopping at the screen's top, so a cursor above the margin never scrolls the region.
+    pub fn reverse_index(&mut self) {
+        self.col_clamp();
+        if self.pos.row == self.scroll_top {
+            self.scroll_down(1, true);
+        } else {
+            self.pos.row = self.pos.row.saturating_sub(1);
+        }
     }
 
     pub fn row_set(&mut self, i: u16) {
@@ -882,11 +894,11 @@ mod bounded_work {
         g.scroll_up(u16::MAX);
         assert_eq!(work::rows_allocated(), 24);
         work::reset();
-        g.scroll_down(u16::MAX);
+        g.scroll_down(u16::MAX, false);
         assert_eq!(work::rows_allocated(), 24);
         g.set_scroll_region(4, 9);
         work::reset();
-        g.scroll_down(u16::MAX);
+        g.scroll_down(u16::MAX, false);
         assert_eq!(work::rows_allocated(), 6);
         work::reset();
         g.scroll_up(u16::MAX);

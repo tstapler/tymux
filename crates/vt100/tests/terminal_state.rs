@@ -96,10 +96,11 @@ fn decscusr_sets_cursor_style_and_ignores_out_of_range() {
 
 #[test]
 fn alternate_screen_reports_the_active_grid() {
-    // ctlseqs ?1049: save cursor, switch to (cleared) alternate screen
+    // ctlseqs ?1049: save cursor, switch to the (cleared) alternate screen. The cursor stays
+    // where it was (xterm, xterm.js), so "alt" lands after the four columns "main" used.
     let p = parse(b"main\x1b[?1049halt");
     assert!(p.screen().alternate_screen());
-    assert_eq!(p.screen().rows(0, 40).next().unwrap().trim_end(), "alt");
+    assert_eq!(p.screen().rows(0, 40).next().unwrap().trim_end(), "    alt");
     let p = parse(b"main\x1b[?1049halt\x1b[?1049l");
     assert!(!p.screen().alternate_screen());
     assert_eq!(p.screen().rows(0, 40).next().unwrap().trim_end(), "main");

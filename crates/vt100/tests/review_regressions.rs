@@ -294,7 +294,7 @@ fn hyperlink_table_keeps_links_referenced_from_scrollback_and_the_alternate_scre
     p.process(
         "\x1b]8;id=sb;https://scrollback/\x1b\\s\x1b]8;;\x1b\\\r\n\r\n\r\n\r\n\r\n\r\n".as_bytes(),
     );
-    p.process("\x1b[?1049h\x1b]8;id=alt;https://alt/\x1b\\a\x1b]8;;\x1b\\".as_bytes());
+    p.process("\x1b[?1049h\x1b[1;1H\x1b]8;id=alt;https://alt/\x1b\\a\x1b]8;;\x1b\\".as_bytes());
     for n in 0..5000 {
         p.process(b"\x1b[3;1H");
         emit_link(&mut p, n);
