@@ -339,6 +339,33 @@ fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot, live: bool) 
             .into_iter()
             .map(|(uri, id)| tymux_proto::v1::Hyperlink { uri, id })
             .collect(),
+        title: snap.title,
+        modes: Some(tymux_proto::v1::TerminalModes {
+            app_cursor_keys: snap.modes.app_cursor_keys,
+            app_keypad: snap.modes.app_keypad,
+            bracketed_paste: snap.modes.bracketed_paste,
+            focus_events: snap.modes.focus_events,
+            mouse_mode: snap.modes.mouse_mode,
+            mouse_encoding: snap.modes.mouse_encoding,
+            reverse_video: snap.modes.reverse_video,
+            origin: snap.modes.origin,
+            no_autowrap: snap.modes.no_autowrap,
+            insert: snap.modes.insert,
+            newline: snap.modes.newline,
+        }),
+        cursor_hidden: snap.cursor_hidden,
+        cursor_style: snap.cursor_style,
+        alt_screen: snap.alt_screen,
+        scroll_top: snap.scroll_top,
+        scroll_bottom: snap.scroll_bottom,
+        tab_stops: snap.tab_stops,
+        charsets: Some(tymux_proto::v1::Charsets {
+            g0: snap.charsets.g[0],
+            g1: snap.charsets.g[1],
+            g2: snap.charsets.g[2],
+            g3: snap.charsets.g[3],
+            gl: snap.charsets.gl,
+        }),
     }
 }
 

@@ -192,6 +192,71 @@ pub struct PaneSnapshot {
     pub cursor_col: u32,
     /// OSC 8 targets as `(uri, id)`; `CellSnapshot::hyperlink` is a 1-based index into this.
     pub hyperlinks: Vec<(String, String)>,
+    pub title: String,
+    pub modes: TerminalModes,
+    pub cursor_hidden: bool,
+    /// DECSCUSR 0-6.
+    pub cursor_style: u32,
+    /// The grid is the alternate screen.
+    pub alt_screen: bool,
+    /// DECSTBM 1-based; 0/0 = whole screen.
+    pub scroll_top: u32,
+    pub scroll_bottom: u32,
+    /// 0-based columns with a tab stop.
+    pub tab_stops: Vec<u32>,
+    pub charsets: Charsets,
+}
+
+/// Mirrors proto `TerminalModes`; mouse values use the proto's numbering.
+#[derive(Default)]
+pub struct TerminalModes {
+    pub app_cursor_keys: bool,
+    pub app_keypad: bool,
+    pub bracketed_paste: bool,
+    pub focus_events: bool,
+    /// 0 off, 1 X10, 2 normal, 3 button, 4 any.
+    pub mouse_mode: u32,
+    /// 0 default, 1 utf8, 2 sgr, 3 urxvt.
+    pub mouse_encoding: u32,
+    pub reverse_video: bool,
+    pub origin: bool,
+    pub no_autowrap: bool,
+    pub insert: bool,
+    pub newline: bool,
+}
+
+/// Mirrors proto `Charsets`: 0 ASCII, 1 DEC special graphics, 2 UK.
+#[derive(Default)]
+pub struct Charsets {
+    pub g: [u32; 4],
+    pub gl: u32,
+}
+
+fn terminal_modes(screen: &vt100::Screen) -> TerminalModes {
+    TerminalModes {
+        app_cursor_keys: screen.application_cursor(),
+        app_keypad: screen.application_keypad(),
+        bracketed_paste: screen.bracketed_paste(),
+        focus_events: screen.focus_events(),
+        mouse_mode: match screen.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => 0,
+            vt100::MouseProtocolMode::Press => 1,
+            vt100::MouseProtocolMode::PressRelease => 2,
+            vt100::MouseProtocolMode::ButtonMotion => 3,
+            vt100::MouseProtocolMode::AnyMotion => 4,
+        },
+        mouse_encoding: match screen.mouse_protocol_encoding() {
+            vt100::MouseProtocolEncoding::Default => 0,
+            vt100::MouseProtocolEncoding::Utf8 => 1,
+            vt100::MouseProtocolEncoding::Sgr => 2,
+            vt100::MouseProtocolEncoding::Urxvt => 3,
+        },
+        reverse_video: screen.reverse_video(),
+        origin: screen.origin_mode(),
+        no_autowrap: !screen.autowrap(),
+        insert: screen.insert_mode(),
+        newline: screen.newline_mode(),
+    }
 }
 
 pub struct CellSnapshot {
@@ -648,6 +713,18 @@ impl Pane {
         }
 
         let (cursor_row, cursor_col) = screen.cursor_position();
+        let title = screen.title().to_string();
+        let modes = terminal_modes(screen);
+        let cursor_hidden = screen.hide_cursor();
+        let cursor_style = u32::from(screen.cursor_style());
+        let alt_screen = screen.alternate_screen();
+        let (scroll_top, scroll_bottom) = screen.scroll_region();
+        let tab_stops = screen.tab_stops().into_iter().map(u32::from).collect();
+        let (g, gl) = screen.charsets();
+        let charsets = Charsets {
+            g: g.map(u32::from),
+            gl: u32::from(gl),
+        };
         // Reset the scroll position back to live — this method is a
         // point-in-time query, not a persistent view change; leaving the
         // parser scrolled would corrupt normal (offset-0) reads from any
@@ -666,6 +743,15 @@ impl Pane {
                 cursor_row: cursor_row as u32,
                 cursor_col: cursor_col as u32,
                 hyperlinks,
+                title,
+                modes,
+                cursor_hidden,
+                cursor_style,
+                alt_screen,
+                scroll_top: u32::from(scroll_top),
+                scroll_bottom: u32::from(scroll_bottom),
+                tab_stops,
+                charsets,
             },
             seq,
         )
@@ -797,6 +883,46 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn terminal_modes_maps_vt100_state_onto_the_proto_numbering() {
+        let mut parser = vt100::Parser::new(5, 20, 0);
+        parser.process(b"\x1b=\x1b[?1h\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1015h\x1b[?5h\x1b[?6h\x1b[?7l\x1b[4h\x1b[20h");
+        let m = terminal_modes(parser.screen());
+        assert!(m.app_cursor_keys && m.app_keypad && m.bracketed_paste && m.focus_events);
+        assert!(m.reverse_video && m.origin && m.no_autowrap && m.insert && m.newline);
+        assert_eq!((m.mouse_mode, m.mouse_encoding), (4, 3));
+        parser.process(b"\x1b[?1003l\x1b[?1015l\x1b[?1000h\x1b[?1006h");
+        let m = terminal_modes(parser.screen());
+        assert_eq!((m.mouse_mode, m.mouse_encoding), (2, 2));
+    }
+
+    #[test]
+    fn snapshot_should_carry_title_cursor_scroll_region_tab_stops_and_charsets() {
+        let pane = Pane::spawn("/bin/sh", 10, 40).unwrap();
+        pane.write_input(
+            b"printf '\\033]2;my title\\007\\033[5 q\\033[?25l\\033[3;7r\\033[1;4H\\033H\\033)0\\016done'\n",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = loop {
+            let snap = pane.snapshot();
+            if snap.title == "my title" && snap.charsets.gl == 1 {
+                break snap;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "printf output never reached the pane"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(snap.cursor_style, 5);
+        assert!(snap.cursor_hidden);
+        assert_eq!((snap.scroll_top, snap.scroll_bottom), (3, 7));
+        assert!(snap.tab_stops.contains(&3));
+        assert_eq!(snap.charsets.g[1], 1);
+        assert!(!snap.alt_screen);
+    }
 
     #[test]
     fn pack_attrs_should_set_faint_bit_when_cell_is_dim() {
