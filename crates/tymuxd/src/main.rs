@@ -316,6 +316,7 @@ fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot, live: bool) 
         cursor_row: snap.cursor_row,
         cursor_col: snap.cursor_col,
         cursor_pending_wrap: snap.cursor_pending_wrap,
+        exit_code: None,
         grid: snap
             .grid
             .into_iter()
@@ -745,14 +746,28 @@ impl TymuxService for TymuxDaemon {
     ) -> Result<Response<ProtoSnapshot>, Status> {
         let req = request.into_inner();
         let pane_id = parse_uuid(&req.pane_id)?;
-        let pane = resolve_live_pane(&self.engine, pane_id).inspect_err(|status| {
-            tracing::warn!(pane_id = %pane_id, code = ?status.code(), "capture_pane: pane unavailable");
-        })?;
-        Ok(Response::new(snapshot_to_proto(
+        // An exited pane still holds its last screen; hand that back marked DEAD instead of an
+        // error. Only a pane with no screen left (persisted record, unknown id) is an error.
+        let pane = match resolve_live_pane(&self.engine, pane_id) {
+            Ok(pane) => pane,
+            Err(status) => match self.engine.exited_pane(pane_id) {
+                Some(pane) => pane,
+                None => {
+                    tracing::warn!(pane_id = %pane_id, code = ?status.code(), "capture_pane: pane unavailable");
+                    return Err(status);
+                }
+            },
+        };
+        let live = !pane.is_exited();
+        let mut snapshot = snapshot_to_proto(
             &req.pane_id,
             pane.snapshot_at_offset(req.scrollback_offset as usize),
-            true,
-        )))
+            live,
+        );
+        if !live {
+            snapshot.exit_code = pane.exit_code();
+        }
+        Ok(Response::new(snapshot))
     }
 
     async fn search_scrollback(
@@ -2707,7 +2722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_pane_should_return_failed_precondition_when_pane_lookup_is_dead_vs_not_found_when_unknown(
+    async fn capture_pane_should_return_last_snapshot_marked_dead_when_pane_exited_vs_not_found_when_unknown(
     ) {
         let daemon = test_daemon();
         let session = daemon
@@ -2722,21 +2737,74 @@ mod tests {
             PaneLookup::Live(pane) => pane,
             _ => panic!("expected freshly created pane to be Live"),
         };
-        pane.write_input(b"exit\n").unwrap();
+        pane.write_input(b"echo last-words; exit 3\n").unwrap();
         wait_for_pane_exit(&pane).await;
 
-        let dead_err = daemon
+        let snap = daemon
             .capture_pane(Request::new(capture_req(pane_id_str)))
             .await
-            .unwrap_err();
-        assert_eq!(dead_err.code(), tonic::Code::FailedPrecondition);
+            .expect("an exited pane still has a last screen to capture")
+            .into_inner();
+        assert_eq!(snap.liveness, Liveness::Dead as i32);
+        assert_eq!(snap.exit_code, Some(3));
+        let text: String = snap
+            .grid
+            .iter()
+            .flat_map(|r| r.cells.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(text.contains("last-words"), "last screen kept: {text:?}");
 
         let unknown_err = daemon
             .capture_pane(Request::new(capture_req(Uuid::new_v4().to_string())))
             .await
             .unwrap_err();
         assert_eq!(unknown_err.code(), tonic::Code::NotFound);
-        assert_ne!(dead_err.code(), unknown_err.code());
+    }
+
+    /// A pane known only from a persisted record (daemon restarted) has no screen to return, so
+    /// CapturePane keeps answering FAILED_PRECONDITION for it.
+    #[tokio::test]
+    async fn capture_pane_should_stay_failed_precondition_when_only_a_persisted_record_remains() {
+        use tymux_core::FsPersistenceBackend;
+
+        let persist_dir =
+            std::env::temp_dir().join(format!("tymux-capture-dead-test-{}", Uuid::new_v4()));
+        let backend = FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let engine = Arc::new(Engine::with_persistence(Box::new(backend)));
+        let daemon = TymuxDaemon::new(engine.clone());
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane_id = parse_uuid(&pane_id_str).unwrap();
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"exit\n").unwrap();
+        wait_for_pane_exit(&pane).await;
+        engine
+            .create_window(
+                parse_uuid(&session.id).unwrap(),
+                Some("/bin/sh".to_string()),
+            )
+            .unwrap();
+
+        let backend2 = FsPersistenceBackend::new(persist_dir.clone()).unwrap();
+        let records = backend2.load_all();
+        let fresh_engine = Arc::new(Engine::with_persistence(Box::new(backend2)));
+        fresh_engine.load_persisted(records);
+        let fresh = TymuxDaemon::new(fresh_engine);
+
+        let err = fresh
+            .capture_pane(Request::new(capture_req(pane_id_str)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        std::fs::remove_dir_all(&persist_dir).ok();
     }
 
     /// Story 1.2.4: a pane's last-known exit code survives into a

@@ -969,6 +969,29 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_should_reflow_wrapped_lines_when_the_pane_is_resized() {
+        let mut parser = vt100::Parser::new(5, 20, 100);
+        parser.process(b"0123456789abcdefghijKLMNOPQRST\r\nnext\r\n");
+        parser.screen_mut().set_size(5, 10);
+        let text = |snap: &PaneSnapshot, row: usize| -> String {
+            snap.grid[row]
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<String>()
+        };
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(text(&snap, 0).trim_end(), "0123456789");
+        assert_eq!(text(&snap, 1).trim_end(), "abcdefghij");
+        assert_eq!(text(&snap, 2).trim_end(), "KLMNOPQRST");
+        assert_eq!(text(&snap, 3).trim_end(), "next");
+
+        parser.screen_mut().set_size(5, 30);
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(text(&snap, 0).trim_end(), "0123456789abcdefghijKLMNOPQRST");
+        assert_eq!(text(&snap, 1).trim_end(), "next");
+    }
+
+    #[test]
     fn pack_attrs_should_set_faint_bit_when_cell_is_dim() {
         let mut parser = vt100::Parser::new(2, 20, 0);
         parser.process(b"\x1b[2mdim\x1b[0m plain \x1b[1mbold\x1b[0m");

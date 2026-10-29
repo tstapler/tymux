@@ -544,6 +544,16 @@ impl Engine {
         }
     }
 
+    /// The pane itself when its child has exited but the engine still tracks it (so its last
+    /// screen is still readable). `None` if the pane is running, unknown, or only a persisted
+    /// record reloaded after a restart (no screen survives that).
+    pub fn exited_pane(&self, pane_id: Uuid) -> Option<Arc<Pane>> {
+        match self.panes.lock().unwrap().get(&pane_id) {
+            Some(PaneEntry::Live(pane)) if pane.is_exited() => Some(pane.clone()),
+            _ => None,
+        }
+    }
+
     /// The last-known exit code for a pane that has already exited (Story
     /// 1.2.4) — the same code an open `Attach` stream would have
     /// delivered, but readable with no `Attach` stream open at all. Covers

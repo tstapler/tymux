@@ -341,6 +341,10 @@ message SearchScrollbackResponse {
   string line = 3;
 }
 
+// CapturePane on a pane whose child has exited (but whose pane is still tracked) returns its last
+// grid with liveness = DEAD rather than an error, so a client can still show the final output.
+// Only a pane the daemon no longer holds a screen for (reloaded from disk after a restart) is
+// FAILED_PRECONDITION.
 message PaneSnapshot {
   string pane_id = 1;
   uint32 rows = 2;
@@ -364,6 +368,8 @@ message PaneSnapshot {
   // The cursor sits past the last column (cursor_col is clamped to cols-1); the next printed
   // character wraps to the next row, or overwrites the last column when DECAWM is off.
   bool cursor_pending_wrap = 18;
+  // Set only when liveness is DEAD: the exited child's exit code, if it was captured.
+  optional int32 exit_code = 19;
 }
 
 message TerminalModes {

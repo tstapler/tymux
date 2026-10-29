@@ -1546,6 +1546,10 @@ func (x *SearchScrollbackResponse) GetLine() string {
 	return ""
 }
 
+// CapturePane on a pane whose child has exited (but whose pane is still tracked) returns its last
+// grid with liveness = DEAD rather than an error, so a client can still show the final output.
+// Only a pane the daemon no longer holds a screen for (reloaded from disk after a restart) is
+// FAILED_PRECONDITION.
 type PaneSnapshot struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	PaneId    string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
@@ -1570,8 +1574,10 @@ type PaneSnapshot struct {
 	// The cursor sits past the last column (cursor_col is clamped to cols-1); the next printed
 	// character wraps to the next row, or overwrites the last column when DECAWM is off.
 	CursorPendingWrap bool `protobuf:"varint,18,opt,name=cursor_pending_wrap,json=cursorPendingWrap,proto3" json:"cursor_pending_wrap,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Set only when liveness is DEAD: the exited child's exit code, if it was captured.
+	ExitCode      *int32 `protobuf:"varint,19,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PaneSnapshot) Reset() {
@@ -1728,6 +1734,13 @@ func (x *PaneSnapshot) GetCursorPendingWrap() bool {
 		return x.CursorPendingWrap
 	}
 	return false
+}
+
+func (x *PaneSnapshot) GetExitCode() int32 {
+	if x != nil && x.ExitCode != nil {
+		return *x.ExitCode
+	}
+	return 0
 }
 
 type TerminalModes struct {
@@ -3042,7 +3055,7 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x18SearchScrollbackResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\rR\x06offset\x12\x12\n" +
-	"\x04line\x18\x03 \x01(\tR\x04line\"\x82\x05\n" +
+	"\x04line\x18\x03 \x01(\tR\x04line\"\xb2\x05\n" +
 	"\fPaneSnapshot\x12\x17\n" +
 	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12\x12\n" +
 	"\x04rows\x18\x02 \x01(\rR\x04rows\x12\x12\n" +
@@ -3068,7 +3081,10 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\rscroll_bottom\x18\x0f \x01(\rR\fscrollBottom\x12\x1b\n" +
 	"\ttab_stops\x18\x10 \x03(\rR\btabStops\x12.\n" +
 	"\bcharsets\x18\x11 \x01(\v2\x12.tymux.v1.CharsetsR\bcharsets\x12.\n" +
-	"\x13cursor_pending_wrap\x18\x12 \x01(\bR\x11cursorPendingWrap\"\xf8\x02\n" +
+	"\x13cursor_pending_wrap\x18\x12 \x01(\bR\x11cursorPendingWrap\x12 \n" +
+	"\texit_code\x18\x13 \x01(\x05H\x00R\bexitCode\x88\x01\x01B\f\n" +
+	"\n" +
+	"_exit_code\"\xf8\x02\n" +
 	"\rTerminalModes\x12&\n" +
 	"\x0fapp_cursor_keys\x18\x01 \x01(\bR\rappCursorKeys\x12\x1d\n" +
 	"\n" +
@@ -3311,6 +3327,7 @@ func file_tymux_v1_tymux_proto_init() {
 		(*ArgSpec_Literal)(nil),
 		(*ArgSpec_FileContentsPath)(nil),
 	}
+	file_tymux_v1_tymux_proto_msgTypes[23].OneofWrappers = []any{}
 	file_tymux_v1_tymux_proto_msgTypes[29].OneofWrappers = []any{
 		(*AttachRequest_PaneId)(nil),
 		(*AttachRequest_Input)(nil),

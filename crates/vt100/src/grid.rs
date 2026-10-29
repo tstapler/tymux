@@ -1,5 +1,7 @@
 use crate::term::BufWrite as _;
 
+mod reflow;
+
 /// How many discarded rows (or one cleared screen's worth) re-arm hyperlink compaction after a
 /// futile scan; see `Screen::osc8`.
 pub const MIN_REARM_ROWS: u64 = 16;
@@ -102,48 +104,6 @@ impl Grid {
 
     pub fn size(&self) -> Size {
         self.size
-    }
-
-    pub fn set_size(&mut self, size: Size) {
-        if size.cols != self.size.cols {
-            for row in &mut self.rows {
-                row.wrap(false);
-            }
-        }
-
-        if self.scroll_bottom == self.size.rows - 1 {
-            self.scroll_bottom = size.rows - 1;
-        }
-
-        self.size = size;
-        // columns that appear on a resize get the default every-8th stop
-        let old_len = self.tab_stops.len();
-        self.tab_stops.resize(usize::from(size.cols), false);
-        for c in old_len..usize::from(size.cols) {
-            self.tab_stops[c] = c % 8 == 0 && c != 0;
-        }
-        for row in &mut self.rows {
-            row.resize(size.cols, crate::Cell::new());
-        }
-        self.rows.resize(usize::from(size.rows), self.new_row());
-
-        if self.scroll_bottom >= size.rows {
-            self.scroll_bottom = size.rows - 1;
-        }
-        if self.scroll_bottom < self.scroll_top {
-            self.scroll_top = 0;
-        }
-
-        self.row_clamp_top(false);
-        self.row_clamp_bottom(false);
-        self.col_clamp();
-
-        if self.saved_pos.row > self.size.rows - 1 {
-            self.saved_pos.row = self.size.rows - 1;
-        }
-        if self.saved_pos.col > self.size.cols - 1 {
-            self.saved_pos.col = self.size.cols - 1;
-        }
     }
 
     pub fn pos(&self) -> Pos {
@@ -821,7 +781,8 @@ impl Grid {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
+            // saturating: on a one-row screen the previous row scrolls away entirely
+            prev_pos.row = prev_pos.row.saturating_sub(scrolled);
             let new_pos = self.pos;
             self.drawing_row_mut(prev_pos.row)
                 // we assume self.pos.row is always valid, and so prev_pos.row
