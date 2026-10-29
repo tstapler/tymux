@@ -611,6 +611,26 @@ impl Grid {
         self.scroll_top != 0 || self.scroll_bottom != self.size.rows - 1
     }
 
+    pub fn origin_mode(&self) -> bool {
+        self.origin_mode
+    }
+
+    /// 1-based `(top, bottom)`, or `(0, 0)` when the region is the whole screen.
+    pub fn scroll_region(&self) -> (u16, u16) {
+        if self.scroll_top == 0 && self.scroll_bottom == self.size.rows - 1 {
+            (0, 0)
+        } else {
+            (self.scroll_top + 1, self.scroll_bottom + 1)
+        }
+    }
+
+    pub fn tab_stops(&self) -> Vec<u16> {
+        (0..self.tab_stops.len())
+            .filter(|&c| self.tab_stops[c])
+            .map(|c| u16::try_from(c).unwrap_or(u16::MAX))
+            .collect()
+    }
+
     pub fn set_origin_mode(&mut self, mode: bool) {
         self.origin_mode = mode;
         self.set_pos(Pos { row: 0, col: 0 });

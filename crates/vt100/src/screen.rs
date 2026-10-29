@@ -3,15 +3,18 @@ use unicode_width::UnicodeWidthChar as _;
 
 const MAX_HYPERLINKS: usize = 4096;
 
-const MODE_APPLICATION_KEYPAD: u8 = 0b0000_0001;
-const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
-const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
-const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
-const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+const MODE_APPLICATION_KEYPAD: u16 = 0b0000_0001;
+const MODE_APPLICATION_CURSOR: u16 = 0b0000_0010;
+const MODE_HIDE_CURSOR: u16 = 0b0000_0100;
+const MODE_ALTERNATE_SCREEN: u16 = 0b0000_1000;
+const MODE_BRACKETED_PASTE: u16 = 0b0001_0000;
 // ANSI mode 4 (IRM), ANSI mode 20 (LNM), and DECAWM inverted so a fresh screen wraps by default
-const MODE_INSERT: u8 = 0b0010_0000;
-const MODE_NEWLINE: u8 = 0b0100_0000;
-const MODE_NO_AUTOWRAP: u8 = 0b1000_0000;
+const MODE_INSERT: u16 = 0b0010_0000;
+const MODE_NEWLINE: u16 = 0b0100_0000;
+const MODE_NO_AUTOWRAP: u16 = 0b1000_0000;
+const MODE_FOCUS_EVENTS: u16 = 1 << 8;
+// DECSCNM
+const MODE_REVERSE_VIDEO: u16 = 1 << 9;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -53,7 +56,9 @@ pub enum MouseProtocolEncoding {
 
     /// SGR-like encoding.
     Sgr,
-    // Urxvt,
+
+    /// urxvt-style decimal encoding (`?1015`).
+    Urxvt,
 }
 
 /// A designated 94-character set (SCS; xterm ctlseqs, "Controls beginning with ESC").
@@ -153,8 +158,11 @@ pub struct Screen {
     /// The previous graphic character, for REP; cleared by anything else.
     last_cluster: Option<String>,
     hyperlinks: Vec<(String, String)>,
+    title: String,
+    /// DECSCUSR 0-6.
+    cursor_style: u8,
 
-    modes: u8,
+    modes: u16,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
 }
@@ -174,6 +182,8 @@ impl Screen {
             saved_charsets: Charsets::default(),
             last_cluster: None,
             hyperlinks: vec![],
+            title: String::new(),
+            cursor_style: 0,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -591,6 +601,82 @@ impl Screen {
             .is_some_and(crate::row::Row::wrapped)
     }
 
+    /// The window title set with OSC 0 or OSC 2 (empty if never set).
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Whether focus in/out reporting (`?1004`) is on.
+    #[must_use]
+    pub fn focus_events(&self) -> bool {
+        self.mode(MODE_FOCUS_EVENTS)
+    }
+
+    /// Whether the whole screen is reverse video (DECSCNM, `?5`).
+    #[must_use]
+    pub fn reverse_video(&self) -> bool {
+        self.mode(MODE_REVERSE_VIDEO)
+    }
+
+    /// Whether cursor addressing is relative to the scroll region (DECOM, `?6`).
+    #[must_use]
+    pub fn origin_mode(&self) -> bool {
+        self.grid().origin_mode()
+    }
+
+    /// Whether the cursor wraps at the right margin (DECAWM, `?7`; on by default).
+    #[must_use]
+    pub fn autowrap(&self) -> bool {
+        !self.mode(MODE_NO_AUTOWRAP)
+    }
+
+    /// Whether characters are inserted rather than overwritten (IRM, ANSI mode 4).
+    #[must_use]
+    pub fn insert_mode(&self) -> bool {
+        self.mode(MODE_INSERT)
+    }
+
+    /// Whether LF also returns the carriage (LNM, ANSI mode 20).
+    #[must_use]
+    pub fn newline_mode(&self) -> bool {
+        self.mode(MODE_NEWLINE)
+    }
+
+    /// The DECSCUSR cursor style, 0 (default) through 6.
+    #[must_use]
+    pub fn cursor_style(&self) -> u8 {
+        self.cursor_style
+    }
+
+    /// The DECSTBM scroll region as 1-based `(top, bottom)` rows, or `(0, 0)`
+    /// when it covers the whole screen.
+    #[must_use]
+    pub fn scroll_region(&self) -> (u16, u16) {
+        self.grid().scroll_region()
+    }
+
+    /// The 0-based columns that currently have a tab stop.
+    #[must_use]
+    pub fn tab_stops(&self) -> Vec<u16> {
+        self.grid().tab_stops()
+    }
+
+    /// The designated character sets for G0-G3 (0 = ASCII, 1 = DEC special
+    /// graphics, 2 = UK) and the set currently locked into GL (0-3).
+    #[must_use]
+    pub fn charsets(&self) -> ([u8; 4], u8) {
+        let id = |c: Charset| match c {
+            Charset::Ascii => 0,
+            Charset::DecSpecial => 1,
+            Charset::Uk => 2,
+        };
+        (
+            self.charsets.g.map(id),
+            u8::try_from(self.charsets.gl).unwrap_or(0),
+        )
+    }
+
     /// Returns whether the alternate screen is currently in use.
     #[must_use]
     pub fn alternate_screen(&self) -> bool {
@@ -820,15 +906,15 @@ impl Screen {
         self.last_cluster = None;
     }
 
-    fn set_mode(&mut self, mode: u8) {
+    fn set_mode(&mut self, mode: u16) {
         self.modes |= mode;
     }
 
-    fn clear_mode(&mut self, mode: u8) {
+    fn clear_mode(&mut self, mode: u16) {
         self.modes &= !mode;
     }
 
-    fn mode(&self, mode: u8) -> bool {
+    fn mode(&self, mode: u16) -> bool {
         self.modes & mode != 0
     }
 
@@ -1415,6 +1501,7 @@ impl Screen {
         for param in params {
             match param {
                 [1] => self.set_mode(MODE_APPLICATION_CURSOR),
+                [5] => self.set_mode(MODE_REVERSE_VIDEO),
                 [6] => self.grid_mut().set_origin_mode(true),
                 [7] => self.clear_mode(MODE_NO_AUTOWRAP),
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),
@@ -1434,6 +1521,8 @@ impl Screen {
                 [1006] => {
                     self.set_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
+                [1015] => self.set_mouse_encoding(MouseProtocolEncoding::Urxvt),
+                [1004] => self.set_mode(MODE_FOCUS_EVENTS),
                 [1049] => {
                     self.decsc();
                     self.alternate_grid.clear();
@@ -1450,6 +1539,7 @@ impl Screen {
         for param in params {
             match param {
                 [1] => self.clear_mode(MODE_APPLICATION_CURSOR),
+                [5] => self.clear_mode(MODE_REVERSE_VIDEO),
                 [6] => self.grid_mut().set_origin_mode(false),
                 [7] => self.set_mode(MODE_NO_AUTOWRAP),
                 [9] => self.clear_mouse_mode(MouseProtocolMode::Press),
@@ -1478,6 +1568,8 @@ impl Screen {
                 [1006] => {
                     self.clear_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
+                [1015] => self.clear_mouse_encoding(MouseProtocolEncoding::Urxvt),
+                [1004] => self.clear_mode(MODE_FOCUS_EVENTS),
                 [1049] => {
                     self.exit_alternate_grid();
                     self.decrc();
@@ -1580,6 +1672,17 @@ impl Screen {
                 _ => unhandled(self),
             }
         }
+    }
+
+    // CSI Ps SP q (xterm ctlseqs, DECSCUSR); values past 6 are ignored
+    pub(crate) fn decscusr(&mut self, style: u16) {
+        if let Ok(style @ 0..=6) = u8::try_from(style) {
+            self.cursor_style = style;
+        }
+    }
+
+    pub(crate) fn set_title(&mut self, title: &[u8]) {
+        self.title = String::from_utf8_lossy(title).into_owned();
     }
 
     // CSI r

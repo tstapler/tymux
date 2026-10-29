@@ -23,7 +23,7 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
 
 impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     fn print(&mut self, c: char) {
-        if c == '\u{fffd}' || ('\u{80}'..'\u{a0}').contains(&c) {
+        if ('\u{80}'..'\u{a0}').contains(&c) {
             self.callbacks.unhandled_char(&mut self.screen, c);
         } else {
             self.screen.text(c);
@@ -194,6 +194,10 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 }
             },
             Some(b'!') if c == 'p' => self.screen.decstr(),
+            // DECSCUSR (xterm ctlseqs, "CSI Ps SP q")
+            Some(b' ') if c == 'q' && intermediates.len() == 1 => {
+                self.screen.decscusr(canonicalize_params_1(params, 0))
+            }
             Some(i) => {
                 self.callbacks.unhandled_csi(
                     &mut self.screen,
@@ -209,6 +213,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
         match params {
             [b"0", s] => {
+                self.screen.set_title(s);
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
@@ -216,6 +221,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
             }
             [b"2", s] => {
+                self.screen.set_title(s);
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
             [b"8", osc8_params, uri @ ..] if !uri.is_empty() => {

@@ -2,6 +2,8 @@
 /// the terminal contents.
 pub struct Parser<CB: crate::callbacks::Callbacks = ()> {
     parser: vte::Parser,
+    /// A trailing 0xC2 whose partner byte hasn't arrived yet (see `process`).
+    pending_c2: bool,
     screen: crate::perform::WrappedScreen<CB>,
 }
 
@@ -12,6 +14,7 @@ impl Parser {
     pub fn new(rows: u16, cols: u16, scrollback_len: usize) -> Self {
         Self {
             parser: vte::Parser::new(),
+            pending_c2: false,
             screen: crate::perform::WrappedScreen::new(rows, cols, scrollback_len),
         }
     }
@@ -25,6 +28,7 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
     pub fn new_with_callbacks(rows: u16, cols: u16, scrollback_len: usize, callbacks: CB) -> Self {
         Self {
             parser: vte::Parser::new(),
+            pending_c2: false,
             screen: crate::perform::WrappedScreen::new_with_callbacks(
                 rows,
                 cols,
@@ -36,8 +40,33 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
 
     /// Processes the contents of the given byte string, and updates the
     /// in-memory terminal state.
+    ///
+    /// C1 controls sent as UTF-8 code points (U+0080-U+009F, bytes `C2 80`-`C2 9F`)
+    /// act as the control, as in xterm's UTF-8 mode: each is rewritten to its
+    /// 7-bit `ESC` + `@`-`_` form before parsing. A `C2` can't be a UTF-8
+    /// continuation byte, so the rewrite never splits a longer character.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.screen, bytes);
+        if !self.pending_c2 && !bytes.contains(&0xC2) {
+            self.parser.advance(&mut self.screen, bytes);
+            return;
+        }
+        let mut out = Vec::with_capacity(bytes.len() + 4);
+        for &b in bytes {
+            if self.pending_c2 {
+                self.pending_c2 = false;
+                if (0x80..=0x9F).contains(&b) {
+                    out.extend_from_slice(&[0x1B, b - 0x40]);
+                    continue;
+                }
+                out.push(0xC2);
+            }
+            if b == 0xC2 {
+                self.pending_c2 = true;
+            } else {
+                out.push(b);
+            }
+        }
+        self.parser.advance(&mut self.screen, &out);
     }
 
     /// Returns a reference to a [`Screen`](crate::Screen) object containing

@@ -180,7 +180,8 @@ fn screen_matches_xterm_js_golden_grids() {
             .with_extension("");
         let name = rel.to_string_lossy().to_string();
         if !name.contains(&filter)
-            || name.starts_with("known_gap/")
+            || (name.starts_with("known_gap/")
+                && std::env::var_os("TYMUX_FIDELITY_KNOWN_GAPS").is_none())
             || XTERM_JS_QUIRKS.contains(&name.as_str())
         {
             continue;
