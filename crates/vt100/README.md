@@ -48,7 +48,7 @@ the fork is tested against (`tests/fidelity_golden.rs`); xterm behavior is from 
 | Invalid UTF-8 | prints U+FFFD per ill-formed sequence | xterm prints U+FFFD; xterm.js drops the bytes |
 | C1 U+008D (RI) as UTF-8 | acts as RI | xterm acts as RI; xterm.js ignores it |
 | DECSC/DECRC | saves DECOM and charset designations | same in xterm; xterm.js saves neither |
-| DECSTR (`CSI ! p`) | resets cursor style, cursor visibility, margins, origin, IRM, DECCKM/DECKPAM, charsets, SGR and the saved cursor; leaves bracketed paste, focus reporting and mouse modes | the same set (xterm `ReallyReset`, soft branch); only RIS clears the rest |
+| DECSTR (`CSI ! p`) | resets cursor style, cursor visibility, margins, origin, IRM, DECCKM/DECKPAM, charsets, SGR and the saved cursor; retains bracketed paste, focus reporting and mouse modes | xterm (`ReallyReset`, soft branch) retains the same three. xterm.js clears bracketed paste and focus reporting on DECSTR and keeps mouse tracking (oracle: `ESC[?2004h ESC[?1004h ESC[?1000h ESC[!p` gives `bracketedPasteMode` false, `sendFocusMode` false, mouse mode unchanged) |
 | OSC titles with 15 or more `;` | truncated: vte keeps 16 OSC parameters | xterm.js keeps the whole title |
 | GR shifts (LS1R/LS2R/LS3R), 96-char sets (`ESC - . /`) | ignored | honored by xterm (GR has no effect in UTF-8 mode) |
 | Unicode width table | `unicode-width` (newer than Unicode 11) | the web terminal loads xterm.js's Unicode 11 table; the corpus matches today, but emoji added after Unicode 11 would lay out differently |
@@ -58,3 +58,13 @@ every cursor move; alternate-screen switches (`?47`, `?1047`, `?1049`) carry the
 instead of homing it; RI blanks with the current background and never scrolls from above the top
 margin; a wide character that wraps blanks the last column with the current attributes; with DECAWM
 off the cursor parks at `cols` after a last-column write.
+
+Snapshot-redraw consequence of that DECSTR difference: after an app sends DECSTR, the browser's own
+xterm.js has already cleared bracketed paste and focus reporting, but this emulator still reports
+them on, so a client redraw built from a snapshot can switch them back on in a terminal that had
+turned them off. A consumer that cares can clear them itself when it sees DECSTR in the stream.
+
+The alternate-screen cursor carry (including `?1049h` while already on the alternate screen, which
+now keeps the screen and cursor) and DECAWM-off wide-character handling (cursor pulled back to the
+last column, no pending wrap) match xterm.js; no divergence survives in either, checked with the
+oracle.
