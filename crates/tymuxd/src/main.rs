@@ -512,8 +512,9 @@ fn resolve_live_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::P
 /// a live pty/broadcast channel.
 #[derive(Debug, PartialEq)]
 enum ForwardStep {
-    /// Forward this event to the client.
-    Emit(AttachEvent),
+    /// Forward this event to the client. Boxed: `AttachEvent` embeds a full `PaneSnapshot`,
+    /// far larger than the other variants.
+    Emit(Box<AttachEvent>),
     /// Don't forward anything, but the stream continues normally — used
     /// for output chunks already reflected in the priming snapshot.
     Skip,
@@ -554,23 +555,23 @@ fn forward_step_for_output_result(
             if seq <= threshold_seq {
                 ForwardStep::Skip
             } else if emit_output_chunk {
-                ForwardStep::Emit(AttachEvent {
+                ForwardStep::Emit(Box::new(AttachEvent {
                     payload: Some(attach_event::Payload::OutputChunk(OutputChunk {
                         seq,
                         data: bytes,
                     })),
-                })
+                }))
             } else {
-                ForwardStep::Emit(AttachEvent {
+                ForwardStep::Emit(Box::new(AttachEvent {
                     payload: Some(attach_event::Payload::Output(bytes)),
-                })
+                }))
             }
         }
         Err(RecvError::Lagged(n)) => {
             tracing::warn!(pane_id = %pane_id, skipped = n, "attach consumer lagged, output_gap signaled");
-            ForwardStep::Emit(AttachEvent {
+            ForwardStep::Emit(Box::new(AttachEvent {
                 payload: Some(attach_event::Payload::OutputGap(true)),
-            })
+            }))
         }
         Err(RecvError::Closed) => ForwardStep::End,
     }
@@ -1173,7 +1174,7 @@ impl TymuxService for TymuxDaemon {
                     result = output_rx.recv() => {
                         match forward_step_for_output_result(result, pane_for_exit.id, live_threshold_seq, emit_output_chunk) {
                             ForwardStep::Emit(event) => {
-                                if forward_tx.send(Ok(event)).await.is_err() {
+                                if forward_tx.send(Ok(*event)).await.is_err() {
                                     return;
                                 }
                             }
@@ -2871,9 +2872,7 @@ mod tests {
         let step = forward_step_for_output_result(Ok((1, b"hello".to_vec())), pane_id, 0, false);
         assert!(matches!(
             step,
-            ForwardStep::Emit(AttachEvent {
-                payload: Some(attach_event::Payload::Output(_))
-            })
+            ForwardStep::Emit(ev) if matches!(ev.payload, Some(attach_event::Payload::Output(_)))
         ));
     }
 
@@ -2888,9 +2887,7 @@ mod tests {
         );
         assert!(matches!(
             step,
-            ForwardStep::Emit(AttachEvent {
-                payload: Some(attach_event::Payload::OutputGap(true))
-            })
+            ForwardStep::Emit(ev) if matches!(ev.payload, Some(attach_event::Payload::OutputGap(true)))
         ));
     }
 
@@ -2948,9 +2945,7 @@ mod tests {
         assert!(
             matches!(
                 &step,
-                ForwardStep::Emit(AttachEvent {
-                    payload: Some(attach_event::Payload::OutputChunk(chunk))
-                }) if chunk.seq == 6 && chunk.data == b"live-after-replay"
+                ForwardStep::Emit(ev) if matches!(&ev.payload, Some(attach_event::Payload::OutputChunk(chunk)) if chunk.seq == 6 && chunk.data == b"live-after-replay")
             ),
             "expected an OutputChunk{{seq: 6, ..}} Emit, got {step:?}"
         );
@@ -3049,9 +3044,7 @@ mod tests {
         assert!(
             matches!(
                 forward_step_for_output_result(Ok((11, b"new-output".to_vec())), pane_id, snapshot_seq, false),
-                ForwardStep::Emit(AttachEvent {
-                    payload: Some(attach_event::Payload::Output(bytes))
-                }) if bytes == b"new-output"
+                ForwardStep::Emit(ev) if matches!(&ev.payload, Some(attach_event::Payload::Output(bytes)) if bytes == b"new-output")
             ),
             "a chunk newer than the snapshot's sequence must forward normally"
         );
@@ -3077,9 +3070,7 @@ mod tests {
         assert!(
             matches!(
                 first,
-                ForwardStep::Emit(AttachEvent {
-                    payload: Some(attach_event::Payload::OutputGap(true))
-                })
+                ForwardStep::Emit(ev) if matches!(ev.payload, Some(attach_event::Payload::OutputGap(true)))
             ),
             "first observed event after a burst past capacity must be OutputGap"
         );
@@ -3091,9 +3082,7 @@ mod tests {
         let second = forward_step_for_output_result(rx.recv().await, pane_id, 0, false);
         assert!(matches!(
             second,
-            ForwardStep::Emit(AttachEvent {
-                payload: Some(attach_event::Payload::Output(_))
-            })
+            ForwardStep::Emit(ev) if matches!(ev.payload, Some(attach_event::Payload::Output(_)))
         ));
     }
 
