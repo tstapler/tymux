@@ -14,25 +14,25 @@ fn at(p: &Parser, row: u16, col: u16) -> String {
 // 3. Operations that move or edit at the cursor must clear a pending wrap like xterm.js: the
 // next character then lands on the last column instead of wrapping to the next row.
 
-fn pending(op: &[u8], row: u16) -> Parser {
+fn pending(op: &[u8]) -> Parser {
     parse(4, 8, &[b"abcdefgh", op, b"X"].concat())
 }
 
 #[test]
 fn ich_dch_ech_clear_a_pending_wrap() {
     for op in [&b"\x1b[2@"[..], b"\x1b[2P", b"\x1b[3X"] {
-        let p = pending(op, 0);
+        let p = pending(op);
         assert_eq!(at(&p, 0, 7), "X", "{op:?}");
         assert_eq!(at(&p, 1, 0), "", "{op:?}");
     }
     // the characters before the cursor are untouched by ICH/DCH at the last column
-    assert_eq!(at(&pending(b"\x1b[2@", 0), 0, 6), "g");
+    assert_eq!(at(&pending(b"\x1b[2@"), 0, 6), "g");
 }
 
 #[test]
 fn decrc_and_csi_u_restore_a_pending_wrap_as_the_last_column() {
     for op in [&b"\x1b7\x1b8"[..], b"\x1b[s\x1b[u"] {
-        let p = pending(op, 0);
+        let p = pending(op);
         assert_eq!(at(&p, 0, 7), "X", "{op:?}");
         assert_eq!(at(&p, 1, 0), "", "{op:?}");
     }
@@ -40,10 +40,10 @@ fn decrc_and_csi_u_restore_a_pending_wrap_as_the_last_column() {
 
 #[test]
 fn ind_and_vpa_clear_a_pending_wrap_before_moving() {
-    let p = pending(b"\x1bD", 0);
+    let p = pending(b"\x1bD");
     assert_eq!(at(&p, 1, 7), "X");
     assert_eq!(at(&p, 0, 7), "h");
-    let p = pending(b"\x1b[2d", 0);
+    let p = pending(b"\x1b[2d");
     assert_eq!(at(&p, 1, 7), "X");
     assert_eq!(at(&p, 0, 7), "h");
 }
