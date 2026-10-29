@@ -860,17 +860,75 @@ impl Screen {
             .position(|(u, i)| u == uri && i == id);
         let index = match existing {
             Some(i) => i,
-            None if self.hyperlinks.len() < MAX_HYPERLINKS => {
-                self.hyperlinks.push((uri.to_string(), id.to_string()));
-                self.hyperlinks.len() - 1
-            }
-            // table full: leave the text unlinked rather than evict a live link
             None => {
-                self.attrs.hyperlink = 0;
-                return;
+                if self.hyperlinks.len() >= MAX_HYPERLINKS {
+                    self.compact_hyperlinks();
+                }
+                // still full: every entry is on screen, so leave the text unlinked rather than
+                // evict a live link
+                if self.hyperlinks.len() >= MAX_HYPERLINKS {
+                    self.attrs.hyperlink = 0;
+                    return;
+                }
+                // compaction renumbers entries, so the link may have been dropped or moved
+                match self
+                    .hyperlinks
+                    .iter()
+                    .position(|(u, i)| u == uri && i == id)
+                {
+                    Some(i) => i,
+                    None => {
+                        self.hyperlinks.push((uri.to_string(), id.to_string()));
+                        self.hyperlinks.len() - 1
+                    }
+                }
             }
         };
         self.attrs.hyperlink = u32::try_from(index + 1).unwrap_or(0);
+    }
+
+    /// Drops table entries no cell (visible, alternate screen or scrollback) and no saved or
+    /// current attribute set references, and renumbers the cells that remain.
+    fn compact_hyperlinks(&mut self) {
+        let mut live = vec![false; self.hyperlinks.len() + 1];
+        let mut mark = |index: u32| {
+            if let Some(slot) = live.get_mut(index as usize) {
+                *slot = true;
+            }
+        };
+        mark(self.attrs.hyperlink);
+        mark(self.saved_attrs.hyperlink);
+        for grid in [&mut self.grid, &mut self.alternate_grid] {
+            grid.cells_mut().for_each(|c| mark(c.hyperlink()));
+        }
+        live[0] = false;
+        if live.iter().all(|l| !l) {
+            self.hyperlinks.clear();
+            return;
+        }
+        if live.iter().skip(1).all(|l| *l) {
+            return; // nothing to reclaim
+        }
+
+        let mut remap = vec![0u32; live.len()];
+        let mut kept = Vec::with_capacity(self.hyperlinks.len());
+        for (old, entry) in std::mem::take(&mut self.hyperlinks).into_iter().enumerate() {
+            if live[old + 1] {
+                kept.push(entry);
+                remap[old + 1] = u32::try_from(kept.len()).unwrap_or(0);
+            }
+        }
+        self.hyperlinks = kept;
+        let renumber = |index: u32| remap.get(index as usize).copied().unwrap_or(0);
+        self.attrs.hyperlink = renumber(self.attrs.hyperlink);
+        self.saved_attrs.hyperlink = renumber(self.saved_attrs.hyperlink);
+        for grid in [&mut self.grid, &mut self.alternate_grid] {
+            for cell in grid.cells_mut() {
+                if cell.hyperlink() != 0 {
+                    cell.set_hyperlink(renumber(cell.hyperlink()));
+                }
+            }
+        }
     }
 
     // SCS: ESC ( ) * + <final> designates G0..G3.

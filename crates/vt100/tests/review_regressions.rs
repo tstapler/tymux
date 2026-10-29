@@ -250,3 +250,66 @@ fn uri_with_a_few_semicolons_still_links() {
         Some("https://e.com/a;b;c".to_string())
     );
 }
+
+// The hyperlink table holds 4096 entries; once full it must reclaim the ones no cell references
+// rather than drop every later link until RIS.
+
+fn emit_link(p: &mut Parser, n: usize) {
+    p.process(format!("\x1b]8;id=i{n};https://e.com/{n}\x1b\\x\x1b]8;;\x1b\\").as_bytes());
+}
+
+#[test]
+fn hyperlink_table_reclaims_dead_entries_when_full() {
+    let mut p = Parser::new(24, 80, 0);
+    p.process("\x1b]8;id=keep;https://keep.example/\x1b\\keep\x1b]8;;\x1b\\".as_bytes());
+    // every distinct link overwrites the same cell, so only the latest is ever visible
+    for n in 0..5000 {
+        p.process(b"\x1b[3;1H");
+        emit_link(&mut p, n);
+    }
+    p.process(b"\x1b[5;1H");
+    emit_link(&mut p, 99_999);
+    assert_eq!(
+        link_of(&p, 4, 0),
+        Some(("https://e.com/99999".into(), "i99999".into()))
+    );
+    // the last pre-compaction link and the old visible one still resolve to their own targets
+    assert_eq!(
+        link_of(&p, 2, 0),
+        Some(("https://e.com/4999".into(), "i4999".into()))
+    );
+    assert_eq!(
+        link_of(&p, 0, 0),
+        Some(("https://keep.example/".into(), "keep".into()))
+    );
+    assert_eq!(
+        link_of(&p, 0, 3),
+        Some(("https://keep.example/".into(), "keep".into()))
+    );
+}
+
+#[test]
+fn hyperlink_table_keeps_links_referenced_from_scrollback_and_the_alternate_screen() {
+    let mut p = Parser::new(5, 40, 100);
+    p.process(
+        "\x1b]8;id=sb;https://scrollback/\x1b\\s\x1b]8;;\x1b\\\r\n\r\n\r\n\r\n\r\n\r\n".as_bytes(),
+    );
+    p.process("\x1b[?1049h\x1b]8;id=alt;https://alt/\x1b\\a\x1b]8;;\x1b\\".as_bytes());
+    for n in 0..5000 {
+        p.process(b"\x1b[3;1H");
+        emit_link(&mut p, n);
+    }
+    p.process(b"\x1b[5;1H");
+    emit_link(&mut p, 99_999);
+    assert_eq!(link_of(&p, 4, 0).map(|l| l.1), Some("i99999".into()));
+    assert_eq!(
+        link_of(&p, 0, 0),
+        Some(("https://alt/".into(), "alt".into()))
+    );
+    p.process(b"\x1b[?1049l");
+    p.screen_mut().set_scrollback(usize::MAX);
+    assert_eq!(
+        link_of(&p, 0, 0),
+        Some(("https://scrollback/".into(), "sb".into()))
+    );
+}

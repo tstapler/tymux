@@ -124,6 +124,10 @@ impl Cell {
         }
     }
 
+    pub(crate) fn set_hyperlink(&mut self, index: u32) {
+        self.attrs.hyperlink = index;
+    }
+
     pub(crate) fn attrs(&self) -> &crate::attrs::Attrs {
         &self.attrs
     }

@@ -82,6 +82,14 @@ impl Grid {
         self.saved_origin_mode = false;
     }
 
+    /// Every stored cell: the visible rows and the scrollback.
+    pub fn cells_mut(&mut self) -> impl Iterator<Item = &mut crate::Cell> {
+        self.rows
+            .iter_mut()
+            .chain(self.scrollback.iter_mut())
+            .flat_map(crate::row::Row::cells_mut)
+    }
+
     pub fn size(&self) -> Size {
         self.size
     }
