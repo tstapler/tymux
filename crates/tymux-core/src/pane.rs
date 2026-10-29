@@ -665,70 +665,7 @@ impl Pane {
     fn snapshot_at_offset_with_seq(&self, offset: usize) -> (PaneSnapshot, u64) {
         let mut parser = self.parser.lock().unwrap();
         parser.screen_mut().set_scrollback(offset);
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-
-        let mut grid = Vec::with_capacity(rows as usize);
-        // screen-wide link index -> 1-based index into the snapshot's own table
-        let mut hyperlinks: Vec<(String, String)> = Vec::new();
-        let mut link_index = std::collections::HashMap::new();
-        for row in 0..rows {
-            let mut cells = Vec::with_capacity(cols as usize);
-            for col in 0..cols {
-                let snap = match screen.cell(row, col) {
-                    Some(cell) => {
-                        let hyperlink = match cell.hyperlink() {
-                            0 => 0,
-                            screen_idx => *link_index.entry(screen_idx).or_insert_with(|| {
-                                match screen.hyperlink(screen_idx) {
-                                    Some((uri, id)) => {
-                                        hyperlinks.push((uri.to_string(), id.to_string()));
-                                        hyperlinks.len() as u32
-                                    }
-                                    None => 0,
-                                }
-                            }),
-                        };
-                        CellSnapshot {
-                            text: cell.contents().to_string(),
-                            fg: pack_color(cell.fgcolor()),
-                            bg: pack_color(cell.bgcolor()),
-                            attrs: pack_attrs(cell),
-                            underline_style: pack_underline_style(cell.underline_style()),
-                            underline_color: pack_color(cell.ulcolor()),
-                            hyperlink,
-                        }
-                    }
-                    None => CellSnapshot {
-                        text: String::new(),
-                        fg: 0,
-                        bg: 0,
-                        attrs: 0,
-                        underline_style: 0,
-                        underline_color: 0,
-                        hyperlink: 0,
-                    },
-                };
-                cells.push(snap);
-            }
-            grid.push(cells);
-        }
-
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let cursor_pending_wrap = screen.cursor_pending_wrap();
-        let cursor_col = cursor_col.min(cols.saturating_sub(1));
-        let title = screen.title().to_string();
-        let modes = terminal_modes(screen);
-        let cursor_hidden = screen.hide_cursor();
-        let cursor_style = u32::from(screen.cursor_style());
-        let alt_screen = screen.alternate_screen();
-        let (scroll_top, scroll_bottom) = screen.scroll_region();
-        let tab_stops = screen.tab_stops().into_iter().map(u32::from).collect();
-        let (g, gl) = screen.charsets();
-        let charsets = Charsets {
-            g: g.map(u32::from),
-            gl: u32::from(gl),
-        };
+        let snapshot = snapshot_from_screen(parser.screen());
         // Reset the scroll position back to live — this method is a
         // point-in-time query, not a persistent view change; leaving the
         // parser scrolled would corrupt normal (offset-0) reads from any
@@ -739,27 +676,7 @@ impl Pane {
         // `process(..)` (Task 1.3.1a) — so this value and the grid just
         // built above can never disagree about which bytes are reflected.
         let seq = self.output_seq.load(Ordering::SeqCst);
-        (
-            PaneSnapshot {
-                rows: rows as u32,
-                cols: cols as u32,
-                grid,
-                cursor_row: cursor_row as u32,
-                cursor_col: cursor_col as u32,
-                cursor_pending_wrap,
-                hyperlinks,
-                title,
-                modes,
-                cursor_hidden,
-                cursor_style,
-                alt_screen,
-                scroll_top: u32::from(scroll_top),
-                scroll_bottom: u32::from(scroll_bottom),
-                tab_stops,
-                charsets,
-            },
-            seq,
-        )
+        (snapshot, seq)
     }
 
     /// Forward-only, next-match search through scrollback for `pattern`
@@ -813,6 +730,93 @@ impl Drop for Pane {
         }
         release_scrollback_budget(self.scrollback_lines);
         release_replay_budget(self.replay_budget_bytes);
+    }
+}
+
+/// Everything a snapshot holds that is computed from the emulator's screen alone (the caller
+/// owns locking and the output sequence). Pure, so it can be tested by feeding bytes to a
+/// `vt100::Parser` with no pty or shell involved.
+fn snapshot_from_screen(screen: &vt100::Screen) -> PaneSnapshot {
+    let (rows, cols) = screen.size();
+
+    let mut grid = Vec::with_capacity(rows as usize);
+    // screen-wide link index -> 1-based index into the snapshot's own table
+    let mut hyperlinks: Vec<(String, String)> = Vec::new();
+    let mut link_index = std::collections::HashMap::new();
+    for row in 0..rows {
+        let mut cells = Vec::with_capacity(cols as usize);
+        for col in 0..cols {
+            let snap = match screen.cell(row, col) {
+                Some(cell) => {
+                    let hyperlink = match cell.hyperlink() {
+                        0 => 0,
+                        screen_idx => *link_index.entry(screen_idx).or_insert_with(|| match screen
+                            .hyperlink(screen_idx)
+                        {
+                            Some((uri, id)) => {
+                                hyperlinks.push((uri.to_string(), id.to_string()));
+                                hyperlinks.len() as u32
+                            }
+                            None => 0,
+                        }),
+                    };
+                    CellSnapshot {
+                        text: cell.contents().to_string(),
+                        fg: pack_color(cell.fgcolor()),
+                        bg: pack_color(cell.bgcolor()),
+                        attrs: pack_attrs(cell),
+                        underline_style: pack_underline_style(cell.underline_style()),
+                        underline_color: pack_color(cell.ulcolor()),
+                        hyperlink,
+                    }
+                }
+                None => CellSnapshot {
+                    text: String::new(),
+                    fg: 0,
+                    bg: 0,
+                    attrs: 0,
+                    underline_style: 0,
+                    underline_color: 0,
+                    hyperlink: 0,
+                },
+            };
+            cells.push(snap);
+        }
+        grid.push(cells);
+    }
+
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let cursor_pending_wrap = screen.cursor_pending_wrap();
+    let cursor_col = cursor_col.min(cols.saturating_sub(1));
+    let title = screen.title().to_string();
+    let modes = terminal_modes(screen);
+    let cursor_hidden = screen.hide_cursor();
+    let cursor_style = u32::from(screen.cursor_style());
+    let alt_screen = screen.alternate_screen();
+    let (scroll_top, scroll_bottom) = screen.scroll_region();
+    let tab_stops = screen.tab_stops().into_iter().map(u32::from).collect();
+    let (g, gl) = screen.charsets();
+    let charsets = Charsets {
+        g: g.map(u32::from),
+        gl: u32::from(gl),
+    };
+    PaneSnapshot {
+        rows: u32::from(rows),
+        cols: u32::from(cols),
+        grid,
+        cursor_row: u32::from(cursor_row),
+        cursor_col: u32::from(cursor_col),
+        cursor_pending_wrap,
+        hyperlinks,
+        title,
+        modes,
+        cursor_hidden,
+        cursor_style,
+        alt_screen,
+        scroll_top: u32::from(scroll_top),
+        scroll_bottom: u32::from(scroll_bottom),
+        tab_stops,
+        charsets,
     }
 }
 
@@ -902,25 +906,22 @@ mod tests {
         assert_eq!((m.mouse_mode, m.mouse_encoding), (2, 2));
     }
 
+    /// Feeds `bytes` to a fresh emulator and snapshots it: no pty, shell or timing involved.
+    fn snapshot_of(rows: u16, cols: u16, bytes: &[u8]) -> PaneSnapshot {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(bytes);
+        snapshot_from_screen(parser.screen())
+    }
+
     #[test]
     fn snapshot_should_carry_title_cursor_scroll_region_tab_stops_and_charsets() {
-        let pane = Pane::spawn("/bin/sh", 10, 40).unwrap();
-        pane.write_input(
-            b"printf '\\033]2;my title\\007\\033[5 q\\033[?25l\\033[3;7r\\033[1;4H\\033H\\033)0\\016done'\n",
-        )
-        .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let snap = loop {
-            let snap = pane.snapshot();
-            if snap.title == "my title" && snap.charsets.gl == 1 {
-                break snap;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "printf output never reached the pane"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let snap = snapshot_of(
+            10,
+            40,
+            b"\x1b]2;my title\x07\x1b[5 q\x1b[?25l\x1b[3;7r\x1b[1;4H\x1bH\x1b)0\x0edone",
+        );
+        assert_eq!(snap.title, "my title");
+        assert_eq!(snap.charsets.gl, 1);
         assert_eq!(snap.cursor_style, 5);
         assert!(snap.cursor_hidden);
         assert_eq!((snap.scroll_top, snap.scroll_bottom), (3, 7));
@@ -931,21 +932,40 @@ mod tests {
 
     #[test]
     fn snapshot_should_clamp_cursor_col_and_flag_a_pending_wrap() {
-        let pane = Pane::spawn("/bin/sh", 10, 40).unwrap();
-        let forty = "x".repeat(40);
-        pane.write_input(format!("printf '%s' {forty}; exec sleep 60\n").as_bytes())
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let snap = loop {
-            let snap = pane.snapshot();
-            if snap.cursor_pending_wrap {
-                break snap;
-            }
-            assert!(Instant::now() < deadline, "the row never filled");
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        let snap = snapshot_from_screen(parser.screen());
         assert_eq!(snap.cursor_col, 39, "cursor_col must stay inside the grid");
         assert!(snap.cursor_col < snap.cols);
+        assert!(snap.cursor_pending_wrap);
+
+        // any cursor movement clears the pending wrap
+        for mv in [&b"\x1b[C"[..], b"\x1b[D", b"\x1b[1;1H", b"\r"] {
+            let mut p = vt100::Parser::new(10, 40, 0);
+            p.process("x".repeat(40).as_bytes());
+            p.process(mv);
+            let snap = snapshot_from_screen(p.screen());
+            assert!(!snap.cursor_pending_wrap, "{mv:?}");
+            assert!(snap.cursor_col < snap.cols, "{mv:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_should_clamp_the_cursor_after_a_resize_and_across_the_alternate_screen() {
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        parser.screen_mut().set_size(10, 20);
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(snap.cols, 20);
+        assert!(snap.cursor_col < snap.cols);
+        assert!(!snap.cursor_pending_wrap);
+
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        parser.process(b"\x1b[?1049h");
+        let snap = snapshot_from_screen(parser.screen());
+        assert!(snap.alt_screen);
+        assert_eq!(snap.cursor_col, 39, "the carried cursor is still clamped");
     }
 
     #[test]
@@ -988,27 +1008,11 @@ mod tests {
 
     #[test]
     fn snapshot_should_carry_underline_style_color_and_deduped_hyperlinks() {
-        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
-        // the doubled quote keeps the typed command line from matching the marker we wait for
-        pane.write_input(
-            b"printf '\\033[4:3;58:2::9:8:7mUL\\033[0m \\033]8;;https://a.test\\033\\\\LI\\033]8;;\\033\\\\ \\033]8;;https://a.test\\033\\\\NK\\033]8;;\\033\\\\ DO''NE\\n'\n",
-        )
-        .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let snap = loop {
-            let snap = pane.snapshot();
-            let text: String = snap
-                .grid
-                .iter()
-                .flatten()
-                .map(|c| c.text.as_str())
-                .collect();
-            if text.contains("DONE") && text.contains("ULLI NK") || Instant::now() > deadline {
-                break snap;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let snap = snapshot_of(
+            24,
+            80,
+            b"\x1b[4:3;58:2::9:8:7mUL\x1b[0m \x1b]8;;https://a.test\x1b\\LI\x1b]8;;\x1b\\ \x1b]8;;https://a.test\x1b\\NK\x1b]8;;\x1b\\ DONE\r\n",
+        );
 
         let cells: Vec<&CellSnapshot> = snap
             .grid
@@ -1016,7 +1020,6 @@ mod tests {
             .flatten()
             .filter(|c| c.text == "U" || c.text == "L" || c.text == "N")
             .collect();
-        // the typed command line echoes a plain "U" too; the printed one is the underlined cell
         let ul = cells
             .iter()
             .find(|c| c.text == "U" && c.attrs & 2 != 0)
