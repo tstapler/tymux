@@ -341,10 +341,11 @@ message SearchScrollbackResponse {
   string line = 3;
 }
 
-// CapturePane on a pane whose child has exited (but whose pane is still tracked) returns its last
-// grid with liveness = DEAD rather than an error, so a client can still show the final output.
-// Only a pane the daemon no longer holds a screen for (reloaded from disk after a restart) is
-// FAILED_PRECONDITION.
+// CapturePane and SearchScrollback on a pane whose child has exited (but whose pane the daemon
+// still holds) serve its last screen, with liveness = DEAD on the snapshot, rather than an error,
+// so a client can still show the final output. Attach, input and resize still need a running
+// pane. A pane the daemon holds no screen for (reloaded from disk after a restart) is
+// FAILED_PRECONDITION for all of them.
 message PaneSnapshot {
   string pane_id = 1;
   uint32 rows = 2;
@@ -368,7 +369,8 @@ message PaneSnapshot {
   // The cursor sits past the last column (cursor_col is clamped to cols-1); the next printed
   // character wraps to the next row, or overwrites the last column when DECAWM is off.
   bool cursor_pending_wrap = 18;
-  // Set only when liveness is DEAD: the exited child's exit code, if it was captured.
+  // Set only when liveness is DEAD: the exited child's exit code, if it was captured. A child
+  // killed by a signal reports 1, not 128+signal (portable-pty 0.8.1 collapses signal deaths).
   optional int32 exit_code = 19;
 }
 

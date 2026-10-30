@@ -184,6 +184,10 @@ impl std::fmt::Display for StdinError {
 
 impl std::error::Error for StdinError {}
 
+/// Largest pane size `Pane::resize` accepts; larger requests are clamped.
+pub const MAX_PANE_ROWS: u16 = 500;
+pub const MAX_PANE_COLS: u16 = 1000;
+
 pub struct PaneSnapshot {
     pub rows: u32,
     pub cols: u32,
@@ -583,6 +587,9 @@ impl Pane {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        // Every row of scrollback and screen costs cols x ~44 bytes, so an absurd client size
+        // would pin gigabytes; clamp instead of trusting the wire value.
+        let (rows, cols) = (rows.min(MAX_PANE_ROWS), cols.min(MAX_PANE_COLS));
         self.master.lock().unwrap().resize(PtySize {
             rows,
             cols,

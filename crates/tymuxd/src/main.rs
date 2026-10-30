@@ -500,10 +500,24 @@ fn resolve_live_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::P
     match engine.pane_lookup(pane_id) {
         PaneLookup::Live(pane) => Ok(pane),
         PaneLookup::Dead => Err(Status::failed_precondition(format!(
-            "pane exited — run 'tymux revive <session_id>' to respawn it (pane_id={pane_id})"
+            "pane is not running and cannot be attached to or written to: its child exited, or \
+             it was restored from disk without a screen (pane_id={pane_id}). Its last screen is \
+             still readable with CapturePane/SearchScrollback while the daemon holds it; a \
+             restored pane can be respawned with ReviveSession"
         ))),
         PaneLookup::Unknown => Err(Status::not_found("no such pane")),
     }
+}
+
+/// For read-only screen RPCs (CapturePane, SearchScrollback): the pane if it is running, or if its
+/// child exited but the daemon still holds its last screen. A pane known only from a persisted
+/// record has no screen, so it keeps the `FAILED_PRECONDITION` of [`resolve_live_pane`].
+#[allow(clippy::result_large_err)]
+fn resolve_readable_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::Pane>, Status> {
+    resolve_live_pane(engine, pane_id).or_else(|status| match engine.exited_pane(pane_id) {
+        Some(pane) => Ok(pane),
+        None => Err(status),
+    })
 }
 
 /// What one `output_rx.recv()` result means for the attach forwarding
@@ -747,18 +761,9 @@ impl TymuxService for TymuxDaemon {
     ) -> Result<Response<ProtoSnapshot>, Status> {
         let req = request.into_inner();
         let pane_id = parse_uuid(&req.pane_id)?;
-        // An exited pane still holds its last screen; hand that back marked DEAD instead of an
-        // error. Only a pane with no screen left (persisted record, unknown id) is an error.
-        let pane = match resolve_live_pane(&self.engine, pane_id) {
-            Ok(pane) => pane,
-            Err(status) => match self.engine.exited_pane(pane_id) {
-                Some(pane) => pane,
-                None => {
-                    tracing::warn!(pane_id = %pane_id, code = ?status.code(), "capture_pane: pane unavailable");
-                    return Err(status);
-                }
-            },
-        };
+        let pane = resolve_readable_pane(&self.engine, pane_id).inspect_err(|status| {
+            tracing::warn!(pane_id = %pane_id, code = ?status.code(), "capture_pane: pane unavailable");
+        })?;
         let live = !pane.is_exited();
         let mut snapshot = snapshot_to_proto(
             &req.pane_id,
@@ -777,7 +782,7 @@ impl TymuxService for TymuxDaemon {
     ) -> Result<Response<SearchScrollbackResponse>, Status> {
         let req = request.into_inner();
         let pane_id = parse_uuid(&req.pane_id)?;
-        let pane = resolve_live_pane(&self.engine, pane_id).inspect_err(|status| {
+        let pane = resolve_readable_pane(&self.engine, pane_id).inspect_err(|status| {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "search_scrollback: pane unavailable");
         })?;
         match pane.search_scrollback(&req.pattern, req.start_offset as usize) {
@@ -1222,8 +1227,10 @@ impl TymuxService for TymuxDaemon {
                             engine_for_input.report_viewport_and_recompute(
                                 window_id,
                                 client_id,
-                                r.rows as u16,
-                                r.cols as u16,
+                                // saturate rather than wrap (65536 would become 0); Pane::resize
+                                // clamps to the supported maximum
+                                u16::try_from(r.rows).unwrap_or(u16::MAX),
+                                u16::try_from(r.cols).unwrap_or(u16::MAX),
                             );
                         } else {
                             tracing::warn!(pane_id = %pane_for_input.id, "resize: pane's window not found, ignoring");
@@ -2754,6 +2761,21 @@ mod tests {
             .flat_map(|r| r.cells.iter().map(|c| c.text.as_str()))
             .collect();
         assert!(text.contains("last-words"), "last screen kept: {text:?}");
+
+        // SearchScrollback serves the same exited pane's screen
+        let found = daemon
+            .search_scrollback(Request::new(SearchScrollbackRequest {
+                pane_id: snap.pane_id.clone(),
+                pattern: "last-words".to_string(),
+                start_offset: 0,
+            }))
+            .await
+            .expect("an exited pane's screen is searchable")
+            .into_inner();
+        assert!(
+            found.found,
+            "pattern should be found on the exited pane's last screen"
+        );
 
         let unknown_err = daemon
             .capture_pane(Request::new(capture_req(Uuid::new_v4().to_string())))

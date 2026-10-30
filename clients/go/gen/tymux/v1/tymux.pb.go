@@ -1546,10 +1546,11 @@ func (x *SearchScrollbackResponse) GetLine() string {
 	return ""
 }
 
-// CapturePane on a pane whose child has exited (but whose pane is still tracked) returns its last
-// grid with liveness = DEAD rather than an error, so a client can still show the final output.
-// Only a pane the daemon no longer holds a screen for (reloaded from disk after a restart) is
-// FAILED_PRECONDITION.
+// CapturePane and SearchScrollback on a pane whose child has exited (but whose pane the daemon
+// still holds) serve its last screen, with liveness = DEAD on the snapshot, rather than an error,
+// so a client can still show the final output. Attach, input and resize still need a running
+// pane. A pane the daemon holds no screen for (reloaded from disk after a restart) is
+// FAILED_PRECONDITION for all of them.
 type PaneSnapshot struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	PaneId    string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
@@ -1574,7 +1575,8 @@ type PaneSnapshot struct {
 	// The cursor sits past the last column (cursor_col is clamped to cols-1); the next printed
 	// character wraps to the next row, or overwrites the last column when DECAWM is off.
 	CursorPendingWrap bool `protobuf:"varint,18,opt,name=cursor_pending_wrap,json=cursorPendingWrap,proto3" json:"cursor_pending_wrap,omitempty"`
-	// Set only when liveness is DEAD: the exited child's exit code, if it was captured.
+	// Set only when liveness is DEAD: the exited child's exit code, if it was captured. A child
+	// killed by a signal reports 1, not 128+signal (portable-pty 0.8.1 collapses signal deaths).
 	ExitCode      *int32 `protobuf:"varint,19,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
