@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::replay_buffer::{
     allocate_replay_budget, release_replay_budget, ReplayBuffer, ReplayOutcome,
 };
+use crate::terminal_query::{strip_queries, PtyReplyOut, QueryReplies, QueryResponder};
 
 /// Epic 5 Story 5.4: vt100's third `Parser::new` arg (how many
 /// scrolled-off lines it keeps) is now a real per-pane budget, not the
@@ -94,12 +95,12 @@ pub struct Pane {
     pub command: String,
     pub launch: Launch,
     pub cwd: String,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Write end of the `stdin_stream` pipe; `None` once closed, or when the
     /// pane was not created with `stdin_stream`.
     stdin_writer: Mutex<Option<std::fs::File>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<QueryResponder>>>,
     /// Mirrors the `vt100::Parser` screen's current size, updated by
     /// [`Self::resize`] right after the screen itself is resized. Lets
     /// [`Self::size`] answer "what size is this pane right now" without
@@ -386,12 +387,22 @@ impl Pane {
         } = prepared;
         drop(stdin);
 
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
 
         let scrollback_lines = allocate_scrollback_budget();
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback_lines)));
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
+        let replies = Arc::new(QueryReplies::new(Box::new(PtyReplyOut {
+            tx: output_tx.clone(),
+            writer: writer.clone(),
+            fd: pair.master.as_raw_fd(),
+        })));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            scrollback_lines,
+            QueryResponder::new(replies.clone()),
+        )));
         let replay_budget_bytes = allocate_replay_budget();
 
         let effective_cwd = cwd.map(str::to_string).unwrap_or_else(|| {
@@ -404,7 +415,7 @@ impl Pane {
             command: command.to_string(),
             launch: launch.clone(),
             cwd: effective_cwd,
-            writer: Mutex::new(writer),
+            writer,
             stdin_writer: Mutex::new(stdin_writer),
             master: Mutex::new(pair.master),
             parser: parser.clone(),
@@ -450,12 +461,21 @@ impl Pane {
                         // standalone lock never nested with `parser`
                         // (already dropped above) — see the `replay`
                         // field's doc comment.
-                        pane_for_reader.replay.lock().unwrap().push(seq, &buf[..n]);
+                        // Queries are stripped so a resuming client never re-answers one the
+                        // daemon (or an earlier client) already answered.
+                        pane_for_reader
+                            .replay
+                            .lock()
+                            .unwrap()
+                            .push(seq, &strip_queries(&buf[..n]));
                         // Fails only when nobody is currently attached (no
                         // receivers) — expected and benign (e.g. shell
                         // startup output before the first Attach), not an
                         // error worth logging.
-                        let _ = output_tx.send((seq, buf[..n].to_vec()));
+                        let delivered = output_tx.send((seq, buf[..n].to_vec())).is_ok();
+                        // Replies parked because a client was attached when the query was
+                        // parsed: if that client already detached, nobody saw the query.
+                        replies.settle(delivered);
                     }
                 }
             }
@@ -1091,6 +1111,84 @@ mod tests {
     fn is_exited_should_return_false_when_process_still_running() {
         let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
         assert!(!pane.is_exited());
+    }
+
+    fn screen_rows(pane: &Pane) -> Vec<String> {
+        pane.snapshot()
+            .grid
+            .iter()
+            .map(|row| row.iter().map(|c| c.text.as_str()).collect::<String>())
+            .collect()
+    }
+
+    fn wait_for_row(pane: &Pane, want: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(row) = screen_rows(pane).into_iter().find(|r| want(r.trim_end())) {
+                return row.trim_end().to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "row never appeared: {:?}",
+                screen_rows(pane)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Puts the tty in raw no-echo mode (so the script itself never echoes onto the screen),
+    /// clears the screen, prints `abc\r\n  xy`, sends `query`, reads up to `reply_len` reply bytes (1s cap via VTIME)
+    /// and returns the `GOT:<od output>:END` row.
+    fn run_query_script(pane: &Pane, query: &str, reply_len: usize) -> String {
+        pane.write_input(b"stty raw -echo min 0 time 10; echo READY\n")
+            .unwrap();
+        wait_for_row(pane, |r| r == "READY");
+        let script = format!(
+            "printf '\\033[2J\\033[Habc\\r\\n  xy'; printf '{query}'; \
+             r=$(dd bs=1 count={reply_len} 2>/dev/null | od -An -c | tr -s ' '); echo \"GOT:$r:END\"\n"
+        );
+        pane.write_input(script.as_bytes()).unwrap();
+        wait_for_row(pane, |r| r.contains("GOT:") && r.ends_with(":END"))
+    }
+
+    #[test]
+    fn terminal_query_should_be_answered_by_the_daemon_when_no_client_is_attached() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        // CPR after "abc\r\n  xy": real cursor is row 2, col 5 => ESC [ 2 ; 5 R
+        let text = run_query_script(&pane, "\\033[6n", 6);
+        assert!(
+            text.contains("GOT: 033 [ 2 ; 5 R :END"),
+            "expected the cursor-position reply, got: {text}"
+        );
+    }
+
+    #[test]
+    fn terminal_query_should_not_be_answered_by_the_daemon_when_a_client_is_attached() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let _attached = pane.subscribe();
+        let text = run_query_script(&pane, "\\033[6n", 6);
+        assert!(
+            text.contains("GOT::END"),
+            "an attached client answers queries; the daemon must stay silent, got: {text}"
+        );
+    }
+
+    #[test]
+    fn replay_buffer_should_not_contain_queries_so_a_resuming_client_cannot_answer_them_twice() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        pane.write_input(b"printf 'before\\033[6nafter'; echo\n")
+            .unwrap();
+        wait_for_row(&pane, |r| r.contains("beforeafter"));
+        let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
+            panic!("expected the whole history to be retained");
+        };
+        let bytes: Vec<u8> = chunks.into_iter().flat_map(|(_, b)| b).collect();
+        assert!(
+            !bytes.windows(4).any(|w| w == b"\x1b[6n"),
+            "replay must not carry the query: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("beforeafter"));
     }
 
     #[test]

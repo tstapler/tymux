@@ -6,6 +6,7 @@ mod persistence;
 mod replay_buffer;
 #[cfg(unix)]
 mod spawn;
+mod terminal_query;
 
 pub use engine::{
     ClosePaneOutcome, Engine, EngineError, LayoutSnapshot, PaneEntry, PaneInfo, PaneLookup,

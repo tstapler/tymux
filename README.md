@@ -112,6 +112,18 @@ solved — see that README for why.
 See `docs/reviews/is-it-ready-2026-07-13.md` for the pre-v1.0 readiness
 review this status section originally drew from.
 
+## Terminal queries with no client attached
+
+While no client is attached to a pane, `tymuxd` answers the terminal queries a
+program may block on at startup: DA1/DA2, DSR 5 and 6 (cursor position from the
+real emulator cursor), XTVERSION, DECRQM, XTWINOPS 18/19 size reports and
+OSC 4/10/11/12 colour queries (xterm.js default palette). With a client
+attached the daemon stays silent and the client's emulator answers, so the
+program never sees duplicate replies. Replies are rate-limited, and queries are
+stripped from the replay buffer so a resuming client does not answer them again.
+The kitty keyboard query (`CSI ? u`) is deliberately left unanswered: claiming
+support would make programs enable a protocol the browser client does not speak.
+
 ## Known Limitations
 
 - **Scrollback content does not survive a daemon restart** — only
