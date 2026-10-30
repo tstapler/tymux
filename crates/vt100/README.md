@@ -31,6 +31,12 @@ live in the stapler-squad repo under `session/tymux/testdata/fidelity`; set `TYM
 to it to run everything, and note the subset is a copy that may lag it. `TYMUX_FIDELITY_FILTER`,
 `TYMUX_FIDELITY_VERBOSE=1` and `TYMUX_FIDELITY_KNOWN_GAPS=1` narrow or widen the run.
 
+`tests/fidelity_resize.rs` replays resize scenarios (`tests/fixtures/fidelity-resize/golden/`) and
+diffs the grid, scrollback, cursor, scroll region and tab stops against xterm.js after every step.
+The cases live in `fixtures/fidelity-resize/generate/cases.mjs`; `bun install && bun generate.mjs`
+there rewrites the goldens (xterm.js 6.0.0 headless, Unicode 11). `TYMUX_RESIZE_FILTER`,
+`TYMUX_RESIZE_VERBOSE=1` and `TYMUX_RESIZE_DUMP=1` narrow the run and print the grids.
+
 ## Known deviations
 
 Where this fork and xterm differ, on purpose or by omission. "xterm.js" is the reference terminal
@@ -52,6 +58,9 @@ the fork is tested against (`tests/fidelity_golden.rs`); xterm behavior is from 
 | OSC titles with 15 or more `;` | truncated: vte keeps 16 OSC parameters | xterm.js keeps the whole title |
 | GR shifts (LS1R/LS2R/LS3R), 96-char sets (`ESC - . /`) | ignored | honored by xterm (GR has no effect in UTF-8 mode) |
 | Unicode width table | `unicode-width` (newer than Unicode 11) | the web terminal loads xterm.js's Unicode 11 table; the corpus matches today, but emoji added after Unicode 11 would lay out differently |
+| Resize | the primary screen reflows soft-wrapped lines (scrollback included) like xterm.js: lines holding the cursor are left alone, cells with only a background colour are not carried across a rewrap, resize resets the scroll region, and a wide glyph pushed to the next row by the edge marks a soft wrap. Tab stops are reapplied from the nearest stop below the new width, which re-adds stops cleared with TBC | same (ported from xterm.js 6.0.0's `Buffer.resize`/`BufferReflow`) |
+| Resize, alternate screen | no reflow; a narrowing resize crops for good | xterm.js keeps the cropped cells and shows them again when the screen widens |
+| Tab stops past the width | dropped on a narrowing resize | xterm.js keeps them |
 
 Matching xterm.js on purpose: a pending wrap is cleared by ICH/DCH/ECH/DECRC/CSI u/IND/VPA and
 every cursor move; alternate-screen switches (`?47`, `?1047`, `?1049`) carry the cursor across

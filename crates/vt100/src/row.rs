@@ -2,8 +2,8 @@ use crate::term::BufWrite as _;
 
 #[derive(Clone, Debug)]
 pub struct Row {
-    cells: Vec<crate::Cell>,
-    wrapped: bool,
+    pub(crate) cells: Vec<crate::Cell>,
+    pub(crate) wrapped: bool,
 }
 
 /// Per-thread tallies the bounded-work tests read: how many rows were allocated and how many

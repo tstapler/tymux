@@ -218,9 +218,9 @@ impl Screen {
 
     /// Resizes the terminal.
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        self.grid.set_size(crate::grid::Size { rows, cols });
-        self.alternate_grid
-            .set_size(crate::grid::Size { rows, cols });
+        let size = crate::grid::Size { rows, cols };
+        self.grid.set_size(size, true);
+        self.alternate_grid.set_size(size, false);
     }
 
     /// Returns the current size of the terminal.
@@ -1136,6 +1136,10 @@ impl Screen {
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+        if width > size.cols {
+            // a wide glyph can't fit a one-column screen (and `cols - width` would underflow)
+            return;
+        }
 
         if width == 1 && pos.col < size.cols && !self.mode(MODE_INSERT) {
             // Common case: a single-width character landing inside the row on a plain cell needs
@@ -1181,7 +1185,9 @@ impl Screen {
                 // self.grid().pos() which we assume to always have a valid
                 // row value. size.cols - 1 is also always a valid column.
                 .unwrap();
-            if last_cell.has_contents() || last_cell.is_wide_continuation() {
+            // a wide character pushed down by the edge always marks a soft wrap (as xterm.js does),
+            // so a later reflow rejoins it with the line above
+            if last_cell.has_contents() || last_cell.is_wide_continuation() || width > 1 {
                 wrap = true;
             }
         }
