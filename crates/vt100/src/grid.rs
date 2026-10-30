@@ -482,7 +482,14 @@ impl Grid {
         self.erase_row_backward(attrs);
         self.current_row_mut().wrap(false);
         if pos.col + 1 >= cols {
-            if let Some(next) = self.rows.get_mut(usize::from(pos.row) + 1) {
+            // Matches an xterm.js bug on purpose: it indexes the absolute line list here
+            // (`lines.get(j + 1)`) without adding ybase, so with scrollback the link it clears is
+            // a scrollback line's, not the row below the cursor's. The README lists it.
+            let abs = usize::from(pos.row) + 1;
+            let sb = self.scrollback.len();
+            if abs < sb {
+                self.scrollback[abs].wrap(false);
+            } else if let Some(next) = self.rows.get_mut(abs - sb) {
                 next.wrap(false);
             }
         }
@@ -565,6 +572,8 @@ impl Grid {
     // IL/DL (ECMA-48 8.3.67/8.3.32, xterm): no-ops outside the scroll region, and the cursor
     // returns to the left margin.
     pub fn insert_lines(&mut self, count: u16) {
+        // xterm.js restricts the cursor (cancelling a pending wrap) before the region check
+        self.col_clamp();
         if !self.in_scroll_region() {
             return;
         }
@@ -576,6 +585,7 @@ impl Grid {
     }
 
     pub fn delete_lines(&mut self, count: u16) {
+        self.col_clamp();
         if !self.in_scroll_region() {
             return;
         }
@@ -593,7 +603,9 @@ impl Grid {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
-            if self.scrollback_len > 0 && !self.scroll_region_active() {
+            // xterm.js keeps scrolled-off rows whenever the region starts at the top row, even if
+            // it ends above the last one; a region starting lower just drops them
+            if self.scrollback_len > 0 && self.scroll_top == 0 {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
@@ -639,10 +651,6 @@ impl Grid {
         self.pos.row >= self.scroll_top && self.pos.row <= self.scroll_bottom
     }
 
-    fn scroll_region_active(&self) -> bool {
-        self.scroll_top != 0 || self.scroll_bottom != self.size.rows - 1
-    }
-
     pub fn origin_mode(&self) -> bool {
         self.origin_mode
     }
@@ -682,6 +690,8 @@ impl Grid {
         if scrolled == 0 && self.pos.row == before + 1 {
             self.current_row_mut().wrap(false);
         }
+        // and a cursor parked past the last column stays on it instead of wrapping
+        self.col_clamp();
     }
 
     pub fn row_inc_scroll(&mut self, count: u16) -> u16 {

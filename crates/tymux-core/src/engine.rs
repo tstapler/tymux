@@ -57,6 +57,15 @@ pub enum PaneEntry {
     Dead(PersistedPaneRecord),
 }
 
+/// The one place a client-reported viewport is clamped to what a pane can actually run at, so the
+/// window size the engine stores and returns equals the panes' real size.
+fn clamp_viewport(rows: u16, cols: u16) -> (u16, u16) {
+    (
+        rows.clamp(MIN_PANE_ROWS, crate::pane::MAX_PANE_ROWS),
+        cols.clamp(MIN_PANE_COLS, crate::pane::MAX_PANE_COLS),
+    )
+}
+
 /// The three-way outcome of looking up a pane by id, replacing the old
 /// `Option<Arc<Pane>>` (which collapsed "exited" and "never existed" into
 /// the same `None`).
@@ -929,8 +938,7 @@ impl Engine {
         // manual release verification — every subsequent operation on
         // that pane, and transitively on Engine-wide state depending on
         // the call path, then fails forever until the daemon restarts).
-        let rows = rows.max(MIN_PANE_ROWS);
-        let cols = cols.max(MIN_PANE_COLS);
+        let (rows, cols) = clamp_viewport(rows, cols);
         self.viewports
             .lock()
             .unwrap()
@@ -1337,6 +1345,18 @@ mod tests {
     /// tree order — used by tests that need to address specific panes
     /// after multiple splits, where the top-level `Split`'s `children`
     /// only exposes the immediate two.
+    /// Makes every resize of these panes take `ms` milliseconds (see `Pane::resize_delay_ms`).
+    fn delay_resizes(engine: &Engine, pane_ids: &[Uuid], ms: u64) {
+        for id in pane_ids {
+            match engine.pane_lookup(*id) {
+                PaneLookup::Live(pane) => pane
+                    .resize_delay_ms
+                    .store(ms, std::sync::atomic::Ordering::SeqCst),
+                _ => panic!("pane must be live"),
+            }
+        }
+    }
+
     fn leaf_ids(node: &LayoutSnapshot) -> Vec<Uuid> {
         match node {
             LayoutSnapshot::Leaf(info) => vec![info.id],
@@ -1393,6 +1413,36 @@ mod tests {
             pane.size(),
             (MIN_PANE_ROWS as u32, MIN_PANE_COLS as u32),
             "the pane itself must have been resized to the clamped floor, not 0x0"
+        );
+    }
+
+    #[test]
+    fn report_viewport_and_recompute_should_clamp_oversized_report_to_what_the_pane_runs_at() {
+        let engine = Engine::new();
+        let id = engine
+            .create_session("test".to_string(), sh(), None)
+            .unwrap();
+        let sessions = engine.list_sessions();
+        let window_id = sessions.iter().find(|s| s.id == id).unwrap().windows[0].id;
+        let pane_id = sole_pane_id(sessions.iter().find(|s| s.id == id).unwrap());
+
+        let client = engine.new_client_id();
+        let (rows, cols) = engine
+            .report_viewport_and_recompute(window_id, client, 9000, 1500)
+            .expect("window exists");
+
+        assert_eq!(
+            (rows, cols),
+            (crate::pane::MAX_PANE_ROWS, crate::pane::MAX_PANE_COLS)
+        );
+        let pane = match engine.pane_lookup(pane_id) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("pane must still be Live"),
+        };
+        assert_eq!(
+            pane.size(),
+            (u32::from(rows), u32::from(cols)),
+            "the size reported to the client is the size the pane really has"
         );
     }
 
@@ -1896,13 +1946,18 @@ mod tests {
             .create_session("unrelated".to_string(), sh(), None)
             .unwrap();
 
-        // Trigger the real, genuinely-slow window resize on a background
-        // thread: 1200 rows x 4800 cols split across 4 leaves is ~1200 x
-        // 1200 cells each. Effective window size is the dimension-wise
+        // Trigger a genuinely-slow window resize on a background thread (each of the 4 panes'
+        // resize takes ~100ms via the test hook; huge sizes can't be used since the engine
+        // clamps to 500 x 1000). Effective window size is the dimension-wise
         // *minimum* across every registered viewport (ADR-004), so this
         // reuses `setup_client`'s id (rather than registering a second,
         // smaller-in-one-dimension client) to actually grow the window
         // instead of being clamped back down to the 24x2000 setup size.
+        delay_resizes(
+            &engine,
+            &leaf_ids(&resize_session_snapshot(&engine).windows[0].layout),
+            100,
+        );
         let engine_for_resize = engine.clone();
         let resize_start = std::time::Instant::now();
         let resize_thread = std::thread::spawn(move || {
@@ -1995,9 +2050,13 @@ mod tests {
 
         let client_slow = engine.new_client_id();
         let client_fast = engine.new_client_id();
+        delay_resizes(
+            &engine,
+            &leaf_ids(&session_snapshot(&engine).windows[0].layout),
+            150,
+        );
 
-        // Large enough that vt100's screen reallocation is genuinely slow
-        // (same calibration as the test above).
+        // Clamped to the maximum pane size; the pane's resize is slowed by the test hook above.
         const SLOW_ROWS: u16 = 1200;
         const SLOW_COLS: u16 = 2400;
         const FAST_ROWS: u16 = 30;
