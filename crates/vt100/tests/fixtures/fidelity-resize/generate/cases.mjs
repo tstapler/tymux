@@ -134,4 +134,53 @@ export const cases = [
     scrollback: 10,
     steps: [w(lines(50, (i) => `${i} ${ruler(100)}`)), r(24, 40), r(24, 80), r(12, 80), r(24, 120)],
   },
+
+  // --- soft-wrap link bookkeeping: which edits break or keep the link between a row and the one
+  // above it. Each op runs on a 12-column screen holding one wrapped line, then the screen widens.
+  ...[
+    ["el2", `${E}[2;1H${E}[2K`],
+    ["el0_at_col0", `${E}[2;1H${E}[K`],
+    ["ed0_at_col0", `${E}[2;1H${E}[J`],
+    ["il", `${E}[2;1H${E}[L`],
+    ["dl", `${E}[1;1H${E}[M`],
+    ["lf_into_continuation", `${E}[1;1H\n`],
+    ["rewrite_then_crlf", `${E}[1;1Hab${nl}`],
+    ["ich_last_col", `${E}[1;12H${E}[2@`],
+    ["dch_last_col", `${E}[1;12H${E}[P`],
+    ["ech_last_col", `${E}[1;12H${E}[X`],
+    ["insert_mode_on_continuing_row", `${E}[4h${E}[1;1Hab${E}[4l`],
+  ].map(([op, seq]) => ({
+    name: `wrap_link_${op}`,
+    note: "xterm.js keeps or breaks the soft-wrap link per edit; widening must agree",
+    rows: 6,
+    cols: 12,
+    steps: [w("x hellox hellox hello"), w(`${seq}${E}[4;1H`), r(6, 20), r(6, 12)],
+  })),
+  {
+    name: "wrap_link_in_scroll_region",
+    note: "a wrapped line written inside a DECSTBM region, region reset, then widen",
+    rows: 6,
+    cols: 12,
+    steps: [w(`${E}[2;5r${E}[2;1Hx hellox hellox hello${E}[r${E}[6;1H`), r(6, 20), r(6, 12)],
+  },
+  {
+    name: "wrap_link_blank_continuation_after_lfs",
+    note: "50 chars widened, then four LFs and a char on the old continuation rows, then shrink",
+    rows: 5,
+    cols: 10,
+    steps: [w(ruler(50)), r(5, 20), w(`${E}[3;1H\n\n\n\nq`), r(5, 10), r(5, 20)],
+  },
+  {
+    name: "wide_glyph_cropped_at_right_edge",
+    note: "xterm.js keeps a wide glyph's cell when a shrink crops it and shows it again on grow",
+    cols: 26,
+    steps: [w("日本語日本語0123456789😀😀abc".repeat(3)), r(9, 11), r(4, 21), r(24, 26)],
+  },
+  {
+    name: "decrc_without_save_after_resize",
+    note: "restoring a cursor that was never saved goes to the origin, even after rows were pulled in",
+    rows: 3,
+    cols: 10,
+    steps: [w("abcdefghij".repeat(5)), r(11, 10), w(`${E}8`), w(`${E}[?1049h${E}[?1049l`)],
+  },
 ];

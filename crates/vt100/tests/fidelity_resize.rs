@@ -143,12 +143,59 @@ fn decode_line(v: &Value, cols: usize) -> Vec<Cell> {
     out
 }
 
-/// Checkpoints where this crate knowingly differs from xterm.js; each is listed in README.md.
-const KNOWN_DEVIATIONS: &[(&str, usize)] = &[
-    // xterm.js keeps alternate-screen cells that a narrowing resize cropped and shows them again
-    // when the screen widens; the crop is final here.
-    ("alt_screen_does_not_reflow", 4),
+/// Column of a `grid rN cM: ...` difference.
+fn grid_col(diff: &str) -> Option<u16> {
+    let rest = diff.strip_prefix("grid r")?;
+    let after_c = rest.split_once(" c")?.1;
+    after_c.split(':').next()?.parse().ok()
+}
+
+/// A documented difference from xterm.js (see README.md): the case, the checkpoint index and a
+/// predicate for the diffs that are masked. Everything else at that checkpoint is still compared.
+struct Deviation {
+    case: &'static str,
+    step: usize,
+    masks: fn(&str) -> bool,
+}
+
+/// xterm.js keeps alternate-screen cells that a narrowing resize cropped and shows them again when
+/// the screen widens; the crop is final here (the case narrows to 60 columns).
+fn alt_screen_cropped_cells(diff: &str) -> bool {
+    grid_col(diff).is_some_and(|c| c >= 60)
+}
+
+/// xterm.js keeps the first half of a wide glyph cut by a narrowing resize (the cell at column 10
+/// of the first row); here the lone half is blanked.
+fn cropped_wide_glyph(diff: &str) -> bool {
+    diff.starts_with("grid r0 c10:")
+}
+
+const KNOWN_DEVIATIONS: &[Deviation] = &[
+    Deviation {
+        case: "alt_screen_does_not_reflow",
+        step: 4,
+        masks: alt_screen_cropped_cells,
+    },
+    Deviation {
+        case: "wide_glyph_cropped_at_right_edge",
+        step: 1,
+        masks: cropped_wide_glyph,
+    },
+    Deviation {
+        case: "wide_glyph_cropped_at_right_edge",
+        step: 2,
+        masks: cropped_wide_glyph,
+    },
+    Deviation {
+        case: "wide_glyph_cropped_at_right_edge",
+        step: 3,
+        masks: cropped_wide_glyph,
+    },
 ];
+
+/// Number of cases in `fixtures/fidelity-resize/generate/cases.mjs`; a lower count of goldens
+/// means some were deleted or never regenerated. Bump it when a case is added.
+const EXPECTED_CASES: usize = 37;
 
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fidelity-resize/golden")
@@ -253,7 +300,12 @@ fn resize_scenarios_match_xterm_js_after_every_step() {
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
     paths.sort();
-    assert!(!paths.is_empty(), "no resize goldens in {:?}", dir());
+    assert!(
+        paths.len() >= EXPECTED_CASES,
+        "{} resize goldens in {:?}, expected {EXPECTED_CASES} (see cases.mjs)",
+        paths.len(),
+        dir()
+    );
 
     let mut failing = vec![];
     let mut total = 0;
@@ -283,8 +335,11 @@ fn resize_scenarios_match_xterm_js_after_every_step() {
             }
             let mut diffs = vec![];
             check_checkpoint(&mut parser, &v["checkpoints"][i], &mut diffs);
-            if !diffs.is_empty() && KNOWN_DEVIATIONS.contains(&(name.as_str(), i)) {
-                diffs.clear();
+            for dev in KNOWN_DEVIATIONS
+                .iter()
+                .filter(|d| d.case == name && d.step == i)
+            {
+                diffs.retain(|d| !(dev.masks)(d));
             }
             if !diffs.is_empty() {
                 case_diffs += diffs.len();

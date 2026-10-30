@@ -3,6 +3,7 @@ use crate::term::BufWrite as _;
 #[derive(Clone, Debug)]
 pub struct Row {
     pub(crate) cells: Vec<crate::Cell>,
+    /// xterm.js's `isWrapped`: this row continues the previous row's logical line.
     pub(crate) wrapped: bool,
 }
 
@@ -77,27 +78,20 @@ impl Row {
         #[cfg(test)]
         work::CELLS_INSERTED.with(|c| c.set(c.get() + 1));
         self.cells.insert(usize::from(i), cell);
-        self.wrapped = false;
     }
 
     pub fn remove(&mut self, i: u16) {
         self.clear_wide(i);
         self.cells.remove(usize::from(i));
-        self.wrapped = false;
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
-        let wide = self.cells[usize::from(i)].is_wide();
         self.clear_wide(i);
         self.cells[usize::from(i)].clear(attrs);
-        if i == self.cols() - if wide { 2 } else { 1 } {
-            self.wrapped = false;
-        }
     }
 
     pub fn truncate(&mut self, len: u16) {
         self.cells.truncate(usize::from(len));
-        self.wrapped = false;
         let last_cell = &mut self.cells[usize::from(len) - 1];
         if last_cell.is_wide() {
             last_cell.clear(*last_cell.attrs());
@@ -114,13 +108,13 @@ impl Row {
                 *last = cell;
             }
         }
-        self.wrapped = false;
     }
 
     pub fn wrap(&mut self, wrap: bool) {
         self.wrapped = wrap;
     }
 
+    /// Whether this row continues the previous row's logical line.
     pub fn wrapped(&self) -> bool {
         self.wrapped
     }
@@ -310,6 +304,8 @@ impl Row {
         row: u16,
         wrapping: bool,
         prev_wrapping: bool,
+        continues: bool,
+        prev_continues: bool,
         mut prev_pos: crate::grid::Pos,
         mut prev_attrs: crate::attrs::Attrs,
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
@@ -438,7 +434,7 @@ impl Row {
         // wrapped, we need to redraw the last character without erasing it to
         // position the cursor after the end of the line correctly so that
         // drawing the next line can just start writing and be wrapped.
-        if (!self.wrapped && prev.wrapped) || (!prev.wrapped && self.wrapped) {
+        if continues != prev_continues {
             let end_pos = if self.cells[usize::from(self.cols() - 1)].is_wide_continuation() {
                 crate::grid::Pos {
                     row,
@@ -452,7 +448,7 @@ impl Row {
             };
             crate::term::MoveFromTo::new(prev_pos, end_pos).write_buf(contents);
             prev_pos = end_pos;
-            if !self.wrapped {
+            if !continues {
                 crate::term::EraseChar::new(1).write_buf(contents);
             }
             let end_cell = &self.cells[usize::from(end_pos.col)];

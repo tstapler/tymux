@@ -702,10 +702,11 @@ export const SearchScrollbackResponseSchema: GenMessage<SearchScrollbackResponse
   messageDesc(file_tymux_v1_tymux, 22);
 
 /**
- * CapturePane on a pane whose child has exited (but whose pane is still tracked) returns its last
- * grid with liveness = DEAD rather than an error, so a client can still show the final output.
- * Only a pane the daemon no longer holds a screen for (reloaded from disk after a restart) is
- * FAILED_PRECONDITION.
+ * CapturePane and SearchScrollback on a pane whose child has exited (but whose pane the daemon
+ * still holds) serve its last screen, with liveness = DEAD on the snapshot, rather than an error,
+ * so a client can still show the final output. Attach, input and resize still need a running
+ * pane. A pane the daemon holds no screen for (reloaded from disk after a restart) is
+ * FAILED_PRECONDITION for all of them.
  *
  * @generated from message tymux.v1.PaneSnapshot
  */
@@ -820,7 +821,8 @@ export type PaneSnapshot = Message<"tymux.v1.PaneSnapshot"> & {
   cursorPendingWrap: boolean;
 
   /**
-   * Set only when liveness is DEAD: the exited child's exit code, if it was captured.
+   * Set only when liveness is DEAD: the exited child's exit code, if it was captured. A child
+   * killed by a signal reports 1, not 128+signal (portable-pty 0.8.1 collapses signal deaths).
    *
    * @generated from field: optional int32 exit_code = 19;
    */
