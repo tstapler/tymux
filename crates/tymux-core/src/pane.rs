@@ -1157,8 +1157,11 @@ mod tests {
         let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
         // CPR after "abc\r\n  xy": real cursor is row 2, col 5 => ESC [ 2 ; 5 R
         let text = run_query_script(&pane, "\\033[6n", 6);
+        // od's column padding differs between platforms; compare without whitespace
         assert!(
-            text.contains("GOT: 033 [ 2 ; 5 R :END"),
+            text.split_whitespace()
+                .collect::<String>()
+                .contains("GOT:033[2;5R:END"),
             "expected the cursor-position reply, got: {text}"
         );
     }
@@ -1169,7 +1172,9 @@ mod tests {
         let _attached = pane.subscribe();
         let text = run_query_script(&pane, "\\033[6n", 6);
         assert!(
-            text.contains("GOT::END"),
+            text.split_whitespace()
+                .collect::<String>()
+                .contains("GOT::END"),
             "an attached client answers queries; the daemon must stay silent, got: {text}"
         );
     }
