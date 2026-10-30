@@ -242,12 +242,13 @@ impl Lines {
     fn reflow_smaller(&mut self, old_cols: usize, new_cols: usize, new_rows: usize) {
         let mut to_insert: Vec<(usize, Vec<Row>)> = vec![]; // (index just past the group, new lines)
         let mut count_to_insert = 0usize;
-        let mut y = self.lines.len();
+        // xterm's `lines.pop()` only shrinks its logical length; the popped lines stay readable
+        // by index and the scan below (bounded by the original length) keeps processing them, so
+        // `live_len` stands in for the length and `self.lines` keeps every line until the end.
+        let mut live_len = self.lines.len();
+        let mut y = live_len;
         while y > 0 {
             y -= 1;
-            if y >= self.lines.len() {
-                continue; // a pop below shortened the list
-            }
             if !self.lines[y].wrapped && trimmed_len(&self.lines[y]) <= new_cols {
                 continue;
             }
@@ -271,10 +272,10 @@ impl Lines {
             let last_len = trimmed_len(&group[n - 1]);
             let dest = new_line_lengths(&group, old_cols, new_cols);
             let to_add = dest.len() as i64 - n as i64;
-            let trimmed = if self.ybase == 0 && self.y + 1 != self.lines.len() {
+            let trimmed = if self.ybase == 0 && self.y + 1 != live_len {
                 (self.y as i64 - self.max_len as i64 + to_add).max(0)
             } else {
-                (self.lines.len() as i64 - self.max_len as i64 + to_add).max(0)
+                (live_len as i64 - self.max_len as i64 + to_add).max(0)
             };
             let add = to_add.max(0) as usize;
             count_to_insert += add;
@@ -339,12 +340,12 @@ impl Lines {
                 if self.ybase == 0 {
                     if self.y + 1 < new_rows {
                         self.y += 1;
-                        self.lines.pop();
+                        live_len = live_len.saturating_sub(1);
                     } else {
                         self.ybase += 1;
                     }
                 } else {
-                    let cap = self.max_len.min(self.lines.len() + count_to_insert);
+                    let cap = self.max_len.min(live_len + count_to_insert);
                     if (self.ybase as i64) < cap as i64 - new_rows as i64 {
                         self.ybase += 1;
                     }
@@ -363,6 +364,7 @@ impl Lines {
             }
         }
 
+        self.lines.truncate(live_len);
         if to_insert.is_empty() {
             return;
         }
@@ -390,6 +392,10 @@ impl Grid {
     /// Resizes to `size`. `reflow` rewraps soft-wrapped lines to the new width (the primary
     /// screen); the alternate screen passes `false` and just crops/extends.
     pub fn set_size(&mut self, size: Size, reflow: bool) {
+        // xterm.js ignores a resize to the current size: margins and a pending wrap survive it.
+        if size == self.size {
+            return;
+        }
         let old_cols = usize::from(self.size.cols);
         let (new_cols, new_rows) = (usize::from(size.cols), usize::from(size.rows));
         let old_rows = usize::from(self.size.rows);

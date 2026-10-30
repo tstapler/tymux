@@ -141,6 +141,10 @@ pub struct Pane {
     /// already reflected in a given snapshot and must not be replayed.
     output_seq: AtomicU64,
     exited: Arc<AtomicBool>,
+    /// Test hook: makes `resize` take at least this long, standing in for the slow reallocation
+    /// huge sizes used to cause (the size clamp removed that).
+    #[cfg(test)]
+    pub(crate) resize_delay_ms: std::sync::atomic::AtomicU64,
     exit_notify: Notify,
     /// The child's numeric exit code, captured by the reader thread's
     /// `_child.wait()` call right after it observes EOF (Story 1.2.2).
@@ -184,7 +188,8 @@ impl std::fmt::Display for StdinError {
 
 impl std::error::Error for StdinError {}
 
-/// Largest pane size `Pane::resize` accepts; larger requests are clamped.
+/// Largest pane size `Pane::resize` accepts; larger requests are clamped (the engine clamps
+/// viewport reports to the same bound so the size it reports is the size the pane runs at).
 pub const MAX_PANE_ROWS: u16 = 500;
 pub const MAX_PANE_COLS: u16 = 1000;
 
@@ -411,6 +416,8 @@ impl Pane {
             output_tx: output_tx.clone(),
             output_seq: AtomicU64::new(0),
             exited: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            resize_delay_ms: std::sync::atomic::AtomicU64::new(0),
             exit_notify: Notify::new(),
             exit_code: Mutex::new(None),
             pid,
@@ -590,6 +597,15 @@ impl Pane {
         // Every row of scrollback and screen costs cols x ~44 bytes, so an absurd client size
         // would pin gigabytes; clamp instead of trusting the wire value.
         let (rows, cols) = (rows.min(MAX_PANE_ROWS), cols.min(MAX_PANE_COLS));
+        // A client re-sending its size must not reset the scroll region or pending wrap under a
+        // running full-screen program, and there is nothing to tell the child.
+        if self.size() == (u32::from(rows), u32::from(cols)) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        std::thread::sleep(std::time::Duration::from_millis(
+            self.resize_delay_ms.load(Ordering::SeqCst),
+        ));
         self.master.lock().unwrap().resize(PtySize {
             rows,
             cols,

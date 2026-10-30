@@ -63,6 +63,8 @@ the fork is tested against (`tests/fidelity_golden.rs`); xterm behavior is from 
 | Tab stops past the width | dropped on a narrowing resize | xterm.js keeps them |
 | Resize, wide glyph cut by a narrowing resize on a line that is not reflowed (the cursor's line) | the cropped first half is blanked | xterm.js keeps the half and draws it again when the screen widens (`wide_glyph_cropped_at_right_edge`) |
 | Soft-wrap links | stored on the continuation row and edited exactly where xterm.js edits them (EL/ED from column 0, IL/DL, LF, autowrap); ICH/DCH/ECH and insert mode leave them alone | same |
+| ED 1 with the cursor in the last column | clears the wrap link of absolute line `row + 1` (counting scrollback), copying an xterm.js bug: it omits `ybase`, so with scrollback the link it clears belongs to a scrollback line | same (`ed1_in_last_column_clears_absolute_line_wrap`) |
+| Reflow row pops | a pop of blank rows below the cursor leaves the popped lines readable and the shrinking-reflow scan still rewrites them, as in xterm.js | same (`reflow_pop_keeps_scanning_stale_lines`) |
 | Scrollback width | scrollback rows keep the width they were scrolled out at (blank beyond it) until a reflow touches them or they are scrolled into view | xterm.js resizes every line |
 
 Matching xterm.js on purpose: a pending wrap is cleared by ICH/DCH/ECH/DECRC/CSI u/IND/VPA and
