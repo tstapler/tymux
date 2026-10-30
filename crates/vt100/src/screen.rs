@@ -1608,7 +1608,7 @@ impl Screen {
 
     // CSI S
     pub(crate) fn su(&mut self, count: u16) {
-        self.grid_mut().scroll_up(count);
+        self.grid_mut().scroll_up_discard(count);
     }
 
     // CSI T

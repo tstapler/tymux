@@ -597,7 +597,19 @@ impl Grid {
         }
     }
 
+    /// Scroll driven by LF/IND/autowrap: rows leaving a region that starts at the top row go to
+    /// scrollback.
     pub fn scroll_up(&mut self, count: u16) {
+        self.scroll_region_up(count, true);
+    }
+
+    /// Explicit SU (`CSI n S`): xterm.js shifts the region's rows in place and never feeds
+    /// scrollback, even for a whole-screen region.
+    pub fn scroll_up_discard(&mut self, count: u16) {
+        self.scroll_region_up(count, false);
+    }
+
+    fn scroll_region_up(&mut self, count: u16, feed_scrollback: bool) {
         // scrolling by the region's height already blanks it; more is wasted work
         for _ in 0..count.min(self.scroll_bottom - self.scroll_top + 1) {
             self.rows
@@ -605,7 +617,7 @@ impl Grid {
             let removed = self.rows.remove(usize::from(self.scroll_top));
             // xterm.js keeps scrolled-off rows whenever the region starts at the top row, even if
             // it ends above the last one; a region starting lower just drops them
-            if self.scrollback_len > 0 && self.scroll_top == 0 {
+            if feed_scrollback && self.scrollback_len > 0 && self.scroll_top == 0 {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
@@ -831,18 +843,14 @@ impl Grid {
     }
 
     // Autowrap: the cursor moves to the next row's first column and that row is marked as
-    // continuing the one above (xterm.js sets `isWrapped` on the new row, always, even when the
-    // last cell of the old row was empty).
+    // continuing the one above. xterm.js does this unconditionally: even when the cursor is
+    // already on the last row, below the scroll region, where it can't move down and keeps
+    // overwriting that row, the row is still flagged, and the last cell being empty doesn't matter.
     pub fn col_wrap(&mut self, width: u16) {
         if self.pos.col > self.size.cols - width {
-            let prev_row = self.pos.row;
             self.pos.col = 0;
-            let scrolled = self.row_inc_scroll(1);
-            // saturating: on a one-row screen the previous row scrolls away entirely
-            let prev_row = prev_row.saturating_sub(scrolled);
-            let moved = prev_row + 1 == self.pos.row;
-            // we assume self.pos.row is always valid
-            self.current_row_mut().wrap(moved);
+            self.row_inc_scroll(1);
+            self.current_row_mut().wrap(true);
         }
     }
 

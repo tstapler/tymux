@@ -170,7 +170,19 @@ fn cropped_wide_glyph(diff: &str) -> bool {
     diff.starts_with("grid r0 c10:")
 }
 
+/// With scrollback 0 xterm.js's buffer cap is `rows`, yet a shrinking reflow can advance `ybase`
+/// past it; the circular list then wraps and the last visible row is a stale line from the top.
+/// Only the cursor and size still have to match.
+fn zero_scrollback_overflow(diff: &str) -> bool {
+    !diff.starts_with("cursor")
+}
+
 const KNOWN_DEVIATIONS: &[Deviation] = &[
+    Deviation {
+        case: "reflow_overflow_with_zero_scrollback",
+        step: 1,
+        masks: zero_scrollback_overflow,
+    },
     Deviation {
         case: "alt_screen_does_not_reflow",
         step: 4,
@@ -195,7 +207,7 @@ const KNOWN_DEVIATIONS: &[Deviation] = &[
 
 /// Number of cases in `fixtures/fidelity-resize/generate/cases.mjs`; a lower count of goldens
 /// means some were deleted or never regenerated. Bump it when a case is added.
-const EXPECTED_CASES: usize = 43;
+const EXPECTED_CASES: usize = 47;
 
 /// `TYMUX_RESIZE_GOLDEN_DIR` points the test at another directory of goldens (e.g. a fuzz run);
 /// the committed-count check is skipped then.

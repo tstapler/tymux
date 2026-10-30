@@ -232,4 +232,33 @@ export const cases = [
     cols: 6,
     steps: [w("abcdef"), w("\n"), w("g"), w(`${E}[1;1Habcdef${E}[B`), w("h")],
   },
+  {
+    name: "su_region_from_top_never_feeds_scrollback",
+    note: "explicit SU shifts a top-anchored region in place; unlike LF it never feeds scrollback (fuzz f202_377)",
+    rows: 6,
+    cols: 10,
+    steps: [w(lines(4, (i) => `line${i}`)), w(`${E}[1;3r${E}[2S${E}[1K`), r(6, 20)],
+  },
+  {
+    name: "su_whole_screen_never_feeds_scrollback",
+    note: "SU on the whole screen drops the rows it scrolls off instead of keeping them (fuzz f202_106)",
+    rows: 4,
+    cols: 10,
+    steps: [w(lines(8, (i) => `line${i}`)), w(`${E}[2J${E}[1S`), w(`${E}[2S`), r(4, 20)],
+  },
+  {
+    name: "wrap_on_last_row_below_region_flags_the_row",
+    note: "autowrap on the last row below the scroll region can't move down but still marks that row as a continuation (fuzz f777_402)",
+    rows: 6,
+    cols: 10,
+    steps: [w(`${E}[2;4r${E}[6;1H${"x".repeat(25)}`), r(6, 20), r(6, 10)],
+  },
+  {
+    name: "reflow_overflow_with_zero_scrollback",
+    note: "scrollback 0: a shrinking reflow pushes xterm.js's ybase past its buffer cap and its last visible row then shows a stale line from the top of its circular list; known deviation (fuzz f777_63, minimized)",
+    rows: 7,
+    cols: 26,
+    scrollback: 0,
+    steps: [w(`sduxhaqpqadlylkinyvavhzdetjaafadmvcekmmpkvqlpgdbyeewicmxrnhhabiuxlqbvpcsscrqmxetaiuegttdoghmyd${nl}psnqwupcwedvjaalbrmrxbkxmhwybuvef`), r(9, 9)],
+  },
 ];
