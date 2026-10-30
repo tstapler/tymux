@@ -303,23 +303,23 @@ impl Screen {
             std::cmp::Ordering::Less => {
                 let (_, cols) = self.size();
                 let mut contents = String::new();
-                for (i, row) in self
+                for (i, (row, continues)) in self
                     .grid()
-                    .visible_rows()
+                    .visible_rows_continuing()
                     .enumerate()
                     .skip(usize::from(start_row))
                     .take(usize::from(end_row) - usize::from(start_row) + 1)
                 {
                     if i == usize::from(start_row) {
                         row.write_contents(&mut contents, start_col, cols - start_col, false);
-                        if !row.wrapped() {
+                        if !continues {
                             contents.push('\n');
                         }
                     } else if i == usize::from(end_row) {
                         row.write_contents(&mut contents, 0, end_col, false);
                     } else {
                         row.write_contents(&mut contents, 0, cols, false);
-                        if !row.wrapped() {
+                        if !continues {
                             contents.push('\n');
                         }
                     }
@@ -395,17 +395,20 @@ impl Screen {
     #[allow(clippy::missing_panics_doc)]
     pub fn rows_formatted(&self, start: u16, width: u16) -> impl Iterator<Item = Vec<u8>> + '_ {
         let mut wrapping = false;
-        self.grid().visible_rows().enumerate().map(move |(i, row)| {
-            // number of rows in a grid is stored in a u16 (see Size), so
-            // visible_rows can never return enough rows to overflow here
-            let i = i.try_into().unwrap();
-            let mut contents = vec![];
-            row.write_contents_formatted(&mut contents, start, width, i, wrapping, None, None);
-            if start == 0 && width == self.grid.size().cols {
-                wrapping = row.wrapped();
-            }
-            contents
-        })
+        self.grid()
+            .visible_rows_continuing()
+            .enumerate()
+            .map(move |(i, (row, continues))| {
+                // number of rows in a grid is stored in a u16 (see Size), so
+                // visible_rows can never return enough rows to overflow here
+                let i = i.try_into().unwrap();
+                let mut contents = vec![];
+                row.write_contents_formatted(&mut contents, start, width, i, wrapping, None, None);
+                if start == 0 && width == self.grid.size().cols {
+                    wrapping = continues;
+                }
+                contents
+            })
     }
 
     /// Returns a terminal byte stream sufficient to turn the visible contents
@@ -452,10 +455,10 @@ impl Screen {
         width: u16,
     ) -> impl Iterator<Item = Vec<u8>> + 'a {
         self.grid()
-            .visible_rows()
-            .zip(prev.grid().visible_rows())
+            .visible_rows_continuing()
+            .zip(prev.grid().visible_rows_continuing())
             .enumerate()
-            .map(move |(i, (row, prev_row))| {
+            .map(move |(i, ((row, continues), (prev_row, prev_continues)))| {
                 // number of rows in a grid is stored in a u16 (see Size), so
                 // visible_rows can never return enough rows to overflow here
                 let i = i.try_into().unwrap();
@@ -468,6 +471,8 @@ impl Screen {
                     i,
                     false,
                     false,
+                    continues,
+                    prev_continues,
                     crate::grid::Pos { row: i, col: start },
                     crate::attrs::Attrs::default(),
                 );
@@ -631,7 +636,7 @@ impl Screen {
     #[must_use]
     pub fn row_wrapped(&self, row: u16) -> bool {
         self.grid()
-            .visible_row(row)
+            .visible_row(row.saturating_add(1))
             .is_some_and(crate::row::Row::wrapped)
     }
 
@@ -1154,15 +1159,6 @@ impl Screen {
             }
         }
 
-        // it doesn't make any sense to wrap if the last column in a row
-        // didn't already have contents. don't try to handle the case where a
-        // character wraps because there was only one column left in the
-        // previous row - literally everything handles this case differently,
-        // and this is tmux behavior (and also the simplest). i'm open to
-        // reconsidering this behavior, but only with a really good reason
-        // (xterm handles this by introducing the concept of triple width
-        // cells, which i really don't want to do).
-        let mut wrap = false;
         let autowrap = !self.mode(MODE_NO_AUTOWRAP);
         if !autowrap {
             // DECAWM off: the cursor sticks at the last column and later characters overwrite it
@@ -1173,22 +1169,6 @@ impl Screen {
                 if width > 1 {
                     return;
                 }
-            }
-        } else if pos.col > size.cols - width {
-            let last_cell = self
-                .grid()
-                .drawing_cell(crate::grid::Pos {
-                    row: pos.row,
-                    col: size.cols - 1,
-                })
-                // pos.row is valid, since it comes directly from
-                // self.grid().pos() which we assume to always have a valid
-                // row value. size.cols - 1 is also always a valid column.
-                .unwrap();
-            // a wide character pushed down by the edge always marks a soft wrap (as xterm.js does),
-            // so a later reflow rejoins it with the line above
-            if last_cell.has_contents() || last_cell.is_wide_continuation() || width > 1 {
-                wrap = true;
             }
         }
         if autowrap && width > 1 && pos.col == size.cols - 1 {
@@ -1203,7 +1183,7 @@ impl Screen {
             }
         }
         if autowrap {
-            self.grid_mut().col_wrap(width, wrap);
+            self.grid_mut().col_wrap(width);
         }
         let pos = self.grid().pos();
         if self.mode(MODE_INSERT) && width > 0 {
@@ -1240,15 +1220,11 @@ impl Screen {
                 }
                 prev_cell.append(c);
             } else if pos.row > 0 {
-                let prev_row = self
+                if self
                     .grid()
-                    .drawing_row(pos.row - 1)
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.row - 1 is valid because we just
-                    // checked for pos.row > 0.
-                    .unwrap();
-                if prev_row.wrapped() {
+                    .drawing_row(pos.row)
+                    .is_some_and(crate::row::Row::wrapped)
+                {
                     let mut prev_cell = self
                         .grid_mut()
                         .drawing_cell_mut(crate::grid::Pos {
@@ -1361,13 +1337,6 @@ impl Screen {
                     if let Some(next_next_cell) = self.grid_mut().drawing_cell_mut(next_next_pos) {
                         next_next_cell.clear(attrs);
                     }
-                    if next_next_pos.col == size.cols - 1 {
-                        self.grid_mut()
-                            .drawing_row_mut(pos.row)
-                            // we assume self.grid().pos().row is always valid
-                            .unwrap()
-                            .wrap(false);
-                    }
                 }
                 let next_cell = self
                     .grid_mut()
@@ -1402,7 +1371,7 @@ impl Screen {
         if self.mode(MODE_NEWLINE) {
             self.cr();
         }
-        self.grid_mut().row_inc_scroll(1);
+        self.grid_mut().line_feed();
     }
 
     // ESC D (IND): down one line, scrolling at the bottom margin; never touches the column
@@ -1639,7 +1608,7 @@ impl Screen {
 
     // CSI S
     pub(crate) fn su(&mut self, count: u16) {
-        self.grid_mut().scroll_up(count);
+        self.grid_mut().scroll_up_discard(count);
     }
 
     // CSI T

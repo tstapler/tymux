@@ -61,6 +61,14 @@ the fork is tested against (`tests/fidelity_golden.rs`); xterm behavior is from 
 | Resize | the primary screen reflows soft-wrapped lines (scrollback included) like xterm.js: lines holding the cursor are left alone, cells with only a background colour are not carried across a rewrap, resize resets the scroll region, and a wide glyph pushed to the next row by the edge marks a soft wrap. Tab stops are reapplied from the nearest stop below the new width, which re-adds stops cleared with TBC | same (ported from xterm.js 6.0.0's `Buffer.resize`/`BufferReflow`) |
 | Resize, alternate screen | no reflow; a narrowing resize crops for good | xterm.js keeps the cropped cells and shows them again when the screen widens |
 | Tab stops past the width | dropped on a narrowing resize | xterm.js keeps them |
+| Resize, wide glyph cut by a narrowing resize on a line that is not reflowed (the cursor's line) | the cropped first half is blanked | xterm.js keeps the half and draws it again when the screen widens (`wide_glyph_cropped_at_right_edge`) |
+| Soft-wrap links | stored on the continuation row and edited exactly where xterm.js edits them (EL/ED from column 0, IL/DL, LF, autowrap); ICH/DCH/ECH and insert mode leave them alone | same |
+| ED 1 with the cursor in the last column | clears the wrap link of absolute line `row + 1` (counting scrollback), copying an xterm.js bug: it omits `ybase`, so with scrollback the link it clears belongs to a scrollback line | same (`ed1_in_last_column_clears_absolute_line_wrap`) |
+| Reflow row pops | a pop of blank rows below the cursor leaves the popped lines readable and the shrinking-reflow scan still rewrites them, as in xterm.js | same (`reflow_pop_keeps_scanning_stale_lines`) |
+| Reflow overflow with scrollback 0 | the buffer stays capped at `rows` | xterm.js's shrinking reflow can advance `ybase` past its cap, and its circular list then shows a stale top line as the last visible row (`reflow_overflow_with_zero_scrollback`; 10 of ~300 zero-scrollback fuzz programs) |
+| SU (`CSI n S`) and scrollback | never feeds scrollback, even for a whole-screen region | same; LF/IND/autowrap feed scrollback when the region's top is row 1 |
+| LF / bare-LF behaviour | LF feeds scrollback for a region from row 1 and cancels a pending wrap, matching xterm.js; tmux may differ (it records history only for a full-screen region) | xterm.js |
+| Scrollback width | scrollback rows keep the width they were scrolled out at (blank beyond it) until a reflow touches them or they are scrolled into view | xterm.js resizes every line |
 
 Matching xterm.js on purpose: a pending wrap is cleared by ICH/DCH/ECH/DECRC/CSI u/IND/VPA and
 every cursor move; alternate-screen switches (`?47`, `?1047`, `?1049`) carry the cursor across

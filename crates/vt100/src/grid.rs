@@ -15,6 +15,8 @@ pub struct Grid {
     size: Size,
     pos: Pos,
     saved_pos: Pos,
+    /// Whether DECSC ever ran since the last reset; an unset slot is xterm.js's absolute row 0.
+    saved_set: bool,
     rows: Vec<crate::row::Row>,
     scroll_top: u16,
     scroll_bottom: u16,
@@ -41,6 +43,7 @@ impl Grid {
             size,
             pos: Pos::default(),
             saved_pos: Pos::default(),
+            saved_set: false,
             rows: vec![],
             scroll_top: 0,
             scroll_bottom: size.rows - 1,
@@ -85,6 +88,7 @@ impl Grid {
         self.freed_rows += u64::from(self.size.rows).max(MIN_REARM_ROWS);
         self.pos = Pos::default();
         self.saved_pos = Pos::default();
+        self.saved_set = false;
         for row in self.drawing_rows_mut() {
             row.clear(crate::attrs::Attrs::default());
         }
@@ -128,6 +132,7 @@ impl Grid {
 
     pub fn save_cursor(&mut self) {
         self.saved_pos = self.pos;
+        self.saved_set = true;
         self.saved_origin_mode = self.origin_mode;
     }
 
@@ -156,6 +161,17 @@ impl Grid {
                     .iter()
                     .take(rows_len.saturating_sub(self.scrollback_offset)),
             )
+    }
+
+    /// Each visible row with whether it continues onto the row after it (the next row's
+    /// `wrapped`), the form the renderers want.
+    pub fn visible_rows_continuing(&self) -> impl Iterator<Item = (&crate::row::Row, bool)> {
+        let mut rows = self.visible_rows().peekable();
+        std::iter::from_fn(move || {
+            let row = rows.next()?;
+            let continues = rows.peek().is_some_and(|next| next.wrapped());
+            Some((row, continues))
+        })
     }
 
     pub fn drawing_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
@@ -211,16 +227,17 @@ impl Grid {
 
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback_offset = rows.min(self.scrollback.len());
+        self.pad_scrollback_window();
     }
 
     pub fn write_contents(&self, contents: &mut String) {
         let mut wrapping = false;
-        for row in self.visible_rows() {
+        for (row, continues) in self.visible_rows_continuing() {
             row.write_contents(contents, 0, self.size.cols, wrapping);
-            if !row.wrapped() {
+            if !continues {
                 contents.push('\n');
             }
-            wrapping = row.wrapped();
+            wrapping = continues;
         }
 
         while contents.ends_with('\n') {
@@ -235,7 +252,7 @@ impl Grid {
         let mut prev_attrs = crate::attrs::Attrs::default();
         let mut prev_pos = Pos::default();
         let mut wrapping = false;
-        for (i, row) in self.visible_rows().enumerate() {
+        for (i, (row, continues)) in self.visible_rows_continuing().enumerate() {
             // we limit the number of cols to a u16 (see Size), so
             // visible_rows() can never return more rows than will fit
             let i = i.try_into().unwrap();
@@ -250,7 +267,7 @@ impl Grid {
             );
             prev_pos = new_pos;
             prev_attrs = new_attrs;
-            wrapping = row.wrapped();
+            wrapping = continues;
         }
 
         self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs));
@@ -267,7 +284,11 @@ impl Grid {
         let mut prev_pos = prev.pos;
         let mut wrapping = false;
         let mut prev_wrapping = false;
-        for (i, (row, prev_row)) in self.visible_rows().zip(prev.visible_rows()).enumerate() {
+        for (i, ((row, continues), (prev_row, prev_continues))) in self
+            .visible_rows_continuing()
+            .zip(prev.visible_rows_continuing())
+            .enumerate()
+        {
             // we limit the number of cols to a u16 (see Size), so
             // visible_rows() can never return more rows than will fit
             let i = i.try_into().unwrap();
@@ -279,13 +300,15 @@ impl Grid {
                 i,
                 wrapping,
                 prev_wrapping,
+                continues,
+                prev_continues,
                 prev_pos,
                 prev_attrs,
             );
             prev_pos = new_pos;
             prev_attrs = new_attrs;
-            wrapping = row.wrapped();
-            prev_wrapping = prev_row.wrapped();
+            wrapping = continues;
+            prev_wrapping = prev_continues;
         }
 
         self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs));
@@ -447,25 +470,46 @@ impl Grid {
         self.erase_row_forward(attrs);
     }
 
+    // ED 1: the current row loses its link to the row above, and when the whole row was erased the
+    // row below no longer continues it
     pub fn erase_all_backward(&mut self, attrs: crate::attrs::Attrs) {
         let pos = self.pos;
+        let cols = self.size.cols;
         for row in self.drawing_rows_mut().take(usize::from(pos.row)) {
             row.clear(attrs);
         }
 
         self.erase_row_backward(attrs);
+        self.current_row_mut().wrap(false);
+        if pos.col + 1 >= cols {
+            // Matches an xterm.js bug on purpose: it indexes the absolute line list here
+            // (`lines.get(j + 1)`) without adding ybase, so with scrollback the link it clears is
+            // a scrollback line's, not the row below the cursor's. The README lists it.
+            let abs = usize::from(pos.row) + 1;
+            let sb = self.scrollback.len();
+            if abs < sb {
+                self.scrollback[abs].wrap(false);
+            } else if let Some(next) = self.rows.get_mut(abs - sb) {
+                next.wrap(false);
+            }
+        }
     }
 
     pub fn erase_row(&mut self, attrs: crate::attrs::Attrs) {
         self.current_row_mut().clear(attrs);
     }
 
+    // EL 0 / ED 0: erasing from the row's first column breaks its link to the row above (xterm.js
+    // `_eraseInBufferLine(.., clearWrap = x === 0)`)
     pub fn erase_row_forward(&mut self, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
         let row = self.current_row_mut();
         for col in pos.col..size.cols {
             row.erase(col, attrs);
+        }
+        if pos.col == 0 {
+            row.wrap(false);
         }
     }
 
@@ -528,6 +572,8 @@ impl Grid {
     // IL/DL (ECMA-48 8.3.67/8.3.32, xterm): no-ops outside the scroll region, and the cursor
     // returns to the left margin.
     pub fn insert_lines(&mut self, count: u16) {
+        // xterm.js restricts the cursor (cancelling a pending wrap) before the region check
+        self.col_clamp();
         if !self.in_scroll_region() {
             return;
         }
@@ -535,12 +581,11 @@ impl Grid {
         for _ in 0..count.min(self.scroll_bottom - self.pos.row + 1) {
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows.insert(usize::from(self.pos.row), self.new_row());
-            // self.scroll_bottom is maintained to always be a valid row
-            self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }
     }
 
     pub fn delete_lines(&mut self, count: u16) {
+        self.col_clamp();
         if !self.in_scroll_region() {
             return;
         }
@@ -552,13 +597,27 @@ impl Grid {
         }
     }
 
+    /// Scroll driven by LF/IND/autowrap: rows leaving a region that starts at the top row go to
+    /// scrollback.
     pub fn scroll_up(&mut self, count: u16) {
+        self.scroll_region_up(count, true);
+    }
+
+    /// Explicit SU (`CSI n S`): xterm.js shifts the region's rows in place and never feeds
+    /// scrollback, even for a whole-screen region.
+    pub fn scroll_up_discard(&mut self, count: u16) {
+        self.scroll_region_up(count, false);
+    }
+
+    fn scroll_region_up(&mut self, count: u16, feed_scrollback: bool) {
         // scrolling by the region's height already blanks it; more is wasted work
         for _ in 0..count.min(self.scroll_bottom - self.scroll_top + 1) {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
-            if self.scrollback_len > 0 && !self.scroll_region_active() {
+            // xterm.js keeps scrolled-off rows whenever the region starts at the top row, even if
+            // it ends above the last one; a region starting lower just drops them
+            if feed_scrollback && self.scrollback_len > 0 && self.scroll_top == 0 {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
@@ -584,8 +643,6 @@ impl Grid {
                 crate::row::Row::new(self.size.cols)
             };
             self.rows.insert(usize::from(self.scroll_top), blank);
-            // self.scroll_bottom is maintained to always be a valid row
-            self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }
     }
 
@@ -604,10 +661,6 @@ impl Grid {
 
     fn in_scroll_region(&self) -> bool {
         self.pos.row >= self.scroll_top && self.pos.row <= self.scroll_bottom
-    }
-
-    fn scroll_region_active(&self) -> bool {
-        self.scroll_top != 0 || self.scroll_bottom != self.size.rows - 1
     }
 
     pub fn origin_mode(&self) -> bool {
@@ -639,6 +692,18 @@ impl Grid {
         let in_scroll_region = self.in_scroll_region();
         self.pos.row = self.pos.row.saturating_add(count);
         self.row_clamp_bottom(in_scroll_region);
+    }
+
+    // LF: a plain move down breaks the landing row's link to the row above (xterm.js `lineFeed`);
+    // scrolling lands on a fresh row and a clamped cursor on the last row is left alone.
+    pub fn line_feed(&mut self) {
+        let before = self.pos.row;
+        let scrolled = self.row_inc_scroll(1);
+        if scrolled == 0 && self.pos.row == before + 1 {
+            self.current_row_mut().wrap(false);
+        }
+        // and a cursor parked past the last column stays on it instead of wrapping
+        self.col_clamp();
     }
 
     pub fn row_inc_scroll(&mut self, count: u16) -> u16 {
@@ -769,6 +834,7 @@ impl Grid {
         self.origin_mode = false;
         self.saved_origin_mode = false;
         self.saved_pos = Pos::default();
+        self.saved_set = false;
     }
 
     pub fn col_set(&mut self, i: u16) {
@@ -776,20 +842,15 @@ impl Grid {
         self.col_clamp();
     }
 
-    pub fn col_wrap(&mut self, width: u16, wrap: bool) {
+    // Autowrap: the cursor moves to the next row's first column and that row is marked as
+    // continuing the one above. xterm.js does this unconditionally: even when the cursor is
+    // already on the last row, below the scroll region, where it can't move down and keeps
+    // overwriting that row, the row is still flagged, and the last cell being empty doesn't matter.
+    pub fn col_wrap(&mut self, width: u16) {
         if self.pos.col > self.size.cols - width {
-            let mut prev_pos = self.pos;
             self.pos.col = 0;
-            let scrolled = self.row_inc_scroll(1);
-            // saturating: on a one-row screen the previous row scrolls away entirely
-            prev_pos.row = prev_pos.row.saturating_sub(scrolled);
-            let new_pos = self.pos;
-            self.drawing_row_mut(prev_pos.row)
-                // we assume self.pos.row is always valid, and so prev_pos.row
-                // must be valid because it is always less than or equal to
-                // self.pos.row
-                .unwrap()
-                .wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            self.row_inc_scroll(1);
+            self.current_row_mut().wrap(true);
         }
     }
 

@@ -143,15 +143,79 @@ fn decode_line(v: &Value, cols: usize) -> Vec<Cell> {
     out
 }
 
-/// Checkpoints where this crate knowingly differs from xterm.js; each is listed in README.md.
-const KNOWN_DEVIATIONS: &[(&str, usize)] = &[
-    // xterm.js keeps alternate-screen cells that a narrowing resize cropped and shows them again
-    // when the screen widens; the crop is final here.
-    ("alt_screen_does_not_reflow", 4),
+/// Column of a `grid rN cM: ...` difference.
+fn grid_col(diff: &str) -> Option<u16> {
+    let rest = diff.strip_prefix("grid r")?;
+    let after_c = rest.split_once(" c")?.1;
+    after_c.split(':').next()?.parse().ok()
+}
+
+/// A documented difference from xterm.js (see README.md): the case, the checkpoint index and a
+/// predicate for the diffs that are masked. Everything else at that checkpoint is still compared.
+struct Deviation {
+    case: &'static str,
+    step: usize,
+    masks: fn(&str) -> bool,
+}
+
+/// xterm.js keeps alternate-screen cells that a narrowing resize cropped and shows them again when
+/// the screen widens; the crop is final here (the case narrows to 60 columns).
+fn alt_screen_cropped_cells(diff: &str) -> bool {
+    grid_col(diff).is_some_and(|c| c >= 60)
+}
+
+/// xterm.js keeps the first half of a wide glyph cut by a narrowing resize (the cell at column 10
+/// of the first row); here the lone half is blanked.
+fn cropped_wide_glyph(diff: &str) -> bool {
+    diff.starts_with("grid r0 c10:")
+}
+
+/// With scrollback 0 xterm.js's buffer cap is `rows`, yet a shrinking reflow can advance `ybase`
+/// past it; the circular list then wraps and the last visible row is a stale line from the top.
+/// Only the cursor and size still have to match.
+fn zero_scrollback_overflow(diff: &str) -> bool {
+    !diff.starts_with("cursor")
+}
+
+const KNOWN_DEVIATIONS: &[Deviation] = &[
+    Deviation {
+        case: "reflow_overflow_with_zero_scrollback",
+        step: 1,
+        masks: zero_scrollback_overflow,
+    },
+    Deviation {
+        case: "alt_screen_does_not_reflow",
+        step: 4,
+        masks: alt_screen_cropped_cells,
+    },
+    Deviation {
+        case: "wide_glyph_cropped_at_right_edge",
+        step: 1,
+        masks: cropped_wide_glyph,
+    },
+    Deviation {
+        case: "wide_glyph_cropped_at_right_edge",
+        step: 2,
+        masks: cropped_wide_glyph,
+    },
+    Deviation {
+        case: "wide_glyph_cropped_at_right_edge",
+        step: 3,
+        masks: cropped_wide_glyph,
+    },
 ];
 
+/// Number of cases in `fixtures/fidelity-resize/generate/cases.mjs`; a lower count of goldens
+/// means some were deleted or never regenerated. Bump it when a case is added.
+const EXPECTED_CASES: usize = 47;
+
+/// `TYMUX_RESIZE_GOLDEN_DIR` points the test at another directory of goldens (e.g. a fuzz run);
+/// the committed-count check is skipped then.
 fn dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fidelity-resize/golden")
+    std::env::var_os("TYMUX_RESIZE_GOLDEN_DIR").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fidelity-resize/golden"),
+        PathBuf::from,
+    )
 }
 
 fn diff_lines(label: &str, want: &[Cell], got: &[Cell], out: &mut Vec<String>) {
@@ -193,6 +257,26 @@ fn check_checkpoint(parser: &mut Parser, cp: &Value, out: &mut Vec<String>) {
                 "scrollback length: want {} got {have}",
                 want_sb.len()
             ));
+            if std::env::var_os("TYMUX_RESIZE_DUMP").is_some() {
+                let text = |line: &Value| -> String {
+                    line.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| match c {
+                            Value::String(t) => t.clone(),
+                            Value::Array(a) => a[0].as_str().unwrap().to_string(),
+                            _ => String::new(),
+                        })
+                        .collect()
+                };
+                let want: Vec<String> = want_sb.iter().map(text).collect();
+                let mut got = vec![];
+                for j in 0..have {
+                    s.set_scrollback(have - j);
+                    got.push(s.rows(0, cols).next().unwrap_or_default());
+                }
+                eprintln!("  scrollback want {want:?}\n  scrollback got  {got:?}");
+            }
         } else {
             for (j, want_line) in want_sb.iter().enumerate() {
                 s.set_scrollback(have - j);
@@ -202,6 +286,43 @@ fn check_checkpoint(parser: &mut Parser, cp: &Value, out: &mut Vec<String>) {
             }
         }
         s.set_scrollback(0);
+    }
+
+    // soft-wrap links of every line (scrollback then grid): xterm.js's `isWrapped`, "this line
+    // continues the one above". Line i's flag is `row_wrapped` of line i-1,
+    // so line 0's can't be observed and is not compared.
+    if !alt {
+        let want_wrapped: Vec<bool> = cp["wrapped"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .map(|c| c == '1')
+            .collect();
+        s.set_scrollback(usize::MAX);
+        let have = s.scrollback();
+        let mut got_wrapped = vec![false];
+        for j in 0..have {
+            s.set_scrollback(have - j);
+            got_wrapped.push(s.row_wrapped(0));
+        }
+        s.set_scrollback(0);
+        for r in 0..rows {
+            got_wrapped.push(s.row_wrapped(r));
+        }
+        got_wrapped.truncate(have + usize::from(rows)); // last entry is "row below the screen"
+                                                        // line 0's own flag (a continuation of a line that is gone) can't be read back
+        if got_wrapped[1..] != want_wrapped[1..] {
+            let show = |v: &[bool]| {
+                v.iter()
+                    .map(|&b| if b { '1' } else { '0' })
+                    .collect::<String>()
+            };
+            out.push(format!(
+                "wrap links: want {} got {}",
+                show(&want_wrapped),
+                show(&got_wrapped)
+            ));
+        }
     }
 
     // cursor and per-buffer state
@@ -253,7 +374,12 @@ fn resize_scenarios_match_xterm_js_after_every_step() {
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
     paths.sort();
-    assert!(!paths.is_empty(), "no resize goldens in {:?}", dir());
+    assert!(
+        std::env::var_os("TYMUX_RESIZE_GOLDEN_DIR").is_some() || paths.len() >= EXPECTED_CASES,
+        "{} resize goldens in {:?}, expected {EXPECTED_CASES} (see cases.mjs)",
+        paths.len(),
+        dir()
+    );
 
     let mut failing = vec![];
     let mut total = 0;
@@ -283,8 +409,11 @@ fn resize_scenarios_match_xterm_js_after_every_step() {
             }
             let mut diffs = vec![];
             check_checkpoint(&mut parser, &v["checkpoints"][i], &mut diffs);
-            if !diffs.is_empty() && KNOWN_DEVIATIONS.contains(&(name.as_str(), i)) {
-                diffs.clear();
+            for dev in KNOWN_DEVIATIONS
+                .iter()
+                .filter(|d| d.case == name && d.step == i)
+            {
+                diffs.retain(|d| !(dev.masks)(d));
             }
             if !diffs.is_empty() {
                 case_diffs += diffs.len();
@@ -296,6 +425,18 @@ fn resize_scenarios_match_xterm_js_after_every_step() {
                     }
                     if std::env::var_os("TYMUX_RESIZE_DUMP").is_some() {
                         let cols = parser.screen().size().1;
+                        {
+                            let s = parser.screen_mut();
+                            s.set_scrollback(usize::MAX);
+                            let have = s.scrollback();
+                            let mut got = vec![];
+                            for j in 0..have {
+                                s.set_scrollback(have - j);
+                                got.push(s.rows(0, cols).next().unwrap_or_default());
+                            }
+                            s.set_scrollback(0);
+                            eprintln!("  got  scrollback {got:?}");
+                        }
                         for (r, line) in parser.screen().rows(0, cols).enumerate() {
                             eprintln!(
                                 "  got  r{r:02} {line:?} wrapped={}",

@@ -3,9 +3,8 @@
 //! deviates from other terminals we copy it; see the vt100 README's list of deviations.
 //!
 //! The grid's scrollback and visible rows are treated as one list of "lines" (xterm's
-//! `lines`), with `ybase` the index of the first visible line. xterm marks the *continuation*
-//! line as wrapped, this crate marks the line that *continues*, so `Row::wrapped` is shifted by
-//! one while the list is being reflowed and shifted back afterwards.
+//! `lines`), with `ybase` the index of the first visible line. Like xterm, `Row::wrapped` marks
+//! the *continuation* row.
 use super::{Grid, Pos, Size};
 use crate::row::Row;
 use crate::Cell;
@@ -154,6 +153,11 @@ impl Lines {
                 continue;
             }
             let group = &mut self.lines[y..i];
+            for row in group.iter_mut() {
+                if row.cells.len() < new_cols {
+                    row.cells.resize(new_cols, Cell::new());
+                }
+            }
             let mut dest_idx = 0usize;
             let mut dest_col = wrapped_line_trimmed_len(group, 0, old_cols);
             let mut src_idx = 1usize;
@@ -238,12 +242,13 @@ impl Lines {
     fn reflow_smaller(&mut self, old_cols: usize, new_cols: usize, new_rows: usize) {
         let mut to_insert: Vec<(usize, Vec<Row>)> = vec![]; // (index just past the group, new lines)
         let mut count_to_insert = 0usize;
-        let mut y = self.lines.len();
+        // xterm's `lines.pop()` only shrinks its logical length; the popped lines stay readable
+        // by index and the scan below (bounded by the original length) keeps processing them, so
+        // `live_len` stands in for the length and `self.lines` keeps every line until the end.
+        let mut live_len = self.lines.len();
+        let mut y = live_len;
         while y > 0 {
             y -= 1;
-            if y >= self.lines.len() {
-                continue; // a pop below shortened the list
-            }
             if !self.lines[y].wrapped && trimmed_len(&self.lines[y]) <= new_cols {
                 continue;
             }
@@ -259,13 +264,18 @@ impl Lines {
             let mut group: Vec<Row> = (y..=last)
                 .map(|i| std::mem::replace(&mut self.lines[i], Row::new(0)))
                 .collect();
+            for row in &mut group {
+                if row.cells.len() < old_cols {
+                    row.cells.resize(old_cols, Cell::new());
+                }
+            }
             let last_len = trimmed_len(&group[n - 1]);
             let dest = new_line_lengths(&group, old_cols, new_cols);
             let to_add = dest.len() as i64 - n as i64;
-            let trimmed = if self.ybase == 0 && self.y + 1 != self.lines.len() {
+            let trimmed = if self.ybase == 0 && self.y + 1 != live_len {
                 (self.y as i64 - self.max_len as i64 + to_add).max(0)
             } else {
-                (self.lines.len() as i64 - self.max_len as i64 + to_add).max(0)
+                (live_len as i64 - self.max_len as i64 + to_add).max(0)
             };
             let add = to_add.max(0) as usize;
             count_to_insert += add;
@@ -330,12 +340,12 @@ impl Lines {
                 if self.ybase == 0 {
                     if self.y + 1 < new_rows {
                         self.y += 1;
-                        self.lines.pop();
+                        live_len = live_len.saturating_sub(1);
                     } else {
                         self.ybase += 1;
                     }
                 } else {
-                    let cap = self.max_len.min(self.lines.len() + count_to_insert);
+                    let cap = self.max_len.min(live_len + count_to_insert);
                     if (self.ybase as i64) < cap as i64 - new_rows as i64 {
                         self.ybase += 1;
                     }
@@ -354,6 +364,7 @@ impl Lines {
             }
         }
 
+        self.lines.truncate(live_len);
         if to_insert.is_empty() {
             return;
         }
@@ -381,32 +392,35 @@ impl Grid {
     /// Resizes to `size`. `reflow` rewraps soft-wrapped lines to the new width (the primary
     /// screen); the alternate screen passes `false` and just crops/extends.
     pub fn set_size(&mut self, size: Size, reflow: bool) {
+        // xterm.js ignores a resize to the current size: margins and a pending wrap survive it.
+        if size == self.size {
+            return;
+        }
         let old_cols = usize::from(self.size.cols);
         let (new_cols, new_rows) = (usize::from(size.cols), usize::from(size.rows));
         let old_rows = usize::from(self.size.rows);
         let sb_len = self.scrollback.len();
 
-        let mut lines: Vec<Row> = std::mem::take(&mut self.scrollback)
+        let lines: Vec<Row> = std::mem::take(&mut self.scrollback)
             .into_iter()
             .chain(std::mem::take(&mut self.rows))
             .collect();
-        // xterm convention: `wrapped` on the continuation line
-        for i in (1..lines.len()).rev() {
-            lines[i].wrapped = lines[i - 1].wrapped;
-        }
-        if let Some(first) = lines.first_mut() {
-            first.wrapped = false;
-        }
-
         let mut b = Lines {
             ybase: sb_len,
             y: usize::from(self.pos.row),
-            saved_y: sb_len + usize::from(self.saved_pos.row),
+            saved_y: if self.saved_set {
+                sb_len + usize::from(self.saved_pos.row)
+            } else {
+                0
+            },
             max_len: self.scrollback_len + new_rows,
             lines,
         };
+        // Only the visible rows need the new width now; scrollback rows stay as narrow as they
+        // are (blank beyond their length) until a reflow touches them or they are scrolled into
+        // view (`Grid::set_scrollback`), so widening doesn't allocate cols x scrollback cells.
         if old_cols < new_cols {
-            for line in &mut b.lines {
+            for line in b.lines.iter_mut().skip(sb_len) {
                 line.cells.resize(new_cols, Cell::new());
             }
         }
@@ -453,9 +467,11 @@ impl Grid {
                 b.reflow_smaller(old_cols, new_cols, new_rows);
             }
         }
-        if new_cols < old_cols {
-            for line in &mut b.lines {
+        for line in &mut b.lines {
+            if line.cells.len() > new_cols {
                 line.cells.truncate(new_cols);
+                // hand the cropped cells' memory back instead of pinning the old width
+                line.cells.shrink_to_fit();
                 if let Some(last) = line.cells.last_mut() {
                     if last.is_wide() {
                         *last = Cell::new();
@@ -463,8 +479,7 @@ impl Grid {
                 }
             }
         }
-        // lines that came from a different width (new blank lines) match the new one
-        for line in &mut b.lines {
+        for line in b.lines.iter_mut().skip(b.ybase) {
             line.cells.resize(new_cols, Cell::new());
         }
 
@@ -474,14 +489,6 @@ impl Grid {
             b.lines.push(blank_line(size.cols, false));
         }
         b.lines.truncate(need);
-        // back to this crate's convention: `wrapped` on the line that continues
-        for i in 0..b.lines.len().saturating_sub(1) {
-            b.lines[i].wrapped = b.lines[i + 1].wrapped;
-        }
-        if let Some(last) = b.lines.last_mut() {
-            last.wrapped = false;
-        }
-        // a line can't continue into the first visible row from outside the screen
         let rows = b.lines.split_off(b.ybase);
         self.scrollback = b.lines.into();
         self.rows = rows;
@@ -498,6 +505,7 @@ impl Grid {
         self.scroll_top = 0;
         self.scroll_bottom = size.rows - 1;
         self.scrollback_offset = self.scrollback_offset.min(self.scrollback.len());
+        self.pad_scrollback_window();
 
         // xterm's `setupTabStops(newCols)`: resume the default every-8th pattern from the nearest
         // stop below the new width (re-adding stops cleared with TBC, as xterm.js does).
@@ -508,6 +516,113 @@ impl Grid {
         }
         for i in (c..new_cols).step_by(8) {
             self.tab_stops[i] = i != 0;
+        }
+    }
+
+    /// Scrollback rows may be narrower than the screen (see `set_size`); pad the ones about to be
+    /// shown so every visible row is exactly `cols` wide.
+    pub(super) fn pad_scrollback_window(&mut self) {
+        let cols = usize::from(self.size.cols);
+        let shown = self.scrollback_offset.min(self.scrollback.len());
+        let skip = self.scrollback.len() - shown;
+        for row in self.scrollback.iter_mut().skip(skip).take(self.rows.len()) {
+            if row.cells.len() < cols {
+                row.cells.resize(cols, Cell::new());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cells (by capacity, i.e. memory actually held) across scrollback and the visible rows.
+    fn held_cells(g: &Grid) -> usize {
+        g.scrollback
+            .iter()
+            .chain(g.rows.iter())
+            .map(|r| r.cells.capacity())
+            .sum()
+    }
+
+    fn filled(rows: u16, cols: u16, scrollback: usize, lines: usize) -> Grid {
+        let mut g = Grid::new(Size { rows, cols }, scrollback);
+        g.allocate_rows();
+        for i in 0..lines {
+            for (c, ch) in format!("{i} lorem ipsum")
+                .chars()
+                .enumerate()
+                .take(usize::from(cols))
+            {
+                g.drawing_cell_mut(Pos {
+                    row: rows - 1,
+                    col: c as u16,
+                })
+                .unwrap()
+                .set(ch, crate::attrs::Attrs::default());
+            }
+            g.scroll_up(1);
+        }
+        g
+    }
+
+    #[test]
+    fn widening_does_not_pad_scrollback_rows() {
+        let mut g = filled(24, 80, 5000, 6000);
+        let before = held_cells(&g);
+        g.set_size(
+            Size {
+                rows: 24,
+                cols: 2000,
+            },
+            true,
+        );
+        // only the 24 visible rows grow: 24 * 2000 extra cells, not 5000 * 2000
+        let after = held_cells(&g);
+        assert!(
+            after < before + 24 * 2000 + 1000,
+            "{before} -> {after} cells held"
+        );
+    }
+
+    #[test]
+    fn shrinking_gives_cropped_width_back() {
+        let mut g = filled(24, 80, 5000, 6000);
+        g.set_size(
+            Size {
+                rows: 24,
+                cols: 2000,
+            },
+            true,
+        );
+        g.set_size(Size { rows: 24, cols: 80 }, true);
+        // back to roughly the original footprint: no row keeps the 2000-column capacity
+        assert!(
+            held_cells(&g) < 5024 * 80 * 2,
+            "{} cells held",
+            held_cells(&g)
+        );
+    }
+
+    #[test]
+    fn scrolling_back_after_widening_shows_full_width_rows() {
+        let mut g = filled(24, 80, 100, 200);
+        g.set_size(
+            Size {
+                rows: 24,
+                cols: 120,
+            },
+            true,
+        );
+        g.set_scrollback(50);
+        for r in 0..24 {
+            for c in 0..120 {
+                assert!(
+                    g.visible_cell(Pos { row: r, col: c }).is_some(),
+                    "r{r} c{c}"
+                );
+            }
         }
     }
 }

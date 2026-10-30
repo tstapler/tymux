@@ -2,7 +2,7 @@
   "name": "tymux-vt100-resize-fixtures",
   "private": true,
   "type": "module",
-  "description": "Regenerates ../cases/*.json and ../golden/*.json from cases.mjs using xterm.js headless as the reference terminal.",
+  "description": "Regenerates ../golden/*.json from cases.mjs using xterm.js headless as the reference terminal.",
   "scripts": { "generate": "bun generate.mjs" },
   "dependencies": {
     "@xterm/headless": "6.0.0",
