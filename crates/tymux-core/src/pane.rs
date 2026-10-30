@@ -1184,7 +1184,9 @@ mod tests {
         let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
         pane.write_input(b"printf 'before\\033[6nafter'; echo\n")
             .unwrap();
-        wait_for_row(&pane, |r| r.contains("beforeafter"));
+        wait_for_row(&pane, |r| {
+            r.contains("before") && r.contains("after") && !r.contains("printf")
+        });
         let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
             panic!("expected the whole history to be retained");
         };
@@ -1194,7 +1196,12 @@ mod tests {
             "replay must not carry the query: {:?}",
             String::from_utf8_lossy(&bytes)
         );
-        assert!(String::from_utf8_lossy(&bytes).contains("beforeafter"));
+        // the tty echoes the daemon's reply between the two words, so only check both survive
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("before") && text.contains("after"),
+            "{text:?}"
+        );
     }
 
     #[test]
