@@ -1142,7 +1142,8 @@ mod tests {
     fn run_query_script(pane: &Pane, query: &str, reply_len: usize) -> String {
         pane.write_input(b"stty raw -echo min 0 time 10; echo READY\n")
             .unwrap();
-        wait_for_row(pane, |r| r == "READY");
+        // bash/dash prefix the line with a prompt; sh on macOS does not
+        wait_for_row(pane, |r| r.trim_start_matches("$ ") == "READY");
         let script = format!(
             "printf '\\033[2J\\033[Habc\\r\\n  xy'; printf '{query}'; \
              r=$(dd bs=1 count={reply_len} 2>/dev/null | od -An -c | tr -s ' '); echo \"GOT:$r:END\"\n"
