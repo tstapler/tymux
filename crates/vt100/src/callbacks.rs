@@ -53,6 +53,17 @@ pub trait Callbacks {
     /// This callback is called when the terminal receives a OSC sequence
     /// (`\e]`) which is otherwise not implemented.
     fn unhandled_osc(&mut self, _: &mut crate::Screen, _params: &[&[u8]]) {}
+    /// Like [`unhandled_osc`](Self::unhandled_osc), but also says whether the
+    /// sequence was terminated with BEL (rather than ST) so a reply can mirror
+    /// the terminator. The default forwards to `unhandled_osc`.
+    fn unhandled_osc_terminated(
+        &mut self,
+        screen: &mut crate::Screen,
+        params: &[&[u8]],
+        _bel_terminated: bool,
+    ) {
+        self.unhandled_osc(screen, params);
+    }
 }
 
 impl Callbacks for () {}

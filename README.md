@@ -114,15 +114,28 @@ review this status section originally drew from.
 
 ## Terminal queries with no client attached
 
-While no client is attached to a pane, `tymuxd` answers the terminal queries a
-program may block on at startup: DA1/DA2, DSR 5 and 6 (cursor position from the
-real emulator cursor), XTVERSION, DECRQM, XTWINOPS 18/19 size reports and
-OSC 4/10/11/12 colour queries (xterm.js default palette). With a client
-attached the daemon stays silent and the client's emulator answers, so the
-program never sees duplicate replies. Replies are rate-limited, and queries are
-stripped from the replay buffer so a resuming client does not answer them again.
-The kitty keyboard query (`CSI ? u`) is deliberately left unanswered: claiming
-support would make programs enable a protocol the browser client does not speak.
+While no client's emulator will see a pane's output, `tymuxd` answers the terminal
+queries a program may block on at startup: DA1/DA2, DSR 5 and 6 (cursor position
+from the real emulator cursor), XTVERSION, DECRQM, XTWINOPS 18/19 size reports and
+OSC 4/10/11/12 colour queries. Attached clients register when they go live; for each
+output chunk the daemon decides once whether a registered, non-lagged client will see
+it. If one will, the chunk goes out raw and only the client answers. If none will, the
+daemon answers and every client receives the chunk with those queries removed, as does
+the replay buffer, so a resuming client never re-answers a query.
+
+Replies are rate-limited and written by a separate thread, so a program that floods
+queries without reading its input cannot stall output. Limits that remain:
+
+- A query a client was meant to answer but whose chunk it lost to lag is not answered.
+- A query introduced with a UTF-8 encoded C1 control (`C2 9B`) is answered but not stripped.
+- A sequence longer than 256 bytes is not held across chunks, so it is not stripped.
+- An OSC that mixes colour sets with queries is left for the client; the daemon ignores it.
+- DECRQM answers like xterm.js for the modes it knows (`mode_status` in
+  `crates/tymux-core/src/terminal_query.rs`) and reports 0 (not recognised) for others.
+- OSC 10/11/12 report xterm.js's dark defaults (white on black); set `TYMUXD_QUERY_FG`,
+  `TYMUXD_QUERY_BG` and `TYMUXD_QUERY_CURSOR` (`#rrggbb`) for a different client theme.
+- The kitty keyboard query (`CSI ? u`) is deliberately unanswered: claiming support would
+  make programs enable a protocol the browser client does not speak.
 
 ## Known Limitations
 

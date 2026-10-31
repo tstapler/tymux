@@ -1,16 +1,24 @@
 //! Answers terminal queries (DA, DSR, DECRQM, XTVERSION, OSC colour queries, XTWINOPS size) on
-//! behalf of a pane when no client is attached.
+//! behalf of a pane when no client's emulator will.
 //!
 //! Normally the attached client's emulator (xterm.js) answers queries it sees in the raw byte
 //! stream. With nobody attached a full-screen app that starts up and waits for a reply (vim, fzf,
-//! Claude Code) would hang, so the daemon answers instead. When a client *is* attached the daemon
-//! stays silent: both answering would hand the app duplicate replies.
+//! Claude Code) would hang, so the daemon answers instead. It never does both:
+//!
+//! * For each output chunk the pane decides once, before parsing it, whether any registered
+//!   client ([`LiveClient`]) will see it live. If not, the daemon answers the queries in it and
+//!   every client receives the chunk with those queries stripped.
+//! * Otherwise the chunk goes out raw and the client answers.
+//! * Replayed history never contains queries.
 //!
 //! Deliberately not answered: the kitty keyboard query (`CSI ? u`). Replying "supported" would make
 //! the app enable the protocol, and the xterm.js client that attaches later sends legacy keys.
 //! Apps probe it together with DA1, so the DA1 reply alone resolves their wait.
 
-use std::borrow::Cow;
+mod clients;
+mod outbox;
+mod scanner;
+
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,16 +26,14 @@ use std::time::Instant;
 
 use vt100::{Callbacks, MouseProtocolEncoding, MouseProtocolMode, Screen};
 
-/// Replies allowed in a burst, and how fast the allowance refills. A program printing queries in a
-/// loop gets a bounded number of answers rather than a stream of writes into its own stdin.
-const RATE_BURST: u32 = 16;
-const RATE_REFILL_PER_SEC: u32 = 8;
-/// Replies held back while a client is attached, in case it detaches before seeing the chunk.
-const MAX_DEFERRED: usize = 16;
-/// Longest sequence the replay stripper will inspect; anything longer is not a query we answer.
-const MAX_SEQ_LEN: usize = 64;
-/// `OSC 4` may carry many `index;?` pairs; answer at most this many per sequence.
-const MAX_OSC4_PAIRS: usize = 8;
+pub(crate) use clients::ClientRegistry;
+pub use clients::LiveClient;
+pub(crate) use outbox::{Outbox, ReplyWriter};
+pub(crate) use scanner::QueryScanner;
+
+/// vte keeps at most this many OSC parameters (`MAX_OSC_PARAMS` in vte 0.15), so an `OSC 4` query
+/// is answered for at most 7 `index;?` pairs; the rest of a longer sequence is lost to the parser.
+const VTE_MAX_OSC_PARAMS: usize = 16;
 
 /// The queries this module answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +54,8 @@ enum Query {
 }
 
 /// Classifies a CSI by the first two intermediate/private bytes (as vte reports them), the first
-/// parameter and the final byte.
+/// parameter and the final byte. The emulator callbacks and the stream scanner both call this, so
+/// what the daemon answers and what gets stripped cannot drift apart.
 fn classify_csi(i1: Option<u8>, i2: Option<u8>, p0: u16, fin: u8) -> Option<Query> {
     match (i1, i2, fin) {
         (None, None, b'c') if p0 == 0 => Some(Query::Da1),
@@ -70,14 +77,32 @@ fn classify_csi(i1: Option<u8>, i2: Option<u8>, p0: u16, fin: u8) -> Option<Quer
     }
 }
 
+/// DECRQM status values (xterm ctlseqs).
+const NOT_RECOGNIZED: u8 = 0;
+const SET: u8 = 1;
+const RESET: u8 = 2;
+const PERMANENTLY_SET: u8 = 3;
+const PERMANENTLY_RESET: u8 = 4;
+
+fn flag(on: bool) -> u8 {
+    if on {
+        SET
+    } else {
+        RESET
+    }
+}
+
+/// Mirrors xterm.js's `requestMode` (the browser client's answer), limited to modes vt100 tracks.
 fn mode_status(screen: &Screen, dec: bool, mode: u16) -> u8 {
-    let flag = |on: bool| if on { 1 } else { 2 };
     let mouse = screen.mouse_protocol_mode();
+    let encoding = screen.mouse_protocol_encoding();
     if !dec {
         return match mode {
+            2 => PERMANENTLY_RESET,
             4 => flag(screen.insert_mode()),
+            12 => PERMANENTLY_SET,
             20 => flag(screen.newline_mode()),
-            _ => 0,
+            _ => NOT_RECOGNIZED,
         };
     }
     match mode {
@@ -85,32 +110,38 @@ fn mode_status(screen: &Screen, dec: bool, mode: u16) -> u8 {
         5 => flag(screen.reverse_video()),
         6 => flag(screen.origin_mode()),
         7 => flag(screen.autowrap()),
+        8 => PERMANENTLY_SET,
+        9 => flag(mouse == MouseProtocolMode::Press),
         25 => flag(!screen.hide_cursor()),
         47 | 1047 | 1049 => flag(screen.alternate_screen()),
         66 => flag(screen.application_keypad()),
-        9 => flag(mouse == MouseProtocolMode::Press),
+        67 | 1005 | 1015 => PERMANENTLY_RESET,
         1000 => flag(mouse == MouseProtocolMode::PressRelease),
         1002 => flag(mouse == MouseProtocolMode::ButtonMotion),
         1003 => flag(mouse == MouseProtocolMode::AnyMotion),
         1004 => flag(screen.focus_events()),
-        1005 => flag(screen.mouse_protocol_encoding() == MouseProtocolEncoding::Utf8),
-        1006 => flag(screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr),
-        1015 => flag(screen.mouse_protocol_encoding() == MouseProtocolEncoding::Urxvt),
+        1006 => flag(encoding == MouseProtocolEncoding::Sgr),
+        1048 => SET,
         2004 => flag(screen.bracketed_paste()),
-        _ => 0,
+        _ => NOT_RECOGNIZED,
     }
 }
 
-/// 1-based cursor row/col as the app sees it (relative to the scroll region under DECOM).
+/// 1-based cursor row/col as the app sees it: relative to the scroll region under DECOM, and
+/// clamped to the screen (a cursor with a pending wrap sits one past the last column).
 fn cursor_report(screen: &Screen) -> (u32, u32) {
     let (row, col) = screen.cursor_position();
+    let (rows, cols) = screen.size();
     let row = if screen.origin_mode() {
         // scroll_region() is 1-based, (0, 0) for the whole screen
         row.saturating_sub(screen.scroll_region().0.saturating_sub(1))
     } else {
         row
     };
-    (u32::from(row) + 1, u32::from(col) + 1)
+    (
+        u32::from(row.saturating_add(1).min(rows)),
+        u32::from(col.saturating_add(1).min(cols)),
+    )
 }
 
 fn reply_for(query: Query, screen: &Screen) -> Vec<u8> {
@@ -143,12 +174,59 @@ fn reply_for(query: Query, screen: &Screen) -> Vec<u8> {
     }
 }
 
-/// Default palette, matching xterm.js's default theme (so an app sees the same colours whether
-/// the daemon or an attached browser answers).
-const DEFAULT_FG: (u8, u8, u8) = (0xff, 0xff, 0xff);
-const DEFAULT_BG: (u8, u8, u8) = (0x00, 0x00, 0x00);
-const DEFAULT_CURSOR: (u8, u8, u8) = (0xff, 0xff, 0xff);
-const ANSI16: [(u8, u8, u8); 16] = [
+type Rgb = (u8, u8, u8);
+
+/// Colours reported for `OSC 10/11/12` queries. Defaults match xterm.js's default (dark) theme;
+/// override per daemon with `TYMUXD_QUERY_FG`, `TYMUXD_QUERY_BG` and `TYMUXD_QUERY_CURSOR`
+/// (`#rrggbb`) when the clients use a different theme, e.g. a light one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Colors {
+    fg: Rgb,
+    bg: Rgb,
+    cursor: Rgb,
+}
+
+impl Default for Colors {
+    fn default() -> Self {
+        Self {
+            fg: (0xff, 0xff, 0xff),
+            bg: (0x00, 0x00, 0x00),
+            cursor: (0xff, 0xff, 0xff),
+        }
+    }
+}
+
+fn parse_hex_color(s: &str) -> Option<Rgb> {
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some((byte(0)?, byte(2)?, byte(4)?))
+}
+
+impl Colors {
+    pub(crate) fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let defaults = Self::default();
+        let pick = |key: &str, default: Rgb| {
+            get(key)
+                .and_then(|v| parse_hex_color(&v))
+                .unwrap_or(default)
+        };
+        Self {
+            fg: pick("TYMUXD_QUERY_FG", defaults.fg),
+            bg: pick("TYMUXD_QUERY_BG", defaults.bg),
+            cursor: pick("TYMUXD_QUERY_CURSOR", defaults.cursor),
+        }
+    }
+}
+
+/// xterm.js's default ANSI palette.
+const ANSI16: [Rgb; 16] = [
     (0x2e, 0x34, 0x36),
     (0xcc, 0x00, 0x00),
     (0x4e, 0x9a, 0x06),
@@ -167,7 +245,7 @@ const ANSI16: [(u8, u8, u8); 16] = [
     (0xee, 0xee, 0xec),
 ];
 
-fn palette(index: u8) -> (u8, u8, u8) {
+fn palette(index: u8) -> Rgb {
     match index {
         0..=15 => ANSI16[usize::from(index)],
         16..=231 => {
@@ -182,187 +260,130 @@ fn palette(index: u8) -> (u8, u8, u8) {
     }
 }
 
-fn osc_color(prefix: &str, (r, g, b): (u8, u8, u8)) -> Vec<u8> {
-    format!("\x1b]{prefix};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\").into_bytes()
+fn osc_color(prefix: &str, (r, g, b): Rgb, bel: bool) -> Vec<u8> {
+    let end = if bel { "\x07" } else { "\x1b\\" };
+    format!("\x1b]{prefix};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}{end}").into_bytes()
 }
 
-/// Replies to an OSC colour query: `OSC 10|11|12 ; ?` or `OSC 4 ; index ; ? [; index ; ?]...`.
-fn osc_replies(params: &[&[u8]]) -> Vec<Vec<u8>> {
-    match params {
-        [b"10", b"?"] => vec![osc_color("10", DEFAULT_FG)],
-        [b"11", b"?"] => vec![osc_color("11", DEFAULT_BG)],
-        [b"12", b"?"] => vec![osc_color("12", DEFAULT_CURSOR)],
-        [b"4", rest @ ..] => rest
-            .chunks(2)
-            .filter(|pair| pair.len() == 2 && pair[1] == b"?")
-            .filter_map(|pair| {
-                let index: u8 = std::str::from_utf8(pair[0]).ok()?.parse().ok()?;
-                Some(osc_color(&format!("4;{index}"), palette(index)))
-            })
-            .take(MAX_OSC4_PAIRS)
-            .collect(),
-        _ => Vec::new(),
-    }
+/// One colour asked for by an OSC query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OscItem {
+    /// `OSC 10|11|12`: foreground, background or cursor colour.
+    Dynamic(u8),
+    /// `OSC 4`: palette entry.
+    Palette(u8),
 }
 
-/// Removes complete query sequences from a chunk bound for the replay buffer.
-///
-/// A client resuming from the buffer would otherwise see (and answer) queries the app already got
-/// answered, duplicating replies. A sequence split across two chunks is left intact: that is a
-/// rare race, and mangling it would leave the client parser mid-sequence.
-pub(crate) fn strip_queries(chunk: &[u8]) -> Cow<'_, [u8]> {
-    if !chunk.contains(&0x1b) {
-        return Cow::Borrowed(chunk);
-    }
-    let mut out: Option<Vec<u8>> = None;
-    let mut copied_to = 0;
-    let mut i = 0;
-    while i < chunk.len() {
-        if chunk[i] != 0x1b {
-            i += 1;
-            continue;
-        }
-        let Some(len) = query_len_at(&chunk[i..]) else {
-            i += 1;
-            continue;
-        };
-        let buf = out.get_or_insert_with(|| Vec::with_capacity(chunk.len()));
-        buf.extend_from_slice(&chunk[copied_to..i]);
-        i += len;
-        copied_to = i;
-    }
-    match out {
-        None => Cow::Borrowed(chunk),
-        Some(mut buf) => {
-            buf.extend_from_slice(&chunk[copied_to..]);
-            Cow::Owned(buf)
-        }
-    }
-}
-
-/// Length of the query sequence starting at `s[0] == ESC`, if it is one we answer.
-fn query_len_at(s: &[u8]) -> Option<usize> {
-    let window = &s[..s.len().min(MAX_SEQ_LEN)];
-    match window.get(1)? {
-        b'[' => csi_query_len(window),
-        b']' => osc_query_len(window),
-        _ => None,
-    }
-}
-
-fn csi_query_len(s: &[u8]) -> Option<usize> {
-    let mut i = 2;
-    let (mut private, mut inter, mut digits) = (None, None, Vec::new());
-    while let Some(&b) = s.get(i) {
-        match b {
-            b'<'..=b'?' if i == 2 => private = Some(b),
-            b'0'..=b'9' | b';' | b':' => digits.push(b),
-            0x20..=0x2f => {
-                if inter.is_none() {
-                    inter = Some(b);
-                }
+/// The colours a pure-query OSC asks for, or `None` if it is not one. A sequence mixing queries
+/// with colour *sets* (`OSC 4;1;rgb:..;2;?`) is not treated as a query: the daemon does not answer
+/// it and the stream scanner leaves it intact, so no client misses the set. Queries for the
+/// dynamic colours (`OSC 10;?;?`: each further `?` is the next colour, as in xterm) and for
+/// palette entries (`OSC 4;i;?[;j;?]...`, as many pairs as vte's parameter limit kept) are recognised.
+fn osc_query(params: &[&[u8]]) -> Option<Vec<OscItem>> {
+    let (&first, rest) = params.split_first()?;
+    let base: u8 = match first {
+        b"10" => 10,
+        b"11" => 11,
+        b"12" => 12,
+        b"4" => {
+            // A full parameter list was cut off by vte, so its odd trailing element is half a pair.
+            let truncated = params.len() >= VTE_MAX_OSC_PARAMS;
+            let rest = if truncated && rest.len() % 2 == 1 {
+                &rest[..rest.len() - 1]
+            } else {
+                rest
+            };
+            if rest.is_empty() || rest.len() % 2 != 0 {
+                return None;
             }
-            0x40..=0x7e => {
-                let p0 = digits
-                    .split(|&d| d == b';')
-                    .next()
-                    .and_then(|d| std::str::from_utf8(d).ok())
-                    .and_then(|d| d.parse().ok())
-                    .unwrap_or(0);
-                // vte lists the private marker first, then other intermediates.
-                let (i1, i2) = match private {
-                    Some(p) => (Some(p), inter),
-                    None => (inter, None),
-                };
-                return classify_csi(i1, i2, p0, b).map(|_| i + 1);
-            }
-            _ => return None,
+            return rest
+                .chunks(2)
+                .map(|pair| {
+                    let index = std::str::from_utf8(pair[0]).ok()?.parse().ok()?;
+                    (pair[1] == b"?").then_some(OscItem::Palette(index))
+                })
+                .collect();
         }
-        i += 1;
-    }
-    None
-}
-
-fn osc_query_len(s: &[u8]) -> Option<usize> {
-    let end = s.iter().skip(2).position(|&b| b == 0x07 || b == 0x1b)? + 2;
-    let total = if s[end] == 0x07 {
-        end + 1
-    } else if s.get(end + 1) == Some(&b'\\') {
-        end + 2
-    } else {
-        return None;
+        _ => return None,
     };
-    let params: Vec<&[u8]> = s[2..end].split(|&b| b == b';').collect();
-    (!osc_replies(&params).is_empty()).then_some(total)
+    if rest.is_empty() || rest.iter().any(|p| *p != b"?") {
+        return None;
+    }
+    Some(
+        (base..=12)
+            .zip(rest)
+            .map(|(ident, _)| OscItem::Dynamic(ident))
+            .collect(),
+    )
 }
 
-/// Where replies go and whether a client is attached; abstracted so the policy is unit-testable.
-pub(crate) trait ReplyOut: Send + Sync {
-    fn client_attached(&self) -> bool;
-    fn write_reply(&self, bytes: &[u8]);
+/// Replies to a pure OSC colour query, ending with the same terminator (`bel`) as the query.
+fn osc_replies(params: &[&[u8]], bel: bool, colors: &Colors) -> Vec<Vec<u8>> {
+    osc_query(params)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| match item {
+            OscItem::Palette(i) => osc_color(&format!("4;{i}"), palette(i), bel),
+            OscItem::Dynamic(ident) => {
+                let color = match ident {
+                    10 => colors.fg,
+                    11 => colors.bg,
+                    _ => colors.cursor,
+                };
+                osc_color(&ident.to_string(), color, bel)
+            }
+        })
+        .collect()
 }
 
-struct State {
-    tokens: f64,
-    last: Instant,
-    deferred: Vec<Vec<u8>>,
+/// The reply to a CSI the emulator did not handle itself, if it is one of our queries.
+fn csi_reply(
+    screen: &Screen,
+    i1: Option<u8>,
+    i2: Option<u8>,
+    params: &[&[u16]],
+    c: char,
+) -> Option<Vec<u8>> {
+    let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+    let fin = u8::try_from(c).ok()?;
+    classify_csi(i1, i2, p0, fin).map(|query| reply_for(query, screen))
 }
 
 /// Shared between the parser's callbacks and the pane's reader thread.
 pub(crate) struct QueryReplies {
-    out: Box<dyn ReplyOut>,
-    state: Mutex<State>,
-    has_deferred: AtomicBool,
+    /// Set by the reader thread before each chunk is parsed (see the module docs).
+    daemon_answers: AtomicBool,
+    colors: Colors,
+    outbox: Outbox,
 }
 
 impl QueryReplies {
-    pub(crate) fn new(out: Box<dyn ReplyOut>) -> Self {
+    pub(crate) fn new(writer: Box<dyn ReplyWriter>, colors: Colors) -> Self {
         Self {
-            out,
-            state: Mutex::new(State {
-                tokens: f64::from(RATE_BURST),
-                last: Instant::now(),
-                deferred: Vec::new(),
-            }),
-            has_deferred: AtomicBool::new(false),
+            daemon_answers: AtomicBool::new(true),
+            colors,
+            outbox: Outbox::new(writer),
         }
     }
 
-    /// Writes `reply` now when nobody is attached; otherwise parks it until [`Self::settle`]
-    /// learns whether the chunk reached a client.
-    fn offer(&self, reply: Vec<u8>, now: Instant) {
-        let mut st = self.state.lock().unwrap();
-        let elapsed = now.saturating_duration_since(st.last);
-        st.last = now;
-        st.tokens = (st.tokens + elapsed.as_secs_f64() * f64::from(RATE_REFILL_PER_SEC))
-            .min(f64::from(RATE_BURST));
-        if st.tokens < 1.0 {
-            return;
-        }
-        st.tokens -= 1.0;
-        if self.out.client_attached() {
-            if st.deferred.len() < MAX_DEFERRED {
-                st.deferred.push(reply);
-                self.has_deferred.store(true, Ordering::Release);
-            }
-        } else {
-            drop(st);
-            self.out.write_reply(&reply);
-        }
+    /// Replies accepted for sending so far (tests assert silence without waiting on a timeout).
+    #[cfg(test)]
+    pub(crate) fn accepted(&self) -> u64 {
+        self.outbox.accepted()
     }
 
-    /// Called after the chunk was broadcast. If no client received it (the last one detached
-    /// between the query being parsed and the send), nobody answered: answer now. Otherwise the
-    /// client's emulator answered and the parked replies are discarded.
-    pub(crate) fn settle(&self, delivered_to_client: bool) {
-        if !self.has_deferred.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        let parked = std::mem::take(&mut self.state.lock().unwrap().deferred);
-        if !delivered_to_client {
-            for reply in parked {
-                self.out.write_reply(&reply);
-            }
+    pub(crate) fn set_daemon_answers(&self, on: bool) {
+        self.daemon_answers.store(on, Ordering::Release);
+    }
+
+    /// Stops the writer thread; called when the pty closes.
+    pub(crate) fn close(&self) {
+        self.outbox.close();
+    }
+
+    fn offer(&self, reply: Vec<u8>) {
+        if self.daemon_answers.load(Ordering::Acquire) {
+            self.outbox.offer(reply, Instant::now());
         }
     }
 }
@@ -387,54 +408,27 @@ impl Callbacks for QueryResponder {
         params: &[&[u16]],
         c: char,
     ) {
-        let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
-        let Ok(fin) = u8::try_from(c) else { return };
-        if let Some(query) = classify_csi(i1, i2, p0, fin) {
-            self.replies.offer(reply_for(query, screen), Instant::now());
+        if let Some(reply) = csi_reply(screen, i1, i2, params, c) {
+            self.replies.offer(reply);
         }
     }
 
-    fn unhandled_osc(&mut self, _: &mut Screen, params: &[&[u8]]) {
-        for reply in osc_replies(params) {
-            self.replies.offer(reply, Instant::now());
+    fn unhandled_osc_terminated(&mut self, _: &mut Screen, params: &[&[u8]], bel: bool) {
+        for reply in osc_replies(params, bel, &self.replies.colors) {
+            self.replies.offer(reply);
         }
     }
 }
 
-/// Writes replies to the pty master, never blocking the pane's reader thread: a child that
-/// floods queries without reading its input would otherwise fill the pty input buffer and
-/// deadlock (the reader thread is also what drains the child's output).
-pub(crate) struct PtyReplyOut {
-    pub(crate) tx: tokio::sync::broadcast::Sender<(u64, Vec<u8>)>,
+/// Writes replies to the pty master from the outbox's writer thread. The write may block while
+/// the child's input buffer is full; only that thread waits, never the pane's reader.
+pub(crate) struct PtyReplyWriter {
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub(crate) fd: Option<i32>,
 }
 
-impl ReplyOut for PtyReplyOut {
-    fn client_attached(&self) -> bool {
-        self.tx.receiver_count() > 0
-    }
-
-    fn write_reply(&self, bytes: &[u8]) {
-        // try_lock: if an input write holds the writer it may be blocked on a full pty, and
-        // waiting here would stall output draining.
-        let Ok(mut writer) = self.writer.try_lock() else {
-            return;
-        };
-        #[cfg(unix)]
-        if let Some(fd) = self.fd {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            // SAFETY: `pfd` is a valid pollfd and the count matches.
-            let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
-            if ready <= 0 || pfd.revents & libc::POLLOUT == 0 {
-                return;
-            }
-        }
-        let _ = self.fd;
+impl ReplyWriter for PtyReplyWriter {
+    fn write_reply(&mut self, bytes: &[u8]) {
+        let mut writer = self.writer.lock().unwrap();
         if writer.write_all(bytes).is_ok() {
             let _ = writer.flush();
         }
@@ -442,267 +436,4 @@ impl ReplyOut for PtyReplyOut {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[derive(Default)]
-    struct Recorder {
-        attached: AtomicBool,
-        written: Mutex<Vec<Vec<u8>>>,
-    }
-
-    struct RecorderOut(Arc<Recorder>);
-
-    impl ReplyOut for RecorderOut {
-        fn client_attached(&self) -> bool {
-            self.0.attached.load(Ordering::SeqCst)
-        }
-        fn write_reply(&self, bytes: &[u8]) {
-            self.0.written.lock().unwrap().push(bytes.to_vec());
-        }
-    }
-
-    fn harness(
-        attached: bool,
-    ) -> (
-        vt100::Parser<QueryResponder>,
-        Arc<Recorder>,
-        Arc<QueryReplies>,
-    ) {
-        let rec = Arc::new(Recorder::default());
-        rec.attached.store(attached, Ordering::SeqCst);
-        let replies = Arc::new(QueryReplies::new(Box::new(RecorderOut(rec.clone()))));
-        let parser =
-            vt100::Parser::new_with_callbacks(10, 40, 0, QueryResponder::new(replies.clone()));
-        (parser, rec, replies)
-    }
-
-    fn replies_to(input: &[u8]) -> Vec<String> {
-        let (mut parser, rec, _) = harness(false);
-        parser.process(input);
-        let written = rec.written.lock().unwrap();
-        written
-            .iter()
-            .map(|b| String::from_utf8_lossy(b).replace('\x1b', "ESC"))
-            .collect()
-    }
-
-    #[test]
-    fn da1_should_report_vt100_with_advanced_video() {
-        assert_eq!(replies_to(b"\x1b[c"), ["ESC[?1;2c"]);
-        assert_eq!(replies_to(b"\x1b[0c"), ["ESC[?1;2c"]);
-    }
-
-    #[test]
-    fn da2_should_report_secondary_attributes() {
-        assert_eq!(replies_to(b"\x1b[>c"), ["ESC[>0;276;0c"]);
-    }
-
-    #[test]
-    fn dsr_5_should_report_ok() {
-        assert_eq!(replies_to(b"\x1b[5n"), ["ESC[0n"]);
-    }
-
-    #[test]
-    fn dsr_6_should_report_the_real_cursor_position() {
-        assert_eq!(replies_to(b"\x1b[6n"), ["ESC[1;1R"]);
-        assert_eq!(replies_to(b"ab\r\n  xyz\x1b[6n"), ["ESC[2;6R"]);
-        assert_eq!(replies_to(b"\x1b[?6n"), ["ESC[?1;1;1R"]);
-    }
-
-    #[test]
-    fn dsr_6_should_be_relative_to_the_scroll_region_under_origin_mode() {
-        // region rows 3..8, DECOM on, cursor to region row 2 col 4
-        assert_eq!(
-            replies_to(b"\x1b[3;8r\x1b[?6h\x1b[2;4H\x1b[6n"),
-            ["ESC[2;4R"]
-        );
-    }
-
-    #[test]
-    fn xtversion_should_report_tymux() {
-        let got = replies_to(b"\x1b[>q");
-        assert_eq!(got.len(), 1);
-        assert!(
-            got[0].starts_with("ESCP>|tymux ") && got[0].ends_with("ESC\\"),
-            "{got:?}"
-        );
-        assert_eq!(replies_to(b"\x1b[>0q"), got);
-    }
-
-    #[test]
-    fn decrqm_should_report_set_reset_and_unknown_modes() {
-        assert_eq!(
-            replies_to(
-                b"\x1b[?25$p\x1b[?25l\x1b[?25$p\x1b[?2004$p\x1b[?2004h\x1b[?2004$p\x1b[?9999$p"
-            ),
-            [
-                "ESC[?25;1$y",
-                "ESC[?25;2$y",
-                "ESC[?2004;2$y",
-                "ESC[?2004;1$y",
-                "ESC[?9999;0$y"
-            ]
-        );
-        assert_eq!(
-            replies_to(b"\x1b[4$p\x1b[4h\x1b[4$p"),
-            ["ESC[4;2$y", "ESC[4;1$y"]
-        );
-        assert_eq!(
-            replies_to(b"\x1b[?1000h\x1b[?1006h\x1b[?1000$p\x1b[?1006$p\x1b[?1003$p"),
-            ["ESC[?1000;1$y", "ESC[?1006;1$y", "ESC[?1003;2$y"]
-        );
-    }
-
-    #[test]
-    fn xtwinops_should_report_the_size_in_characters() {
-        assert_eq!(replies_to(b"\x1b[18t"), ["ESC[8;10;40t"]);
-        assert_eq!(replies_to(b"\x1b[19t"), ["ESC[9;10;40t"]);
-    }
-
-    #[test]
-    fn osc_color_queries_should_report_the_default_palette() {
-        assert_eq!(
-            replies_to(b"\x1b]10;?\x07"),
-            ["ESC]10;rgb:ffff/ffff/ffffESC\\"]
-        );
-        assert_eq!(
-            replies_to(b"\x1b]11;?\x1b\\"),
-            ["ESC]11;rgb:0000/0000/0000ESC\\"]
-        );
-        assert_eq!(
-            replies_to(b"\x1b]12;?\x07"),
-            ["ESC]12;rgb:ffff/ffff/ffffESC\\"]
-        );
-        assert_eq!(
-            replies_to(b"\x1b]4;1;?\x07"),
-            ["ESC]4;1;rgb:cccc/0000/0000ESC\\"]
-        );
-        assert_eq!(
-            replies_to(b"\x1b]4;232;?\x07"),
-            ["ESC]4;232;rgb:0808/0808/0808ESC\\"]
-        );
-        assert_eq!(
-            replies_to(b"\x1b]4;196;?\x07"),
-            ["ESC]4;196;rgb:ffff/0000/0000ESC\\"]
-        );
-    }
-
-    #[test]
-    fn osc_setting_a_color_should_not_be_answered() {
-        assert!(replies_to(b"\x1b]10;#ff0000\x07\x1b]4;1;#00ff00\x07").is_empty());
-    }
-
-    #[test]
-    fn kitty_keyboard_query_should_not_be_answered() {
-        assert!(replies_to(b"\x1b[?u").is_empty());
-    }
-
-    #[test]
-    fn non_query_sequences_should_not_be_answered() {
-        assert!(replies_to(b"\x1b[2J\x1b[1;31mhi\x1b[0m\x1b[8;10;40t\x1b[>1c\x1b[7n").is_empty());
-    }
-
-    #[test]
-    fn a_query_split_across_chunks_should_be_answered_exactly_once() {
-        let (mut parser, rec, _) = harness(false);
-        parser.process(b"\x1b[");
-        parser.process(b"6");
-        parser.process(b"n");
-        assert_eq!(rec.written.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn replies_should_be_silent_while_a_client_is_attached() {
-        let (mut parser, rec, replies) = harness(true);
-        parser.process(b"\x1b[6n\x1b[c");
-        replies.settle(true);
-        assert!(rec.written.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn replies_should_be_sent_when_the_last_client_detached_before_the_chunk_was_delivered() {
-        let (mut parser, rec, replies) = harness(true);
-        parser.process(b"\x1b[6n");
-        rec.attached.store(false, Ordering::SeqCst);
-        replies.settle(false);
-        assert_eq!(rec.written.lock().unwrap().len(), 1);
-        // and only once: settle clears what it parked
-        replies.settle(false);
-        assert_eq!(rec.written.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn a_reply_flood_should_be_rate_limited() {
-        let (mut parser, rec, _) = harness(false);
-        parser.process("\x1b[5n".repeat(1000).as_bytes());
-        let sent = rec.written.lock().unwrap().len();
-        assert!((1..=RATE_BURST as usize + 2).contains(&sent), "sent {sent}");
-    }
-
-    #[test]
-    fn the_rate_limit_should_refill_over_time() {
-        let rec = Arc::new(Recorder::default());
-        let replies = QueryReplies::new(Box::new(RecorderOut(rec.clone())));
-        let t0 = Instant::now();
-        for _ in 0..RATE_BURST + 5 {
-            replies.offer(b"x".to_vec(), t0);
-        }
-        assert_eq!(rec.written.lock().unwrap().len(), RATE_BURST as usize);
-        replies.offer(b"x".to_vec(), t0 + Duration::from_secs(1));
-        assert_eq!(rec.written.lock().unwrap().len(), RATE_BURST as usize + 1);
-    }
-
-    #[test]
-    fn an_osc4_query_should_answer_a_bounded_number_of_pairs() {
-        let mut q = String::from("\x1b]4");
-        for i in 0..40 {
-            q.push_str(&format!(";{i};?"));
-        }
-        q.push('\x07');
-        assert!(replies_to(q.as_bytes()).len() <= MAX_OSC4_PAIRS);
-    }
-
-    #[test]
-    fn strip_queries_should_remove_whole_queries_and_keep_everything_else() {
-        let input = b"hi\x1b[6nthere\x1b[1;31mred\x1b[c\x1b]11;?\x07end\x1b[?2004$p";
-        assert_eq!(&*strip_queries(input), b"hithere\x1b[1;31mredend" as &[u8]);
-        assert_eq!(
-            &*strip_queries(b"\x1b[?u\x1b]10;#fff\x07"),
-            b"\x1b[?u\x1b]10;#fff\x07" as &[u8]
-        );
-        assert!(matches!(strip_queries(b"plain"), Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn strip_queries_should_leave_a_split_query_intact() {
-        assert_eq!(&*strip_queries(b"abc\x1b[6"), b"abc\x1b[6" as &[u8]);
-        assert_eq!(&*strip_queries(b"6nabc"), b"6nabc" as &[u8]);
-    }
-
-    #[test]
-    fn strip_and_reply_should_agree_on_what_is_a_query() {
-        for seq in [
-            &b"\x1b[c"[..],
-            b"\x1b[0c",
-            b"\x1b[>c",
-            b"\x1b[5n",
-            b"\x1b[6n",
-            b"\x1b[?6n",
-            b"\x1b[>q",
-            b"\x1b[4$p",
-            b"\x1b[?25$p",
-            b"\x1b[18t",
-            b"\x1b]10;?\x07",
-            b"\x1b]4;3;?\x1b\\",
-            b"\x1b[7n",
-            b"\x1b[?u",
-            b"\x1b[8;5;5t",
-        ] {
-            let answered = !replies_to(seq).is_empty();
-            let stripped = strip_queries(seq).is_empty();
-            assert_eq!(answered, stripped, "{:?}", String::from_utf8_lossy(seq));
-        }
-    }
-}
+mod tests;

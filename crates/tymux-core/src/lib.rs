@@ -24,3 +24,5 @@ pub use persistence::{
     CURRENT_SCHEMA_VERSION, STALE_SESSION_MAX_AGE,
 };
 pub use replay_buffer::ReplayOutcome;
+
+pub use terminal_query::LiveClient;

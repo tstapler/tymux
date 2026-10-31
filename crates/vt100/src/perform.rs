@@ -212,7 +212,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
         match params {
             // vte splits the payload on every `;`, but a title may contain them (xterm.js rejoins)
             [b"0", rest @ ..] if !rest.is_empty() => {
@@ -246,11 +246,16 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     self.callbacks.copy_to_clipboard(&mut self.screen, ty, data);
                 }
                 _ => {
-                    self.callbacks.unhandled_osc(&mut self.screen, params);
+                    self.callbacks.unhandled_osc_terminated(
+                        &mut self.screen,
+                        params,
+                        bel_terminated,
+                    );
                 }
             },
             _ => {
-                self.callbacks.unhandled_osc(&mut self.screen, params);
+                self.callbacks
+                    .unhandled_osc_terminated(&mut self.screen, params, bel_terminated);
             }
         }
     }
