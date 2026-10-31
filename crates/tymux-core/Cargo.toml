@@ -8,6 +8,8 @@ license.workspace = true
 tokio = { workspace = true }
 portable-pty = { workspace = true }
 vt100 = { workspace = true }
+vte = "0.15.0"
+memchr = "2"
 uuid = { workspace = true, features = ["serde"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }

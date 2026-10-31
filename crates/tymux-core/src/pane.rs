@@ -13,6 +13,9 @@ use uuid::Uuid;
 use crate::replay_buffer::{
     allocate_replay_budget, release_replay_budget, ReplayBuffer, ReplayOutcome,
 };
+use crate::terminal_query::{
+    ClientRegistry, Colors, LiveClient, PtyReplyWriter, QueryReplies, QueryResponder, QueryScanner,
+};
 
 /// Epic 5 Story 5.4: vt100's third `Parser::new` arg (how many
 /// scrolled-off lines it keeps) is now a real per-pane budget, not the
@@ -79,6 +82,9 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 pub use crate::launch::Launch;
 use crate::launch::PreparedLaunch;
 
+#[cfg(test)]
+type PushBumpHook = Box<dyn Fn(&Pane) + Send>;
+
 /// A single pty-backed terminal. Owns the child process, the pty master
 /// (for resize + writing input), and a `vt100::Parser` that keeps a
 /// structured screen model in sync with everything the child prints.
@@ -94,12 +100,12 @@ pub struct Pane {
     pub command: String,
     pub launch: Launch,
     pub cwd: String,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Write end of the `stdin_stream` pipe; `None` once closed, or when the
     /// pane was not created with `stdin_stream`.
     stdin_writer: Mutex<Option<std::fs::File>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<QueryResponder>>>,
     /// Mirrors the `vt100::Parser` screen's current size, updated by
     /// [`Self::resize`] right after the screen itself is resized. Lets
     /// [`Self::size`] answer "what size is this pane right now" without
@@ -119,12 +125,12 @@ pub struct Pane {
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
     /// Epic 2.1: bounded, byte-budgeted log of recent output chunks,
-    /// populated in the reader thread's read loop strictly *after*
-    /// `parser`'s lock is dropped and *before* `output_tx.send` — a
-    /// standalone lock, never nested with `parser` (Pattern Decisions:
-    /// "Replay-buffer locking"), so a resuming reader's buffer-tail read
-    /// can never disagree with what a live subscriber has already
-    /// received.
+    /// populated in the reader thread's read loop inside `parser`'s lock,
+    /// before `output_seq` is bumped and before `output_tx.send`. Lock order
+    /// is parser -> replay only; nothing takes `replay` then `parser`. Having
+    /// the chunk in the buffer before its seq is visible means a resuming
+    /// reader that sees `output_seq == q` always finds chunk `q`. Chunks are
+    /// stored with terminal queries stripped.
     replay: Mutex<ReplayBuffer>,
     /// This pane's granted share of `GLOBAL_REPLAY_BUFFER_BUDGET_BYTES` —
     /// released back to the budget on `Drop`. Stored separately from
@@ -132,6 +138,13 @@ pub struct Pane {
     /// can read the granted amount back out without locking `replay`.
     replay_budget_bytes: usize,
     output_tx: broadcast::Sender<(u64, Vec<u8>)>,
+    /// Attached clients whose emulators answer terminal queries (see `terminal_query`).
+    clients: ClientRegistry,
+    #[cfg(test)]
+    query_replies: Arc<QueryReplies>,
+    /// Test hook run between the replay push and the seq bump, with the replay lock held.
+    #[cfg(test)]
+    push_bump_hook: Mutex<Option<PushBumpHook>>,
     /// Monotonic count of pty-read chunks fed into `parser` so far (Task
     /// 1.3.1a / ADR-003 Amendment). Incremented in the reader thread in
     /// the same critical section as `parser.process(..)`, so a value read
@@ -386,12 +399,36 @@ impl Pane {
         } = prepared;
         drop(stdin);
 
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
 
         let scrollback_lines = allocate_scrollback_budget();
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback_lines)));
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
+        #[cfg(unix)]
+        let reply_fd = {
+            use std::os::fd::{BorrowedFd, RawFd};
+            let raw: RawFd = pair
+                .master
+                .as_raw_fd()
+                .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
+            // SAFETY: the master (and so `raw`) outlives this call; the duplicate is independent.
+            unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?
+        };
+        let replies = Arc::new(QueryReplies::new(
+            #[cfg(unix)]
+            Box::new(PtyReplyWriter::new(reply_fd)),
+            #[cfg(not(unix))]
+            Box::new(PtyReplyWriter {
+                writer: writer.clone(),
+            }),
+            Colors::from_env(),
+        ));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            scrollback_lines,
+            QueryResponder::new(replies.clone()),
+        )));
         let replay_budget_bytes = allocate_replay_budget();
 
         let effective_cwd = cwd.map(str::to_string).unwrap_or_else(|| {
@@ -404,7 +441,7 @@ impl Pane {
             command: command.to_string(),
             launch: launch.clone(),
             cwd: effective_cwd,
-            writer: Mutex::new(writer),
+            writer,
             stdin_writer: Mutex::new(stdin_writer),
             master: Mutex::new(pair.master),
             parser: parser.clone(),
@@ -414,6 +451,11 @@ impl Pane {
             replay: Mutex::new(ReplayBuffer::new(replay_budget_bytes)),
             replay_budget_bytes,
             output_tx: output_tx.clone(),
+            clients: ClientRegistry::default(),
+            #[cfg(test)]
+            query_replies: replies.clone(),
+            #[cfg(test)]
+            push_bump_hook: Mutex::new(None),
             output_seq: AtomicU64::new(0),
             exited: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -430,6 +472,7 @@ impl Pane {
         let pane_for_reader = pane.clone();
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; PTY_READ_BUF_SIZE];
+            let mut scanner = QueryScanner::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -440,24 +483,58 @@ impl Pane {
                         // never be observed out of sync by a concurrent
                         // `snapshot_at_offset_with_seq` reader (ADR-003
                         // Amendment).
-                        let seq = {
+                        //
+                        // Terminal queries: decided once per chunk, before parsing, whether a
+                        // registered client will see it live; if not the daemon answers (from
+                        // the parser callbacks) and clients get the chunk with queries
+                        // stripped. See `terminal_query`.
+                        //
+                        // Epic 2.1: the replay push and the seq bump happen under one `replay`
+                        // lock (order parser -> replay, never the reverse). `replay_since`
+                        // reads `output_seq` under that same lock, so it never returns a chunk
+                        // newer than its `tail_seq`, nor misses a chunk at or below it.
+                        let (seq, daemon_answered, scanned) = {
                             let mut parser = parser.lock().unwrap();
+                            let next = pane_for_reader.output_seq.load(Ordering::SeqCst) + 1;
+                            let daemon_answers = !pane_for_reader.clients.has_answerer(next);
+                            replies.set_daemon_answers(daemon_answers);
                             parser.process(&buf[..n]);
-                            pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst) + 1
+                            let scanned = scanner.feed(&buf[..n]);
+                            {
+                                let mut replay = pane_for_reader.replay.lock().unwrap();
+                                replay.push(next, scanned.stripped());
+                                #[cfg(test)]
+                                pane_for_reader.run_push_bump_hook();
+                                pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst);
+                            }
+                            (next, daemon_answers, scanned)
                         };
-                        // Epic 2.1: pushed into the replay buffer strictly
-                        // *before* the broadcast send below, and on a
-                        // standalone lock never nested with `parser`
-                        // (already dropped above) — see the `replay`
-                        // field's doc comment.
-                        pane_for_reader.replay.lock().unwrap().push(seq, &buf[..n]);
+                        let payload = if daemon_answered {
+                            scanned.stripped()
+                        } else {
+                            &scanned.raw
+                        };
                         // Fails only when nobody is currently attached (no
                         // receivers) — expected and benign (e.g. shell
                         // startup output before the first Attach), not an
-                        // error worth logging.
-                        let _ = output_tx.send((seq, buf[..n].to_vec()));
+                        // error worth logging. An empty payload (everything
+                        // held back as a possible partial query) is not sent.
+                        if !payload.is_empty() {
+                            let _ = output_tx.send((seq, payload.to_vec()));
+                        }
                     }
                 }
+            }
+            replies.close();
+            // A sequence still open at EOF was held back from every consumer; release it.
+            let rest = scanner.take_held();
+            if !rest.is_empty() {
+                let next = pane_for_reader.output_seq.load(Ordering::SeqCst) + 1;
+                let mut replay = pane_for_reader.replay.lock().unwrap();
+                replay.push(next, &rest);
+                pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst);
+                drop(replay);
+                let _ = output_tx.send((next, rest));
             }
             // Child exited (or the pty read failed, which for a live child
             // is effectively the same signal). Reap it and capture its
@@ -633,8 +710,22 @@ impl Pane {
     /// sequence number (from [`Self::snapshot_with_seq`]) tell which
     /// already-subscribed chunks predate that snapshot and must not be
     /// replayed on top of it (ADR-003 Amendment).
+    /// Registers an attached client as the answerer of terminal queries. Until
+    /// [`LiveClient::go_live_after`] is called the daemon keeps answering; call it with the seq
+    /// the client's priming snapshot/replay covers. Hold the handle for the life of the attach.
+    pub fn register_live_client(&self) -> LiveClient {
+        self.clients.register()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<(u64, Vec<u8>)> {
         self.output_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    fn run_push_bump_hook(&self) {
+        if let Some(hook) = self.push_bump_hook.lock().unwrap().as_ref() {
+            hook(self);
+        }
     }
 
     /// Epic 2.1 Story 2.1.2: returns the output chunks produced since
@@ -1091,6 +1182,320 @@ mod tests {
     fn is_exited_should_return_false_when_process_still_running() {
         let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
         assert!(!pane.is_exited());
+    }
+
+    fn screen_rows(pane: &Pane) -> Vec<String> {
+        pane.snapshot()
+            .grid
+            .iter()
+            .map(|row| row.iter().map(|c| c.text.as_str()).collect::<String>())
+            .collect()
+    }
+
+    fn wait_for_row(pane: &Pane, want: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(row) = screen_rows(pane).into_iter().find(|r| want(r.trim_end())) {
+                return row.trim_end().to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "row never appeared: {:?}",
+                screen_rows(pane)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Puts the tty in raw no-echo mode (so the script itself never echoes onto the screen),
+    /// clears the screen, prints `abc\r\n  xy`, sends `query`, reads up to `reply_len` reply bytes (1s cap via VTIME)
+    /// and returns the `GOT:<od output>:END` row.
+    fn run_query_script(pane: &Pane, query: &str, reply_len: usize) -> String {
+        pane.write_input(b"stty raw -echo min 0 time 10; echo READY\n")
+            .unwrap();
+        // bash/dash prefix the line with a prompt; sh on macOS does not
+        wait_for_row(pane, |r| r.trim_start_matches("$ ") == "READY");
+        let script = format!(
+            "printf '\\033[2J\\033[Habc\\r\\n  xy'; printf '{query}'; \
+             r=$(dd bs=1 count={reply_len} 2>/dev/null | od -An -c | tr -s ' '); echo \"GOT:$r:END\"\n"
+        );
+        pane.write_input(script.as_bytes()).unwrap();
+        wait_for_row(pane, |r| r.contains("GOT:") && r.ends_with(":END"))
+    }
+
+    #[test]
+    fn terminal_query_should_be_answered_by_the_daemon_when_no_client_is_attached() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        // CPR after "abc\r\n  xy": real cursor is row 2, col 5 => ESC [ 2 ; 5 R
+        let text = run_query_script(&pane, "\\033[6n", 6);
+        // od's column padding differs between platforms; compare without whitespace
+        assert!(
+            text.split_whitespace()
+                .collect::<String>()
+                .contains("GOT:033[2;5R:END"),
+            "expected the cursor-position reply, got: {text}"
+        );
+    }
+
+    #[test]
+    fn terminal_query_should_not_be_answered_by_the_daemon_when_a_client_is_attached() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let _rx = pane.subscribe();
+        let client = pane.register_live_client();
+        client.go_live_after(0);
+        // The marker is printed after the query, so once it is on screen the query was parsed:
+        // an event, not a timeout.
+        pane.write_input(b"printf '\\033[6n\\033[c'; echo MA\"\"RK\n")
+            .unwrap();
+        wait_for_row(&pane, |r| r.ends_with("MARK") && !r.contains("echo"));
+        assert_eq!(pane.query_replies.accepted(), 0, "daemon must stay silent");
+    }
+
+    #[test]
+    fn terminal_query_should_be_counted_as_answered_when_no_client_is_attached() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        pane.write_input(b"printf '\\033[6n\\033[c'; echo MA\"\"RK\n")
+            .unwrap();
+        // the tty may echo a reply just before the marker on the same row
+        wait_for_row(&pane, |r| r.ends_with("MARK") && !r.contains("echo"));
+        assert_eq!(pane.query_replies.accepted(), 2);
+    }
+
+    fn squash(text: &str) -> String {
+        text.split_whitespace().collect()
+    }
+
+    #[test]
+    fn terminal_query_should_be_answered_when_a_client_subscribed_but_is_not_live_yet() {
+        // An attach subscribes before it has its snapshot threshold: nobody shows it these chunks.
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let _rx = pane.subscribe();
+        let _unfinished_attach = pane.register_live_client();
+        let text = run_query_script(&pane, "\\033[6n", 6);
+        assert!(squash(&text).contains("GOT:033[2;5R"), "{text}");
+    }
+
+    #[test]
+    fn terminal_query_should_be_answered_when_the_only_client_is_lagged() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let _rx = pane.subscribe();
+        let client = pane.register_live_client();
+        client.go_live_after(0);
+        client.set_lagged(true);
+        let text = run_query_script(&pane, "\\033[6n", 6);
+        assert!(squash(&text).contains("GOT:033[2;5R"), "{text}");
+    }
+
+    /// Everything a subscriber receives while `pane` runs `script`, until `marker` shows up.
+    fn collect_broadcast(
+        pane: &Pane,
+        rx: &mut broadcast::Receiver<(u64, Vec<u8>)>,
+        marker: &str,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut bytes = Vec::new();
+        while !String::from_utf8_lossy(&bytes).contains(marker) {
+            assert!(
+                Instant::now() < deadline,
+                "no {marker}: {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+            while let Ok((_, chunk)) = rx.try_recv() {
+                bytes.extend_from_slice(&chunk);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = pane;
+        bytes
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn broadcast_should_carry_the_query_only_when_a_client_answers_it() {
+        // answered by the client: raw
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let mut rx = pane.subscribe();
+        let client = pane.register_live_client();
+        client.go_live_after(0);
+        pane.write_input(b"printf 'q\\033[6nZ'; echo DO\"\"NE1\n")
+            .unwrap();
+        let bytes = collect_broadcast(&pane, &mut rx, "DONE1\r");
+        assert!(
+            contains_bytes(&bytes, b"q\x1b[6nZ"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        // answered by the daemon: stripped for every subscriber, even a registered-but-lagged one
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let mut rx = pane.subscribe();
+        let client = pane.register_live_client();
+        client.go_live_after(0);
+        client.set_lagged(true);
+        pane.write_input(b"printf 'q\\033[6nZ'; echo DO\"\"NE2\n")
+            .unwrap();
+        let bytes = collect_broadcast(&pane, &mut rx, "DONE2\r");
+        assert!(
+            !contains_bytes(&bytes, b"\x1b[6n"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            contains_bytes(&bytes, b"qZ"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn a_child_that_never_reads_stdin_and_floods_queries_should_not_stall_output() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        // `yes` is an external process writing queries as fast as the pty drains; it never reads
+        // stdin, so every reply it provokes piles up unread.
+        pane.write_input(b"yes \"$(printf '\\033[c\\033[6nx')\"\n")
+            .unwrap();
+        let wait_until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_until("the flood to be answered", &|| {
+            pane.query_replies.accepted() > 0
+        });
+        let before = pane.snapshot_with_seq().1;
+        // the reader keeps draining output even though replies sit unread in the child's pty
+        wait_until("output to keep flowing", &|| {
+            pane.snapshot_with_seq().1 > before + 50
+        });
+        pane.kill().unwrap();
+    }
+
+    #[test]
+    fn replay_buffer_should_not_contain_queries_so_a_resuming_client_cannot_answer_them_twice() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        pane.write_input(b"printf 'before\\033[6nafter'; echo\n")
+            .unwrap();
+        wait_for_row(&pane, |r| {
+            r.contains("before") && r.contains("after") && !r.contains("printf")
+        });
+        let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
+            panic!("expected the whole history to be retained");
+        };
+        let bytes: Vec<u8> = chunks.into_iter().flat_map(|(_, b)| b).collect();
+        assert!(
+            !bytes.windows(4).any(|w| w == b"\x1b[6n"),
+            "replay must not carry the query: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        // the tty echoes the daemon's reply between the two words, so only check both survive
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("before") && text.contains("after"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn replay_buffer_should_not_contain_a_query_split_across_reads() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        // let the startup output land in chunk 1, which a resume can never replay
+        pane.write_input(b"echo RE\"\"ADY\n").unwrap();
+        wait_for_row(&pane, |r| r.trim_start_matches("$ ") == "READY");
+        pane.write_input(b"printf 'a\\033['; i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '6nb'; echo SPLIT\"\"DONE\n")
+            .unwrap();
+        // the tty may echo the daemon's reply between the marker and the text
+        wait_for_row(&pane, |r| r.starts_with("ab") && r.contains("SPLITDONE"));
+        let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
+            panic!("expected the whole history to be retained");
+        };
+        let bytes: Vec<u8> = chunks.into_iter().flat_map(|(_, b)| b).collect();
+        let text = String::from_utf8_lossy(&bytes);
+        // "a" and "b" adjacent proves both the ESC[ prefix and the 6n tail are gone
+        assert!(!contains_bytes(&bytes, b"\x1b[6n"), "{text:?}");
+        assert!(text.contains("\r\nab"), "{text:?}");
+    }
+
+    #[test]
+    fn a_sequence_open_at_pty_eof_should_still_reach_subscribers_and_replay() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let mut rx = pane.subscribe();
+        pane.write_input(b"echo RE\"\"ADY\n").unwrap();
+        wait_for_row(&pane, |r| r.ends_with("READY") && !r.contains("echo"));
+        // ESC [ 6 is a query prefix the scanner holds back; EOF must release it
+        // exec: nothing else may follow the open sequence, or it would complete and not be held
+        pane.write_input(b"exec printf 'x\\033[6'\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pane.is_exited() {
+            assert!(Instant::now() < deadline, "child never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut live = Vec::new();
+        while let Ok((_, chunk)) = rx.try_recv() {
+            live.extend_from_slice(&chunk);
+        }
+        assert!(
+            contains_bytes(&live, b"x\x1b[6"),
+            "subscriber: {:?}",
+            String::from_utf8_lossy(&live)
+        );
+        let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
+            panic!("expected the history to be retained");
+        };
+        let replayed: Vec<u8> = chunks.into_iter().flat_map(|(_, b)| b).collect();
+        assert!(
+            contains_bytes(&replayed, b"x\x1b[6"),
+            "replay: {:?}",
+            String::from_utf8_lossy(&replayed)
+        );
+    }
+
+    #[test]
+    fn user_input_should_not_wait_behind_a_flood_of_unread_replies() {
+        let pane = Arc::new(Pane::spawn("/bin/sh", 24, 80).unwrap());
+        pane.write_input(b"yes \"$(printf '\\033[c')\"\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while pane.query_replies.accepted() == 0 {
+            assert!(Instant::now() < deadline, "flood never answered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let p = pane.clone();
+        std::thread::spawn(move || {
+            p.write_input(b"\x03").unwrap();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Ctrl-C write blocked behind reply writes");
+        pane.kill().unwrap();
+    }
+
+    #[test]
+    fn replay_push_and_seq_bump_should_happen_under_the_replay_lock() {
+        // If the lock were not held between push and bump, `replay_since` could return a chunk
+        // newer than its tail_seq (re-sent live: double render and double query).
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let held_every_time = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicU64::new(0));
+        let (flag, n) = (held_every_time.clone(), calls.clone());
+        *pane.push_bump_hook.lock().unwrap() = Some(Box::new(move |p: &Pane| {
+            n.fetch_add(1, Ordering::SeqCst);
+            if p.replay.try_lock().is_ok() {
+                flag.store(false, Ordering::SeqCst);
+            }
+        }));
+        pane.write_input(b"echo HO\"\"OK\n").unwrap();
+        wait_for_row(&pane, |r| r.ends_with("HOOK") && !r.contains("echo"));
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        assert!(
+            held_every_time.load(Ordering::SeqCst),
+            "replay lock not held across push+bump"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod persistence;
 mod replay_buffer;
 #[cfg(unix)]
 mod spawn;
+mod terminal_query;
 
 pub use engine::{
     ClosePaneOutcome, Engine, EngineError, LayoutSnapshot, PaneEntry, PaneInfo, PaneLookup,
@@ -23,3 +24,5 @@ pub use persistence::{
     CURRENT_SCHEMA_VERSION, STALE_SESSION_MAX_AGE,
 };
 pub use replay_buffer::ReplayOutcome;
+
+pub use terminal_query::LiveClient;

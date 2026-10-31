@@ -1828,6 +1828,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "libc",
+ "memchr",
  "portable-pty",
  "proptest",
  "serde",
@@ -1836,6 +1837,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vt100",
+ "vte",
 ]
 
 [[package]]

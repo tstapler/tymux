@@ -112,6 +112,43 @@ solved — see that README for why.
 See `docs/reviews/is-it-ready-2026-07-13.md` for the pre-v1.0 readiness
 review this status section originally drew from.
 
+## Terminal queries with no client attached
+
+While no client's emulator will see a pane's output, `tymuxd` answers the terminal
+queries a program may block on at startup: DA1/DA2, DSR 5 and 6 (cursor position
+from the real emulator cursor), XTVERSION, DECRQM, XTWINOPS 18/19 size reports and
+OSC 4/10/11/12 colour queries. Attached clients register when they go live; for each
+output chunk the daemon decides once whether a registered, non-lagged client will see
+it. If one will, the chunk goes out raw and only the client answers. If none will, the
+daemon answers and every client receives the chunk with those queries removed, as does
+the replay buffer, so a resuming client never re-answers a query.
+
+Replies are rate-limited and written by a separate thread, so a program that floods
+queries without reading its input cannot stall output. Limits that remain:
+
+- A query in a chunk the daemon sent raw because a client was registered, but that the client then never
+  received, is not answered. That happens when the client's broadcast receiver overflows (1024 chunks)
+  or its forward queue (64 events) backs up and the attach ends, or the client disconnects between the
+  decision and delivery. The lag marker only protects chunks decided afterwards.
+- With several clients attached each client's emulator answers, as before this feature.
+- Reply writes use their own pty fd and wait at most 250 ms for the child to accept data, so a child
+  that never reads stdin drops replies instead of blocking output or user input.
+- A query introduced with a UTF-8 encoded C1 control (`C2 9B`) is answered but not stripped.
+- A lone trailing ESC, or an open CSI/OSC, is withheld from clients and replay until the next chunk or
+  pty EOF (there is no idle flush; releasing early could split a query across chunks). `ESC[` followed
+  only by C0 output such as newlines is withheld until a final byte arrives or 64 KiB accumulate.
+- A sequence still open after 64 KiB is released unheld, so a query completing later is answered but
+  not stripped from replay.
+- An OSC that mixes colour sets with queries is left for the client; the daemon ignores it.
+- DECRQM mirrors xterm.js's answers for the modes vt100 tracks (table in `mode_status`,
+  `crates/tymux-core/src/terminal_query.rs`). Modes xterm.js answers from client state or
+  features vt100 lacks (3, 12, 45, 1016, 2026, 9001) report 0 (not recognised), as does every
+  unknown mode, so a program probing synchronized output (2026) sees it as unsupported.
+- OSC 10/11/12 report xterm.js's dark defaults (white on black); set `TYMUXD_QUERY_FG`,
+  `TYMUXD_QUERY_BG` and `TYMUXD_QUERY_CURSOR` (`#rrggbb`) for a different client theme.
+- The kitty keyboard query (`CSI ? u`) is deliberately unanswered: claiming support would
+  make programs enable a protocol the browser client does not speak.
+
 ## Known Limitations
 
 - **Scrollback content does not survive a daemon restart** — only

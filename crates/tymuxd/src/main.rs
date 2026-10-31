@@ -1032,6 +1032,9 @@ impl TymuxService for TymuxDaemon {
         // which sibling of `AttachEvent.payload`'s oneof the live loop
         // populates for the rest of this stream (Task 2.2.1c).
         let mut output_rx = pane.subscribe();
+        // Until `go_live_after` below the daemon keeps answering terminal queries: chunks at or
+        // below the priming threshold never reach this client's emulator.
+        let live_client = pane.register_live_client();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let (priming_events, live_threshold_seq, emit_output_chunk, replay_chunks): (
             Vec<AttachEvent>,
@@ -1105,6 +1108,7 @@ impl TymuxService for TymuxDaemon {
                 (vec![snapshot_event], snapshot_seq, false, Vec::new())
             }
         };
+        live_client.go_live_after(live_threshold_seq);
         // Practically infallible this early (the receiver was just
         // created), but a client that cancelled instantly could already
         // be gone — benign either way, forward_handle's own sends will
@@ -1177,6 +1181,15 @@ impl TymuxService for TymuxDaemon {
                 tokio::select! {
                     biased;
                     result = output_rx.recv() => {
+                        // A lagged client skipped output, so the daemon must answer queries
+                        // until it is receiving again.
+                        match &result {
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                live_client.set_lagged(true);
+                            }
+                            Ok(_) => live_client.set_lagged(false),
+                            Err(_) => {}
+                        }
                         match forward_step_for_output_result(result, pane_for_exit.id, live_threshold_seq, emit_output_chunk) {
                             ForwardStep::Emit(event) => {
                                 if forward_tx.send(Ok(*event)).await.is_err() {
@@ -3596,7 +3609,7 @@ mod tests {
         // marker-in-broadcast-stream wait unreliable here.
         const LINE_COUNT: usize = 40_000;
         let cmd = format!(
-            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; printf 'FLOOD-D''ONE\\n'\n"
+            "awk 'BEGIN{{for(i=0;i<{LINE_COUNT};i++)printf \"L%07dE\\n\", i}}'; printf 'FLOOD-D''ONE\\n'\n"
         );
         pane.write_input(cmd.as_bytes()).unwrap();
 
@@ -3768,7 +3781,7 @@ mod tests {
         let stale_resume_from_seq = 1u64;
         const LINE_COUNT: usize = 40_000;
         let cmd = format!(
-            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; printf 'FLOOD-D''ONE\\n'\n"
+            "awk 'BEGIN{{for(i=0;i<{LINE_COUNT};i++)printf \"L%07dE\\n\", i}}'; printf 'FLOOD-D''ONE\\n'\n"
         );
         pane.write_input(cmd.as_bytes()).unwrap();
 
@@ -3921,7 +3934,7 @@ mod tests {
         let stale_resume_from_seq = 1u64;
         const LINE_COUNT: usize = 40_000;
         let cmd = format!(
-            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; printf 'FLOOD-D''ONE\\n'\n"
+            "awk 'BEGIN{{for(i=0;i<{LINE_COUNT};i++)printf \"L%07dE\\n\", i}}'; printf 'FLOOD-D''ONE\\n'\n"
         );
         pane.write_input(cmd.as_bytes()).unwrap();
         let flood_deadline = Instant::now() + Duration::from_secs(20);
