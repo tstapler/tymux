@@ -867,6 +867,7 @@ struct GatedBackend {
     armed: std::sync::atomic::AtomicBool,
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    deleted: std::sync::atomic::AtomicBool,
 }
 
 struct SharedBackend(Arc<GatedBackend>);
@@ -889,6 +890,9 @@ impl PersistenceBackend for SharedBackend {
     }
     fn delete(&self, session_id: Uuid) {
         self.0.disk.lock().unwrap().remove(&session_id);
+        self.0
+            .deleted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -901,6 +905,7 @@ fn a_session_killed_while_its_snapshot_is_being_saved_should_not_reappear_on_dis
         armed: Default::default(),
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
+        deleted: Default::default(),
     });
     let clock = Arc::new(ManualClock::new(T0));
     let engine = Arc::new(Engine::with_supervision(
@@ -931,6 +936,14 @@ fn a_session_killed_while_its_snapshot_is_being_saved_should_not_reappear_on_dis
         let engine = engine.clone();
         std::thread::spawn(move || engine.kill_session(session).unwrap())
     };
+    // Give the kill the chance to delete while the save is still in flight: without
+    // serialization it does so at once, with it the kill waits for the save to finish.
+    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    while !backend.deleted.load(std::sync::atomic::Ordering::SeqCst)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
     release_tx.send(()).unwrap();
     saver.join().unwrap();
     killer.join().unwrap();
