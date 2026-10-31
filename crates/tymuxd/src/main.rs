@@ -127,16 +127,9 @@ impl TymuxDaemon {
         }
     }
 
+    /// The pane's status as a response. Runs on a blocking thread: it takes the supervision
+    /// lock, which a restart holds across a process spawn.
     #[allow(clippy::result_large_err)]
-    fn pane_status_response(&self, pane_id: Uuid) -> Result<Response<ProtoPaneStatus>, Status> {
-        self.engine
-            .pane_status(pane_id)
-            .map(|status| Response::new(status_to_proto(&status)))
-            .ok_or_else(|| Status::not_found(format!("no such pane: {pane_id}")))
-    }
-
-    /// [`Self::pane_status_response`] on a blocking thread: it takes the supervision lock, which
-    /// a restart holds across a process spawn.
     async fn pane_status_blocking(
         &self,
         pane_id: Uuid,
