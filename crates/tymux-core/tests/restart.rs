@@ -860,6 +860,44 @@ async fn revive_should_leave_a_failed_pane_failed() {
     rig.engine.kill_session(session).unwrap();
 }
 
+#[tokio::test]
+async fn reviving_a_restored_session_with_no_panes_should_revive_zero_without_panicking() {
+    let dir = tmp_dir("no-panes");
+    let rig1 = rig_with(Box::new(
+        FsPersistenceBackend::new(dir.join("sessions")).unwrap(),
+    ));
+    let (session, _) = create(&rig1, long_running(), policy(RestartMode::Never));
+    let mut records = copy_records(&dir.join("sessions"), &dir.join("daemon-restart"));
+    rig1.engine.kill_session(session).unwrap();
+    for record in &mut records {
+        record.windows.clear();
+    }
+
+    let rig2 = rig();
+    rig2.engine.load_persisted(records);
+    assert_eq!(
+        rig2.engine.revive_session(session).unwrap(),
+        ReviveOutcome::Revived { pane_count: 0 }
+    );
+}
+
+#[tokio::test]
+async fn stopping_an_already_stopped_pane_should_say_nothing_more() {
+    let rig = rig();
+    let (session, id) = create(&rig, long_running(), policy(RestartMode::Always));
+    rig.engine.stop_pane(id, GRACE).unwrap();
+    pane(&rig, id).wait_exit().await;
+    let markers = |rig: &Rig| screen_text(&pane(rig, id)).matches("stopped").count();
+    let before = markers(&rig);
+    assert!(before >= 1, "the first stop leaves a marker");
+    assert_eq!(
+        rig.engine.stop_pane(id, GRACE).unwrap(),
+        SignalOutcome::Immediate
+    );
+    assert_eq!(markers(&rig), before, "a repeat stop must not add a marker");
+    rig.engine.kill_session(session).unwrap();
+}
+
 /// Records what is "on disk" and can hold one `save` open, to force the interleaving where a
 /// snapshot is taken, the session is killed, and only then is the snapshot written.
 struct GatedBackend {

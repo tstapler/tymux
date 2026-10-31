@@ -2184,7 +2184,8 @@ export const TymuxService: GenService<{
    * before that, such a session was reported already_live and nothing was respawned.
    * A pane the operator stopped (STOPPED, StopPane) or that ran out of restarts (FAILED)
    * is never revived by this call: it stays as it is while the session's other panes are
-   * revived. If every pane is STOPPED or FAILED the call is FAILED_PRECONDITION. Use
+   * revived, and pane_count counts only the panes started. If every pane is STOPPED or
+   * FAILED the call is FAILED_PRECONDITION. Use
    * StartPane (STOPPED or FAILED) or RestartPane (resets the budget) for those.
    *
    * @generated from rpc tymux.v1.TymuxService.ReviveSession

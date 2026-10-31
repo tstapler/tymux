@@ -67,10 +67,10 @@ stays `LIVE` only while a process runs; `DEAD` covers every other state.
 
 | RPC | Effect |
 |---|---|
-| `SetRestartPolicy` | takes effect at the pane's next exit; a pending backoff the new policy would not have scheduled is cancelled, one it would have is left on its schedule |
+| `SetRestartPolicy` | takes effect at the pane's next exit; a pending backoff the new policy would not have scheduled is cancelled (the stream gets a "restart cancelled" marker and a second `EXITED` event after the one sent when the process died), one it would have is left on its schedule |
 | `GetPaneStatus` | state, resolved policy, `restart_count` (lifetime), `restarts_in_window`, `consecutive_failures`, last exit code and time, `next_restart_at`, `started_at`, `uptime`, `pid`, and the daemon's clock (for a countdown that does not trust the client's) |
 | `RestartPane` | running: SIGTERM, SIGKILL after `grace_ms` (default 5000), respawn once it dies, no delay, not charged to the budget; dead (any state): respawn now. `reset_backoff` also clears the delay and the window. Returns after the new process started |
-| `StopPane` | SIGTERM, SIGKILL after the grace period, park in `STOPPED`, cancel a pending backoff. Returns once the process is reaped (or grace plus a 2 s margin) |
+| `StopPane` | SIGTERM, SIGKILL after the grace period, park in `STOPPED`, cancel a pending backoff; repeating it on a pane already `STOPPED` is a silent no-op. Returns once the process is reaped (or grace plus a 2 s margin) |
 | `StartPane` | from `STOPPED`, `EXITED`, `FAILED` or `BACKOFF`, with a fresh budget; `FAILED_PRECONDITION` if running. Also starts a single pane restored from disk |
 | `ResetRestartBudget` | clears delay and window; `FAILED` becomes `EXITED` and nothing starts |
 
@@ -119,7 +119,9 @@ the policy applies from then on.
 panes restored from disk. A session with any running pane is still `already_live` and nothing is spawned.
 A revive never overrides an operator decision: a pane in `STOPPED` (StopPane) or `FAILED` (restart budget used up)
 is skipped and stays as it is while the session's other panes are revived; if every pane is `STOPPED` or `FAILED` the
-call is `FAILED_PRECONDITION`. `StartPane` or `RestartPane` (which reset the budget) bring those back.
+call is `FAILED_PRECONDITION`. A mixed session (some panes held, others revivable) returns
+`Revived { pane_count: n }` counting only the panes started; the held panes stay as they are. A session with no panes
+revives to `pane_count: 0`. `StartPane` or `RestartPane` (which reset the budget) bring those back.
 
 ### Implementation
 

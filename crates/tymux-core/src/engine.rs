@@ -949,7 +949,7 @@ impl Engine {
                 Some(LifecycleState::Stopped | LifecycleState::Failed)
             )
         });
-        if pane_ids.is_empty() {
+        if pane_ids.is_empty() && !held.is_empty() {
             return Err(match self.supervision.state_of(held[0]) {
                 Some(LifecycleState::Stopped) => EngineError::PaneStopped(held[0]),
                 _ => EngineError::PaneFailed(held[0]),
@@ -1041,8 +1041,10 @@ impl Engine {
 
     /// Persists the session that owns `pane_id` (after its supervision changed).
     fn persist_session(&self, session_id: Uuid) {
-        // Every save goes through here: snapshot and save under one lock, and delete under it too, so a stale snapshot cannot
-        // be written after the session was killed.
+        // Every save goes through here: snapshot and save under one lock, and delete under it
+        // too, so a stale snapshot cannot be written after the kill. Taking the supervision
+        // snapshot before this lock would reintroduce that race, so a slow spawn (which holds
+        // the supervision lock) can stall persists; accepted.
         let _serialized = self.persist_lock.lock().unwrap();
         let record = {
             let sessions = self.sessions.lock().unwrap();

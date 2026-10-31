@@ -108,7 +108,8 @@ type TymuxServiceClient interface {
 	// before that, such a session was reported already_live and nothing was respawned.
 	// A pane the operator stopped (STOPPED, StopPane) or that ran out of restarts (FAILED)
 	// is never revived by this call: it stays as it is while the session's other panes are
-	// revived. If every pane is STOPPED or FAILED the call is FAILED_PRECONDITION. Use
+	// revived, and pane_count counts only the panes started. If every pane is STOPPED or
+	// FAILED the call is FAILED_PRECONDITION. Use
 	// StartPane (STOPPED or FAILED) or RestartPane (resets the budget) for those.
 	ReviveSession(context.Context, *connect.Request[v1.ReviveSessionRequest]) (*connect.Response[v1.ReviveSessionResponse], error)
 	// One-shot structured read of a pane's current screen — the AI-friendly
@@ -493,7 +494,8 @@ type TymuxServiceHandler interface {
 	// before that, such a session was reported already_live and nothing was respawned.
 	// A pane the operator stopped (STOPPED, StopPane) or that ran out of restarts (FAILED)
 	// is never revived by this call: it stays as it is while the session's other panes are
-	// revived. If every pane is STOPPED or FAILED the call is FAILED_PRECONDITION. Use
+	// revived, and pane_count counts only the panes started. If every pane is STOPPED or
+	// FAILED the call is FAILED_PRECONDITION. Use
 	// StartPane (STOPPED or FAILED) or RestartPane (resets the budget) for those.
 	ReviveSession(context.Context, *connect.Request[v1.ReviveSessionRequest]) (*connect.Response[v1.ReviveSessionResponse], error)
 	// One-shot structured read of a pane's current screen — the AI-friendly

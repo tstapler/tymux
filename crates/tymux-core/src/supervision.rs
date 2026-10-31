@@ -373,7 +373,9 @@ impl Supervision {
             }
             SignalOutcome::Signaled
         } else {
-            if let Some(pane) = pane {
+            // Stopping a pane that is already stopped changes nothing, so it says nothing.
+            let already_stopped = before.state() == LifecycleState::Stopped;
+            if let Some(pane) = pane.filter(|_| !already_stopped) {
                 let now = self.clock.now_ms();
                 let what = if before.state() == LifecycleState::Backoff {
                     "stopped; the pending restart is cancelled"
