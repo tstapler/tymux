@@ -2629,4 +2629,53 @@ mod tests {
             "spawned pane's environment must still inherit other variables"
         );
     }
+
+    /// A restart spawns through the same path, but is a separate call site worth pinning: the
+    /// respawned process must not inherit the daemon's token either.
+    #[test]
+    fn respawn_should_not_leak_tymuxd_token_into_pane_environment() {
+        let pane = Pane::spawn("/bin/sh", 300, 200).unwrap();
+        pane.write_input(b"exit\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pane.is_exited() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.is_exited(), "the first shell did not exit");
+
+        std::env::set_var("TYMUXD_TOKEN", "respawn-leaked-secret");
+        std::env::set_var("TYMUX_TEST_RESPAWN_VAR", "visible");
+        let respawned = pane.respawn_with(&|_| Vec::new());
+        let mut text = String::new();
+        let mut completed = false;
+        if respawned.is_ok() {
+            pane.write_input(b"env; echo DONE-MARKER | rev\n").unwrap();
+            while Instant::now() < deadline {
+                text = pane
+                    .snapshot()
+                    .grid
+                    .iter()
+                    .flatten()
+                    .map(|c| c.text.as_str())
+                    .collect();
+                if text.contains("REKRAM-ENOD") {
+                    completed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        std::env::remove_var("TYMUXD_TOKEN");
+        std::env::remove_var("TYMUX_TEST_RESPAWN_VAR");
+
+        respawned.unwrap();
+        assert!(completed, "the respawned shell's output did not complete");
+        assert!(
+            !text.contains("TYMUXD_TOKEN") && !text.contains("respawn-leaked-secret"),
+            "a respawned pane's environment must not contain TYMUXD_TOKEN"
+        );
+        assert!(
+            text.contains("TYMUX_TEST_RESPAWN_VAR=visible"),
+            "a respawned pane must still inherit other variables"
+        );
+    }
 }

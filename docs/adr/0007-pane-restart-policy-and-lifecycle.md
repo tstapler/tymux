@@ -110,13 +110,16 @@ After a daemon restart the process is gone and the v1 persistence ADR's rule
 ([ADR-002](../../project_plans/v1-release/decisions/ADR-002-persistence-durability-tiers.md)) that nothing is revived
 automatically on startup still holds, so `LIVE`, `BACKOFF` and `RESTARTING` come back as `EXITED`: a pending
 backoff timer is dropped, not resumed. `STOPPED` and `FAILED` stay as they were; `restart_count`, the window log and
-`consecutive_failures` are kept. `ReviveSession`, `StartPane` or `RestartPane` starts the pane, with a fresh budget;
+`consecutive_failures` are kept. `StartPane` or `RestartPane` starts any of them, with a fresh budget (`ReviveSession` does too, except for `STOPPED` and `FAILED`, see below);
 the policy applies from then on.
 
 ### ReviveSession
 
 `ReviveSession` now respawns panes whose child exited in this daemon (in place, same pane and subscribers) as well as
 panes restored from disk. A session with any running pane is still `already_live` and nothing is spawned.
+A revive never overrides an operator decision: a pane in `STOPPED` (StopPane) or `FAILED` (restart budget used up)
+is skipped and stays as it is while the session's other panes are revived; if every pane is `STOPPED` or `FAILED` the
+call is `FAILED_PRECONDITION`. `StartPane` or `RestartPane` (which reset the budget) bring those back.
 
 ### Implementation
 

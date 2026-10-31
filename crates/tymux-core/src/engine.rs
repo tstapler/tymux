@@ -103,6 +103,8 @@ pub enum EngineError {
     PaneRunning(Uuid),
     /// The pane was stopped on purpose; only StartPane (or RestartPane) brings it back.
     PaneStopped(Uuid),
+    /// The pane ran out of restarts; only RestartPane/StartPane (which reset the budget) revive it.
+    PaneFailed(Uuid),
     InvalidRestartPolicy(String),
     /// Starting or stopping the pane's process failed.
     PaneStart {
@@ -134,6 +136,10 @@ impl std::fmt::Display for EngineError {
             EngineError::PaneStopped(id) => write!(
                 f,
                 "pane {id} was stopped with StopPane; use StartPane to run it again"
+            ),
+            EngineError::PaneFailed(id) => write!(
+                f,
+                "pane {id} exhausted its restart budget; use RestartPane or StartPane to run it again"
             ),
             EngineError::InvalidRestartPolicy(why) => write!(f, "invalid restart policy: {why}"),
             EngineError::PaneStart { pane_id, message } => {
@@ -935,12 +941,19 @@ impl Engine {
             return Ok(ReviveOutcome::AlreadyLive);
         }
 
-        // An explicit StopPane is not overridden by a revive; the operator starts it again.
-        if let Some(stopped) = pane_ids
-            .iter()
-            .find(|id| self.supervision.state_of(**id) == Some(LifecycleState::Stopped))
-        {
-            return Err(EngineError::PaneStopped(*stopped));
+        // A revive never overrides an operator's decision: STOPPED and FAILED panes stay as
+        // they are (StartPane/RestartPane bring them back); every other pane is revived.
+        let (held, pane_ids): (Vec<Uuid>, Vec<Uuid>) = pane_ids.into_iter().partition(|id| {
+            matches!(
+                self.supervision.state_of(*id),
+                Some(LifecycleState::Stopped | LifecycleState::Failed)
+            )
+        });
+        if pane_ids.is_empty() {
+            return Err(match self.supervision.state_of(held[0]) {
+                Some(LifecycleState::Stopped) => EngineError::PaneStopped(held[0]),
+                _ => EngineError::PaneFailed(held[0]),
+            });
         }
 
         // Resolve every pane's launch first, so a file deleted since the session died fails

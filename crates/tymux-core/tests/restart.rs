@@ -782,25 +782,65 @@ async fn stopping_a_pane_that_is_already_dead_should_still_leave_a_stopped_marke
 }
 
 #[tokio::test]
-async fn revive_should_not_override_an_explicit_stop_but_may_revive_a_failed_pane() {
+async fn revive_should_start_only_panes_the_operator_did_not_stop() {
     let rig = rig();
-    let (session, id) = create(&rig, long_running(), policy(RestartMode::Always));
-    let p = pane(&rig, id);
-    rig.engine.stop_pane(id, GRACE).unwrap();
-    p.wait_exit().await;
+    let (session, a) = create(&rig, long_running(), policy(RestartMode::Never));
+    let snap = rig
+        .engine
+        .split_pane(
+            a,
+            tymux_core::Orientation::Horizontal,
+            Some("/bin/sh".into()),
+        )
+        .unwrap();
+    let b = {
+        let mut ids = Vec::new();
+        collect_leaves(&snap.windows[0].layout, &mut ids);
+        *ids.iter().find(|id| **id != a).unwrap()
+    };
+    rig.engine.stop_pane(a, GRACE).unwrap();
+    pane(&rig, a).wait_exit().await;
+    pane(&rig, b).write_input(b"exit 1\n").unwrap();
+    pane(&rig, b).wait_exit().await;
+    assert_eq!(state(&rig, a), LifecycleState::Stopped);
+    assert_eq!(state(&rig, b), LifecycleState::Exited);
+
     assert_eq!(
-        rig.engine.revive_session(session),
-        Err(EngineError::PaneStopped(id))
+        rig.engine.revive_session(session).unwrap(),
+        ReviveOutcome::Revived { pane_count: 1 }
     );
-    assert_eq!(
-        state(&rig, id),
-        LifecycleState::Stopped,
-        "nothing was started"
-    );
-    rig.engine.start_pane(id).unwrap();
-    assert_eq!(state(&rig, id), LifecycleState::Live);
+    assert_eq!(state(&rig, a), LifecycleState::Stopped, "A stays stopped");
+    assert_eq!(state(&rig, b), LifecycleState::Live, "B is revived");
+
     rig.engine.kill_session(session).unwrap();
 
+    // Nothing but a stopped pane: an error that names StartPane, and StartPane works.
+    let (session, only) = create(&rig, long_running(), policy(RestartMode::Never));
+    rig.engine.stop_pane(only, GRACE).unwrap();
+    pane(&rig, only).wait_exit().await;
+    assert_eq!(
+        rig.engine.revive_session(session),
+        Err(EngineError::PaneStopped(only))
+    );
+    rig.engine.start_pane(only).unwrap();
+    assert_eq!(state(&rig, only), LifecycleState::Live);
+    rig.engine.kill_session(session).unwrap();
+}
+
+fn collect_leaves(layout: &LayoutSnapshot, out: &mut Vec<Uuid>) {
+    match layout {
+        LayoutSnapshot::Leaf(info) => out.push(info.id),
+        LayoutSnapshot::Split { children, .. } => {
+            for (child, _) in children {
+                collect_leaves(child, out);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn revive_should_leave_a_failed_pane_failed() {
+    let rig = rig();
     let (session, id) = create(&rig, sh_launch("exit 1"), policy(RestartMode::Always));
     for _ in 0..4 {
         pane(&rig, id).wait_exit().await;
@@ -811,9 +851,12 @@ async fn revive_should_not_override_an_explicit_stop_but_may_revive_a_failed_pan
     }
     assert_eq!(state(&rig, id), LifecycleState::Failed);
     assert_eq!(
-        rig.engine.revive_session(session).unwrap(),
-        ReviveOutcome::Revived { pane_count: 1 }
+        rig.engine.revive_session(session),
+        Err(EngineError::PaneFailed(id))
     );
+    assert_eq!(state(&rig, id), LifecycleState::Failed);
+    rig.engine.restart_pane(id, true, GRACE).unwrap();
+    assert_ne!(state(&rig, id), LifecycleState::Failed);
     rig.engine.kill_session(session).unwrap();
 }
 

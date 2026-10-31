@@ -680,6 +680,9 @@ fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
         tymux_core::EngineError::PaneStopped(id) => Status::failed_precondition(format!(
             "pane {id} was stopped with StopPane and is not revived implicitly: use StartPane"
         )),
+        tymux_core::EngineError::PaneFailed(id) => Status::failed_precondition(format!(
+            "pane {id} exhausted its restart budget and is not revived implicitly: use RestartPane or StartPane"
+        )),
         tymux_core::EngineError::PaneRunning(id) => {
             Status::failed_precondition(format!("pane {id} is already running"))
         }

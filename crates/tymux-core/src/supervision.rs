@@ -566,3 +566,93 @@ fn announce_failed_spawn(entry: &Entry, pane: &Pane, kind: ExitKind, error: &str
         _ => pane.inject_output(&marker(&format!("start failed ({error})"))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::restart::{FixedJitter, ManualClock, RestartMode, RestartPolicy};
+
+    fn never() -> RestartPolicy {
+        RestartPolicy {
+            mode: RestartMode::Never,
+            max_restarts: 3,
+            window_ms: 60_000,
+            initial_delay_ms: 1_000,
+            multiplier: 2.0,
+            max_delay_ms: 8_000,
+            jitter: 0.0,
+            healthy_after_ms: 10_000,
+        }
+    }
+
+    fn supervised_shell() -> (Arc<Supervision>, Arc<Pane>) {
+        let sup = Supervision::new(
+            Arc::new(ManualClock::new(1_000)),
+            Arc::new(FixedJitter(0.5)),
+        );
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        sup.register_live(&pane, never());
+        (sup, pane)
+    }
+
+    fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_reaped_childs_pid_should_be_cleared_before_the_exit_hook_runs() {
+        let (_sup, pane) = supervised_shell();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        pane.set_exit_hook(Arc::new(move |p, _| {
+            seen_tx.send(p.pid()).unwrap();
+            false
+        }));
+        pane.write_input(b"exit\n").unwrap();
+        let pid_in_hook = seen_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            pid_in_hook, None,
+            "a reaped pid can be recycled; never signal it"
+        );
+    }
+
+    #[test]
+    fn restart_between_the_exit_hook_and_exited_should_wait_instead_of_failing_the_spawn() {
+        let (sup, pane) = supervised_shell();
+        let (accounted_tx, accounted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let hook_sup = sup.clone();
+        pane.set_exit_hook(Arc::new(move |p, code| {
+            let pending = hook_sup.handle_exit(p, code);
+            accounted_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            pending
+        }));
+        pane.write_input(b"exit\n").unwrap();
+        accounted_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(
+            !pane.is_exited(),
+            "the window under test: accounted, not yet published"
+        );
+
+        let outcome = sup.restart(pane.id, true, Duration::from_secs(1));
+        assert_eq!(outcome, Ok(SignalOutcome::Signaled));
+        release_tx.send(()).unwrap();
+        wait_until("the pane to be published as exited", || pane.is_exited());
+
+        assert_eq!(sup.state_of(pane.id), Some(LifecycleState::Restarting));
+        sup.run_due();
+        wait_until("the restarted shell", || {
+            !pane.is_exited() && sup.state_of(pane.id) == Some(LifecycleState::Live)
+        });
+        pane.retire();
+        let _ = pane.terminate(Duration::from_secs(1));
+    }
+}

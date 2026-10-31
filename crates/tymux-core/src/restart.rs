@@ -417,12 +417,12 @@ impl PaneSupervisor {
         self.after_failure(now, code, ran_for, unit)
     }
 
-    /// Spawning the process failed. Counts as an immediate failed run, so a pane whose launch
-    /// can never succeed (missing binary, deleted argument file) still ends in `Failed`.
+    /// Spawning the process failed. Counts as a failed run that never became healthy, so a pane
+    /// whose launch can never succeed (missing binary, deleted argument file) still ends in `Failed`.
     pub fn on_spawn_failed(&mut self, now: u64, unit: f64) -> ExitKind {
         self.started_at_ms = None;
         self.next_restart_at_ms = None;
-        self.after_failure(now, None, Some(0), unit)
+        self.after_failure(now, None, None, unit)
     }
 
     fn after_failure(
@@ -933,6 +933,30 @@ mod tests {
         }
         assert_eq!(kind, ExitKind::Failed);
         assert_eq!(scheduled, 3);
+    }
+
+    #[test]
+    fn a_failed_spawn_should_not_reset_the_backoff_even_when_healthy_after_is_zero() {
+        let mut p = policy(RestartMode::Always);
+        p.healthy_after_ms = 0;
+        p.max_restarts = 10;
+        let mut s = PaneSupervisor::new(p);
+        s.on_started(0);
+        s.on_exit(0, Some(1), None, 0.5);
+        let ExitKind::Scheduled { at_ms, .. } = s.on_spawn_failed(1_000, 0.5) else {
+            panic!("expected a retry");
+        };
+        let first = at_ms - 1_000;
+        let ExitKind::Scheduled {
+            delay_ms: second, ..
+        } = s.on_spawn_failed(at_ms, 0.5)
+        else {
+            panic!("expected a retry");
+        };
+        assert!(
+            second > first,
+            "backoff must keep growing: {first} then {second}"
+        );
     }
 
     #[test]
