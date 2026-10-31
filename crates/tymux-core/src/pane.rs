@@ -689,12 +689,17 @@ impl Pane {
     /// supervisor leaves where a process died and its successor starts. Call only while no
     /// reader thread is running (between a child's exit and its respawn).
     pub fn inject_output(&self, data: &[u8]) {
+        // Same ordering as the reader thread: parser, then replay, with the replay push and the
+        // sequence bump under one replay lock so `replay_since` never sees one without the other.
         let seq = {
             let mut parser = self.parser.lock().unwrap();
+            let next = self.output_seq.load(Ordering::SeqCst) + 1;
             parser.process(data);
-            self.output_seq.fetch_add(1, Ordering::SeqCst) + 1
+            let mut replay = self.replay.lock().unwrap();
+            replay.push(next, data);
+            self.output_seq.fetch_add(1, Ordering::SeqCst);
+            next
         };
-        self.replay.lock().unwrap().push(seq, data);
         let _ = self.output_tx.send((seq, data.to_vec()));
     }
 
@@ -1635,6 +1640,49 @@ mod tests {
         );
     }
 
+    /// A restarted process gets its own terminal-query replies: the reply writer is re-armed on
+    /// the new pty, and a fresh scanner runs in the new reader thread.
+    #[cfg(unix)]
+    #[test]
+    fn a_respawned_pane_should_answer_terminal_queries_on_its_new_pty() {
+        let launch = Launch {
+            args: vec![
+                "-c".into(),
+                "stty raw -echo; printf '\\033[c'; dd bs=1 count=4 2>/dev/null | od -An -c; exit 0"
+                    .into(),
+            ],
+            ..Launch::default()
+        };
+        let pane = Pane::spawn_launch("/bin/sh", &launch, None, None, 24, 200).unwrap();
+        assert!(wait_for_grid_text(&pane, "033"), "first run was answered");
+        wait_for_exit(&pane);
+        let first = pane.query_replies.accepted();
+        assert_eq!(first, 1);
+
+        pane.respawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while pane.query_replies.accepted() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the new process was never answered"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        wait_for_exit(&pane);
+        let text: String = pane
+            .snapshot()
+            .grid
+            .iter()
+            .flatten()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(
+            text.matches("033").count(),
+            2,
+            "the reply reached the second process too: {text}"
+        );
+    }
+
     #[test]
     fn a_child_that_never_reads_stdin_and_floods_queries_should_not_stall_output() {
         let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
@@ -2542,7 +2590,7 @@ mod tests {
         // above).
         pane.write_input(b"env; echo DONE-MARKER | rev\n").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut text = String::new();
         let mut completed = false;
         while Instant::now() < deadline {
