@@ -135,6 +135,21 @@ impl TymuxDaemon {
             .ok_or_else(|| Status::not_found(format!("no such pane: {pane_id}")))
     }
 
+    /// [`Self::pane_status_response`] on a blocking thread: it takes the supervision lock, which
+    /// a restart holds across a process spawn.
+    async fn pane_status_blocking(
+        &self,
+        pane_id: Uuid,
+    ) -> Result<Response<ProtoPaneStatus>, Status> {
+        let engine = self.engine.clone();
+        let status = tokio::task::spawn_blocking(move || engine.pane_status(pane_id))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        status
+            .map(|s| Response::new(status_to_proto(&s)))
+            .ok_or_else(|| Status::not_found(format!("no such pane: {pane_id}")))
+    }
+
     /// Waits for the pane's process to die (bounded by `grace` plus a margin), then runs the
     /// supervisor so a restart that was waiting on the exit happens before the caller replies.
     async fn wait_for_restart(&self, pane_id: Uuid, generation_before: u64, grace: Duration) {
@@ -662,6 +677,9 @@ fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
         tymux_core::EngineError::ReviveLaunch { pane_id, message } => {
             Status::failed_precondition(format!("cannot revive pane {pane_id}: {message}"))
         }
+        tymux_core::EngineError::PaneStopped(id) => Status::failed_precondition(format!(
+            "pane {id} was stopped with StopPane and is not revived implicitly: use StartPane"
+        )),
         tymux_core::EngineError::PaneRunning(id) => {
             Status::failed_precondition(format!("pane {id} is already running"))
         }
@@ -1171,18 +1189,26 @@ impl TymuxService for TymuxDaemon {
         let status = match req.target {
             Some(Target::PaneId(id)) => {
                 let pane_id = parse_uuid(&id)?;
-                let status = self
-                    .engine
-                    .set_restart_policy(pane_id, policy)
-                    .map_err(engine_error_to_status)?;
+                let engine = self.engine.clone();
+                // Persists the session record, so not on an async worker.
+                let status =
+                    tokio::task::spawn_blocking(move || engine.set_restart_policy(pane_id, policy))
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map_err(engine_error_to_status)?;
                 tracing::info!(pane_id = %pane_id, "restart policy set");
                 Some(status_to_proto(&status))
             }
             Some(Target::SessionId(id)) => {
                 let session_id = parse_uuid(&id)?;
-                self.engine
-                    .set_session_restart_policy(session_id, policy, req.apply_to_existing_panes)
-                    .map_err(engine_error_to_status)?;
+                let engine = self.engine.clone();
+                let apply = req.apply_to_existing_panes;
+                tokio::task::spawn_blocking(move || {
+                    engine.set_session_restart_policy(session_id, policy, apply)
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(engine_error_to_status)?;
                 tracing::info!(session_id = %session_id, "session default restart policy set");
                 None
             }
@@ -1200,7 +1226,7 @@ impl TymuxService for TymuxDaemon {
         request: Request<GetPaneStatusRequest>,
     ) -> Result<Response<ProtoPaneStatus>, Status> {
         let pane_id = parse_uuid(&request.into_inner().pane_id)?;
-        self.pane_status_response(pane_id)
+        self.pane_status_blocking(pane_id).await
     }
 
     async fn restart_pane(
@@ -1225,7 +1251,7 @@ impl TymuxService for TymuxDaemon {
                 .await;
         }
         tracing::info!(pane_id = %pane_id, "pane restarted");
-        self.pane_status_response(pane_id)
+        self.pane_status_blocking(pane_id).await
     }
 
     async fn stop_pane(
@@ -1246,7 +1272,7 @@ impl TymuxService for TymuxDaemon {
             }
         }
         tracing::info!(pane_id = %pane_id, "pane stopped");
-        self.pane_status_response(pane_id)
+        self.pane_status_blocking(pane_id).await
     }
 
     async fn start_pane(
@@ -1260,7 +1286,7 @@ impl TymuxService for TymuxDaemon {
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(engine_error_to_status)?;
         tracing::info!(pane_id = %pane_id, "pane started");
-        self.pane_status_response(pane_id)
+        self.pane_status_blocking(pane_id).await
     }
 
     async fn reset_restart_budget(
@@ -1268,10 +1294,12 @@ impl TymuxService for TymuxDaemon {
         request: Request<ResetRestartBudgetRequest>,
     ) -> Result<Response<ProtoPaneStatus>, Status> {
         let pane_id = parse_uuid(&request.into_inner().pane_id)?;
-        self.engine
-            .reset_restart_budget(pane_id)
+        let engine = self.engine.clone();
+        tokio::task::spawn_blocking(move || engine.reset_restart_budget(pane_id))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
             .map_err(engine_error_to_status)?;
-        self.pane_status_response(pane_id)
+        self.pane_status_blocking(pane_id).await
     }
 
     async fn write_stdin(

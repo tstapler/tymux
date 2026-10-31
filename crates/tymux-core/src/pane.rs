@@ -178,7 +178,7 @@ pub struct Pane {
     exit_code: Mutex<Option<i32>>,
     /// Captured at spawn so `kill` can signal without taking `_child`; 0 = none. Replaced by
     /// [`Self::respawn`].
-    pid: AtomicU32,
+    pid: Arc<AtomicU32>,
     /// Bumped by every respawn, so a delayed SIGKILL aimed at an old process never hits its
     /// successor.
     generation: Arc<AtomicU64>,
@@ -431,7 +431,7 @@ impl Pane {
             resize_delay_ms: std::sync::atomic::AtomicU64::new(0),
             exit_notify: Notify::new(),
             exit_code: Mutex::new(None),
-            pid: AtomicU32::new(process.pid.unwrap_or(0)),
+            pid: Arc::new(AtomicU32::new(process.pid.unwrap_or(0))),
             generation: Arc::new(AtomicU64::new(0)),
             last_signal: AtomicI32::new(0),
             restart_pending: AtomicBool::new(false),
@@ -534,6 +534,9 @@ impl Pane {
                 Err(_) => None,
             };
             *pane_for_reader.exit_code.lock().unwrap() = code;
+            // Reaped: from here no signal may be aimed at this pid (it can be recycled), not even
+            // by a SIGKILL escalation already scheduled or a Stop that raced the hook below.
+            pane_for_reader.pid.store(0, Ordering::SeqCst);
             // The supervisor decides here, before the exit becomes visible, whether a restart
             // follows, so a client that sees `is_exited()` also sees `restart_pending()`.
             let hook = {
@@ -780,6 +783,7 @@ impl Pane {
         }
         let exited = self.exited.clone();
         let generation = self.generation.clone();
+        let live_pid = self.pid.clone();
         let this_generation = generation.load(Ordering::SeqCst);
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + grace;
@@ -795,6 +799,7 @@ impl Pane {
             // killing the successor process.
             if !exited.load(Ordering::SeqCst)
                 && generation.load(Ordering::SeqCst) == this_generation
+                && live_pid.load(Ordering::SeqCst) == pid
             {
                 // SAFETY: as above; `exited` is set right after the reap.
                 unsafe { libc::kill(pid as i32, libc::SIGKILL) };

@@ -328,9 +328,16 @@ impl Supervision {
             .entries
             .get_mut(&pane_id)
             .ok_or(EngineError::PaneNotFound(pane_id))?;
+        let was_backoff = entry.sup.state() == LifecycleState::Backoff;
         entry.sup.set_policy(policy);
         if let Some(pane) = entry.pane.upgrade() {
             pane.set_restart_pending(entry.sup.restart_pending());
+            if was_backoff && entry.sup.state() == LifecycleState::Exited {
+                // The restart announced at exit will not happen; say so before the stream ends.
+                pane.inject_output(&marker("restart cancelled: the restart policy changed"));
+                let now = self.clock.now_ms();
+                pane.emit_lifecycle(event(LifecycleEventKind::Exited, &entry.sup, now, |_| {}));
+            }
         }
         inner.dirty.insert(pane_id);
         self.wake.notify_one();
@@ -345,6 +352,7 @@ impl Supervision {
             .entries
             .get_mut(&pane_id)
             .ok_or(EngineError::PaneNotFound(pane_id))?;
+        let before = entry.sup.clone();
         let needs_signal = entry.sup.request_stop();
         let pane = entry.pane.upgrade();
         if let Some(pane) = &pane {
@@ -353,15 +361,26 @@ impl Supervision {
         let outcome = if needs_signal {
             if let Some(pane) = pane.filter(|p| !p.is_exited()) {
                 // The exit hook emits the Stopped event once the process is really gone.
-                pane.terminate(grace).map_err(|e| EngineError::PaneStart {
-                    pane_id,
-                    message: e.to_string(),
-                })?;
+                if let Err(e) = pane.terminate(grace) {
+                    // Still running and still supervised as before, not a phantom Stopped.
+                    pane.set_restart_pending(before.restart_pending());
+                    entry.sup = before;
+                    return Err(EngineError::PaneStart {
+                        pane_id,
+                        message: e.to_string(),
+                    });
+                }
             }
             SignalOutcome::Signaled
         } else {
             if let Some(pane) = pane {
                 let now = self.clock.now_ms();
+                let what = if before.state() == LifecycleState::Backoff {
+                    "stopped; the pending restart is cancelled"
+                } else {
+                    "stopped"
+                };
+                pane.inject_output(&marker(what));
                 pane.emit_lifecycle(event(LifecycleEventKind::Stopped, &entry.sup, now, |_| {}));
             }
             SignalOutcome::Immediate
@@ -384,15 +403,29 @@ impl Supervision {
         let entry = entries
             .get_mut(&pane_id)
             .ok_or(EngineError::PaneNotFound(pane_id))?;
+        let before = entry.sup.clone();
         let signaled = entry.sup.request_restart(reset_backoff);
         dirty.insert(pane_id);
         if signaled {
             if let Some(pane) = entry.running_pane() {
-                pane.terminate(grace).map_err(|e| EngineError::PaneStart {
-                    pane_id,
-                    message: e.to_string(),
-                })?;
+                if let Err(e) = pane.terminate(grace) {
+                    entry.sup = before;
+                    return Err(EngineError::PaneStart {
+                        pane_id,
+                        message: e.to_string(),
+                    });
+                }
             }
+            self.wake.notify_one();
+            return Ok(SignalOutcome::Signaled);
+        }
+        if let Some(pane) = entry.running_pane() {
+            // The old process's exit is accounted but not yet published (the reader thread is
+            // between the exit hook and setting `exited`). Respawning now would fail; let the
+            // supervisor do it once the exit is visible, as for a restart of a live pane.
+            let now = self.clock.now_ms();
+            entry.sup.schedule_manual_restart_now(now);
+            pane.set_restart_pending(true);
             self.wake.notify_one();
             return Ok(SignalOutcome::Signaled);
         }

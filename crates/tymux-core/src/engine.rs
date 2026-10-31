@@ -101,6 +101,8 @@ pub enum EngineError {
     },
     /// The pane has a running process, so it cannot be started.
     PaneRunning(Uuid),
+    /// The pane was stopped on purpose; only StartPane (or RestartPane) brings it back.
+    PaneStopped(Uuid),
     InvalidRestartPolicy(String),
     /// Starting or stopping the pane's process failed.
     PaneStart {
@@ -129,6 +131,10 @@ impl std::fmt::Display for EngineError {
                 write!(f, "cannot revive pane {pane_id}: {message}")
             }
             EngineError::PaneRunning(id) => write!(f, "pane {id} is already running"),
+            EngineError::PaneStopped(id) => write!(
+                f,
+                "pane {id} was stopped with StopPane; use StartPane to run it again"
+            ),
             EngineError::InvalidRestartPolicy(why) => write!(f, "invalid restart policy: {why}"),
             EngineError::PaneStart { pane_id, message } => {
                 write!(f, "cannot start pane {pane_id}: {message}")
@@ -507,12 +513,7 @@ impl Engine {
             window_index.insert_pane(pane_id, window_id);
         }
 
-        let record = {
-            let sessions = self.sessions.lock().unwrap();
-            let panes = self.panes.lock().unwrap();
-            self.snapshot_persisted_record(&sessions, &panes, id)
-        };
-        self.save_persisted(record);
+        self.persist_session(id);
         Ok(id)
     }
 
@@ -718,14 +719,12 @@ impl Engine {
             .unwrap()
             .insert_pane(new_pane_id, window_id);
 
-        let (snapshot, record) = {
+        let snapshot = {
             let sessions = self.sessions.lock().unwrap();
             let panes = self.panes.lock().unwrap();
-            let snapshot = session_to_snapshot(&sessions[&session_id], &panes, &self.supervision);
-            let record = self.snapshot_persisted_record(&sessions, &panes, session_id);
-            (snapshot, record)
+            session_to_snapshot(&sessions[&session_id], &panes, &self.supervision)
         };
-        self.save_persisted(record);
+        self.persist_session(session_id);
         self.notify_window_changed(window_id);
         Ok(snapshot)
     }
@@ -779,29 +778,24 @@ impl Engine {
             }
         }
 
-        let (removed_session, final_snapshot, record) = if session_closed.is_some() {
-            (sessions.remove(&session_id), None, None)
+        let (removed_session, final_snapshot) = if session_closed.is_some() {
+            (sessions.remove(&session_id), None)
         } else {
-            let (snapshot, record) = {
-                let panes = self.panes.lock().unwrap();
-                let record = self.snapshot_persisted_record(&sessions, &panes, session_id);
-                (
-                    Some(session_to_snapshot(
-                        &sessions[&session_id],
-                        &panes,
-                        &self.supervision,
-                    )),
-                    record,
-                )
-            };
-            (None, snapshot, record)
+            let panes = self.panes.lock().unwrap();
+            let snapshot = Some(session_to_snapshot(
+                &sessions[&session_id],
+                &panes,
+                &self.supervision,
+            ));
+            (None, snapshot)
         };
         drop(sessions);
         if removed_session.is_some() {
             let _serialized = self.persist_lock.lock().unwrap();
             self.persistence.delete(session_id);
+        } else {
+            self.persist_session(session_id);
         }
-        self.save_persisted(record);
 
         // Keep the O(1) reverse index in sync: the closed pane is always
         // gone; the window is gone too only when it had no panes left
@@ -885,11 +879,10 @@ impl Engine {
         }
 
         let panes = self.panes.lock().unwrap();
-        let record = self.snapshot_persisted_record(&sessions, &panes, session_id);
         let snapshot = session_to_snapshot(&sessions[&session_id], &panes, &self.supervision);
         drop(sessions);
         drop(panes);
-        self.save_persisted(record);
+        self.persist_session(session_id);
         Ok(snapshot)
     }
 
@@ -942,6 +935,14 @@ impl Engine {
             return Ok(ReviveOutcome::AlreadyLive);
         }
 
+        // An explicit StopPane is not overridden by a revive; the operator starts it again.
+        if let Some(stopped) = pane_ids
+            .iter()
+            .find(|id| self.supervision.state_of(**id) == Some(LifecycleState::Stopped))
+        {
+            return Err(EngineError::PaneStopped(*stopped));
+        }
+
         // Resolve every pane's launch first, so a file deleted since the session died fails
         // the whole revive instead of respawning some panes without the argument they were
         // created with.
@@ -970,12 +971,7 @@ impl Engine {
             }
         }
 
-        let record = {
-            let sessions = self.sessions.lock().unwrap();
-            let panes = self.panes.lock().unwrap();
-            self.snapshot_persisted_record(&sessions, &panes, session_id)
-        };
-        self.save_persisted(record);
+        self.persist_session(session_id);
 
         tracing::info!(session_id = %session_id, pane_count = revived, "session revived");
         Ok(ReviveOutcome::Revived {
@@ -1032,7 +1028,7 @@ impl Engine {
 
     /// Persists the session that owns `pane_id` (after its supervision changed).
     fn persist_session(&self, session_id: Uuid) {
-        // Snapshot and save under one lock, and delete under it too, so a stale snapshot cannot
+        // Every save goes through here: snapshot and save under one lock, and delete under it too, so a stale snapshot cannot
         // be written after the session was killed.
         let _serialized = self.persist_lock.lock().unwrap();
         let record = {
@@ -1328,12 +1324,7 @@ impl Engine {
         tracing::debug!(window_id = %window_id, rows, cols, "window geometry recomputed");
         self.notify_window_changed(window_id);
 
-        let record = {
-            let sessions = self.sessions.lock().unwrap();
-            let panes = self.panes.lock().unwrap();
-            self.snapshot_persisted_record(&sessions, &panes, session_id)
-        };
-        self.save_persisted(record);
+        self.persist_session(session_id);
 
         Some((rows, cols))
     }

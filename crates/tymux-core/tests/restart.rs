@@ -735,3 +735,164 @@ async fn wait_final_exit_should_stay_pending_through_backoff_and_resolve_when_it
     waiter.await.unwrap();
     rig.engine.kill_session(session).unwrap();
 }
+
+#[tokio::test]
+async fn cancelling_a_pending_restart_by_policy_should_say_so_and_end_with_a_final_event() {
+    let rig = rig();
+    let (session, id) = create(&rig, sh_launch("exit 1"), policy(RestartMode::Always));
+    let p = pane(&rig, id);
+    let mut events = p.subscribe_lifecycle();
+    p.wait_exit().await;
+    assert_eq!(state(&rig, id), LifecycleState::Backoff);
+
+    rig.engine
+        .set_restart_policy(id, policy(RestartMode::Never))
+        .unwrap();
+    let mut kinds = Vec::new();
+    while let Ok(e) = events.try_recv() {
+        kinds.push((e.kind, e.state));
+    }
+    assert_eq!(
+        kinds.last(),
+        Some(&(LifecycleEventKind::Exited, LifecycleState::Exited)),
+        "the last event must not still say a restart is scheduled: {kinds:?}"
+    );
+    let text = screen_text(&p);
+    assert!(text.contains("restarting in 1.0s"), "{text}");
+    assert!(text.contains("restart cancelled"), "{text}");
+    rig.engine.kill_session(session).unwrap();
+}
+
+#[tokio::test]
+async fn stopping_a_pane_that_is_already_dead_should_still_leave_a_stopped_marker() {
+    let rig = rig();
+    let (session, id) = create(&rig, sh_launch("exit 0"), RestartPolicy::default());
+    let p = pane(&rig, id);
+    p.wait_exit().await;
+    assert_eq!(
+        rig.engine.stop_pane(id, GRACE).unwrap(),
+        SignalOutcome::Immediate
+    );
+    assert!(
+        screen_text(&p).contains("[tymux: stopped]"),
+        "{}",
+        screen_text(&p)
+    );
+    rig.engine.kill_session(session).unwrap();
+}
+
+#[tokio::test]
+async fn revive_should_not_override_an_explicit_stop_but_may_revive_a_failed_pane() {
+    let rig = rig();
+    let (session, id) = create(&rig, long_running(), policy(RestartMode::Always));
+    let p = pane(&rig, id);
+    rig.engine.stop_pane(id, GRACE).unwrap();
+    p.wait_exit().await;
+    assert_eq!(
+        rig.engine.revive_session(session),
+        Err(EngineError::PaneStopped(id))
+    );
+    assert_eq!(
+        state(&rig, id),
+        LifecycleState::Stopped,
+        "nothing was started"
+    );
+    rig.engine.start_pane(id).unwrap();
+    assert_eq!(state(&rig, id), LifecycleState::Live);
+    rig.engine.kill_session(session).unwrap();
+
+    let (session, id) = create(&rig, sh_launch("exit 1"), policy(RestartMode::Always));
+    for _ in 0..4 {
+        pane(&rig, id).wait_exit().await;
+        if let Some(at) = rig.engine.pane_status(id).unwrap().view.next_restart_at_ms {
+            rig.clock.set(at);
+            tick(&rig);
+        }
+    }
+    assert_eq!(state(&rig, id), LifecycleState::Failed);
+    assert_eq!(
+        rig.engine.revive_session(session).unwrap(),
+        ReviveOutcome::Revived { pane_count: 1 }
+    );
+    rig.engine.kill_session(session).unwrap();
+}
+
+/// Records what is "on disk" and can hold one `save` open, to force the interleaving where a
+/// snapshot is taken, the session is killed, and only then is the snapshot written.
+struct GatedBackend {
+    disk: std::sync::Mutex<std::collections::HashMap<Uuid, tymux_core::PersistedSessionRecord>>,
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+struct SharedBackend(Arc<GatedBackend>);
+
+impl PersistenceBackend for SharedBackend {
+    fn save(&self, record: &tymux_core::PersistedSessionRecord) -> anyhow::Result<()> {
+        let b = &self.0;
+        if b.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            b.entered.send(()).unwrap();
+            b.release.lock().unwrap().recv().unwrap();
+        }
+        b.disk
+            .lock()
+            .unwrap()
+            .insert(record.session_id, record.clone());
+        Ok(())
+    }
+    fn load_all(&self) -> Vec<tymux_core::PersistedSessionRecord> {
+        Vec::new()
+    }
+    fn delete(&self, session_id: Uuid) {
+        self.0.disk.lock().unwrap().remove(&session_id);
+    }
+}
+
+#[test]
+fn a_session_killed_while_its_snapshot_is_being_saved_should_not_reappear_on_disk() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let backend = Arc::new(GatedBackend {
+        disk: Default::default(),
+        armed: Default::default(),
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let clock = Arc::new(ManualClock::new(T0));
+    let engine = Arc::new(Engine::with_supervision(
+        Box::new(SharedBackend(backend.clone())),
+        clock,
+        Arc::new(FixedJitter(0.5)),
+    ));
+    let session = engine
+        .create_session_supervised(
+            "t".into(),
+            Some("/bin/sh".into()),
+            long_running(),
+            None,
+            policy(RestartMode::Never),
+        )
+        .unwrap();
+    let pane_id = first_pane(&engine, session);
+    // A persist is in flight (the revive's final save), held open inside `save`.
+    backend
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let saver = {
+        let engine = engine.clone();
+        std::thread::spawn(move || engine.reset_restart_budget(pane_id).unwrap())
+    };
+    entered_rx.recv().unwrap();
+    let killer = {
+        let engine = engine.clone();
+        std::thread::spawn(move || engine.kill_session(session).unwrap())
+    };
+    release_tx.send(()).unwrap();
+    saver.join().unwrap();
+    killer.join().unwrap();
+    assert!(
+        !backend.disk.lock().unwrap().contains_key(&session),
+        "a killed session must not be resurrected by a save that was already in flight"
+    );
+}

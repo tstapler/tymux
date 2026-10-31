@@ -167,6 +167,10 @@ impl RestartPolicy {
     /// `[base * (1 - jitter), min(base * (1 + jitter), max_delay_ms)]` where `base` is
     /// `initial_delay_ms * multiplier^consecutive_failures` capped at `max_delay_ms`.
     pub fn delay_ms(&self, consecutive_failures: u32, unit: f64) -> u64 {
+        // 0 * multiplier^n is 0, but 0 * inf (a huge n) is NaN, which would pick the maximum.
+        if self.initial_delay_ms == 0 {
+            return 0;
+        }
         let exp = consecutive_failures.min(1024) as i32;
         let base = (self.initial_delay_ms as f64 * self.multiplier.powi(exp))
             .min(self.max_delay_ms as f64);
@@ -469,6 +473,15 @@ impl PaneSupervisor {
         }
         self.next_restart_at_ms = None;
         self.state = LifecycleState::Restarting;
+    }
+
+    /// A restart is due as soon as the process that just exited is reaped (its exit was already
+    /// accounted for but not yet published). Not charged to the budget.
+    pub fn schedule_manual_restart_now(&mut self, now: u64) {
+        self.stop_requested = false;
+        self.restart_requested = false;
+        self.state = LifecycleState::Restarting;
+        self.next_restart_at_ms = Some(now);
     }
 
     /// Operator stop. Returns true if a live process must be signaled.
@@ -782,6 +795,15 @@ mod tests {
         }
         assert_eq!(p.delay_ms(0, 0.0), 750);
         assert_eq!(p.delay_ms(0, 0.5), 1_000);
+    }
+
+    #[test]
+    fn a_zero_initial_delay_should_stay_zero_however_many_failures() {
+        let mut p = policy(RestartMode::Always);
+        p.initial_delay_ms = 0;
+        assert_eq!(p.delay_ms(0, 0.5), 0);
+        assert_eq!(p.delay_ms(1100, 0.5), 0);
+        assert_eq!(p.delay_ms(u32::MAX, 0.99), 0);
     }
 
     #[test]
