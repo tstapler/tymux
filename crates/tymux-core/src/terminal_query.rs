@@ -3,7 +3,9 @@
 //!
 //! Normally the attached client's emulator (xterm.js) answers queries it sees in the raw byte
 //! stream. With nobody attached a full-screen app that starts up and waits for a reply (vim, fzf,
-//! Claude Code) would hang, so the daemon answers instead. It never does both:
+//! Claude Code) would hang, so the daemon answers instead. The daemon never answers a query a
+//! registered client will see (with several clients attached each one's emulator answers, as it
+//! always did; that is not new). Per chunk:
 //!
 //! * For each output chunk the pane decides once, before parsing it, whether any registered
 //!   client ([`LiveClient`]) will see it live. If not, the daemon answers the queries in it and
@@ -19,9 +21,12 @@ mod clients;
 mod outbox;
 mod scanner;
 
+#[cfg(not(unix))]
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(unix))]
+use std::sync::Mutex;
 use std::time::Instant;
 
 use vt100::{Callbacks, MouseProtocolEncoding, MouseProtocolMode, Screen};
@@ -107,7 +112,6 @@ fn mode_status(screen: &Screen, dec: bool, mode: u16) -> u8 {
     }
     match mode {
         1 => flag(screen.application_cursor()),
-        5 => flag(screen.reverse_video()),
         6 => flag(screen.origin_mode()),
         7 => flag(screen.autowrap()),
         8 => PERMANENTLY_SET,
@@ -420,13 +424,46 @@ impl Callbacks for QueryResponder {
     }
 }
 
-/// Writes replies to the pty master from the outbox's writer thread. The write may block while
-/// the child's input buffer is full; only that thread waits, never the pane's reader.
+/// Writes replies to the pty master from the outbox's writer thread, through its own duplicate of
+/// the master fd so a reply never waits on (or holds up) the pane's input writer. Each write waits
+/// for the pty to accept data for at most `WRITE_WAIT`, then drops the reply: a child that never
+/// reads stdin cannot pin the thread, or Ctrl-C queued behind it.
 pub(crate) struct PtyReplyWriter {
+    #[cfg(unix)]
+    pub(crate) fd: std::os::fd::OwnedFd,
+    #[cfg(not(unix))]
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
+#[cfg(unix)]
+const WRITE_WAIT_MS: libc::c_int = 250;
+
 impl ReplyWriter for PtyReplyWriter {
+    #[cfg(unix)]
+    fn write_reply(&mut self, mut bytes: &[u8]) {
+        use std::os::fd::AsRawFd;
+        let fd = self.fd.as_raw_fd();
+        while !bytes.is_empty() {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: `pfd` is a valid pollfd and the count matches.
+            let ready = unsafe { libc::poll(&mut pfd, 1, WRITE_WAIT_MS) };
+            if ready <= 0 || pfd.revents & libc::POLLOUT == 0 {
+                return;
+            }
+            // SAFETY: `bytes` is a valid readable slice; `fd` is owned by `self`.
+            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if n <= 0 {
+                return;
+            }
+            bytes = &bytes[n as usize..];
+        }
+    }
+
+    #[cfg(not(unix))]
     fn write_reply(&mut self, bytes: &[u8]) {
         let mut writer = self.writer.lock().unwrap();
         if writer.write_all(bytes).is_ok() {

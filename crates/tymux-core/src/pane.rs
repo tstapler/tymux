@@ -82,6 +82,9 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 pub use crate::launch::Launch;
 use crate::launch::PreparedLaunch;
 
+#[cfg(test)]
+type PushBumpHook = Box<dyn Fn(&Pane) + Send>;
+
 /// A single pty-backed terminal. Owns the child process, the pty master
 /// (for resize + writing input), and a `vt100::Parser` that keeps a
 /// structured screen model in sync with everything the child prints.
@@ -139,6 +142,9 @@ pub struct Pane {
     clients: ClientRegistry,
     #[cfg(test)]
     query_replies: Arc<QueryReplies>,
+    /// Test hook run between the replay push and the seq bump, with the replay lock held.
+    #[cfg(test)]
+    push_bump_hook: Mutex<Option<PushBumpHook>>,
     /// Monotonic count of pty-read chunks fed into `parser` so far (Task
     /// 1.3.1a / ADR-003 Amendment). Incremented in the reader thread in
     /// the same critical section as `parser.process(..)`, so a value read
@@ -398,8 +404,21 @@ impl Pane {
 
         let scrollback_lines = allocate_scrollback_budget();
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
+        #[cfg(unix)]
+        let reply_fd = {
+            use std::os::fd::{BorrowedFd, RawFd};
+            let raw: RawFd = pair
+                .master
+                .as_raw_fd()
+                .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
+            // SAFETY: the master (and so `raw`) outlives this call; the duplicate is independent.
+            unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?
+        };
         let replies = Arc::new(QueryReplies::new(
             Box::new(PtyReplyWriter {
+                #[cfg(unix)]
+                fd: reply_fd,
+                #[cfg(not(unix))]
                 writer: writer.clone(),
             }),
             Colors::from_env(),
@@ -435,6 +454,8 @@ impl Pane {
             clients: ClientRegistry::default(),
             #[cfg(test)]
             query_replies: replies.clone(),
+            #[cfg(test)]
+            push_bump_hook: Mutex::new(None),
             output_seq: AtomicU64::new(0),
             exited: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -468,9 +489,10 @@ impl Pane {
                         // the parser callbacks) and clients get the chunk with queries
                         // stripped. See `terminal_query`.
                         //
-                        // Epic 2.1: the replay buffer is pushed here too, before the seq bump
-                        // (lock order parser -> replay, never the reverse), so a reader that
-                        // observes `output_seq == q` finds chunk `q` in the buffer.
+                        // Epic 2.1: the replay push and the seq bump happen under one `replay`
+                        // lock (order parser -> replay, never the reverse). `replay_since`
+                        // reads `output_seq` under that same lock, so it never returns a chunk
+                        // newer than its `tail_seq`, nor misses a chunk at or below it.
                         let (seq, daemon_answered, scanned) = {
                             let mut parser = parser.lock().unwrap();
                             let next = pane_for_reader.output_seq.load(Ordering::SeqCst) + 1;
@@ -478,12 +500,13 @@ impl Pane {
                             replies.set_daemon_answers(daemon_answers);
                             parser.process(&buf[..n]);
                             let scanned = scanner.feed(&buf[..n]);
-                            pane_for_reader
-                                .replay
-                                .lock()
-                                .unwrap()
-                                .push(next, scanned.stripped());
-                            pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst);
+                            {
+                                let mut replay = pane_for_reader.replay.lock().unwrap();
+                                replay.push(next, scanned.stripped());
+                                #[cfg(test)]
+                                pane_for_reader.run_push_bump_hook();
+                                pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst);
+                            }
                             (next, daemon_answers, scanned)
                         };
                         let payload = if daemon_answered {
@@ -503,6 +526,16 @@ impl Pane {
                 }
             }
             replies.close();
+            // A sequence still open at EOF was held back from every consumer; release it.
+            let rest = scanner.take_held();
+            if !rest.is_empty() {
+                let next = pane_for_reader.output_seq.load(Ordering::SeqCst) + 1;
+                let mut replay = pane_for_reader.replay.lock().unwrap();
+                replay.push(next, &rest);
+                pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst);
+                drop(replay);
+                let _ = output_tx.send((next, rest));
+            }
             // Child exited (or the pty read failed, which for a live child
             // is effectively the same signal). Reap it and capture its
             // exit code (ADR-001/Story 1.2.2) before flipping `exited` —
@@ -694,6 +727,13 @@ impl Pane {
     /// range). Reads `output_seq` directly rather than under `parser`'s
     /// lock — resume doesn't need the grid, consistent with `size()`'s
     /// existing precedent of reading atomics without `parser`.
+    #[cfg(test)]
+    fn run_push_bump_hook(&self) {
+        if let Some(hook) = self.push_bump_hook.lock().unwrap().as_ref() {
+            hook(self);
+        }
+    }
+
     pub fn replay_since(&self, resume_from_seq: u64) -> ReplayOutcome {
         self.replay
             .lock()
@@ -1317,19 +1357,22 @@ mod tests {
         // stdin, so every reply it provokes piles up unread.
         pane.write_input(b"yes \"$(printf '\\033[c\\033[6nx')\"\n")
             .unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+        let wait_until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_until("the flood to be answered", &|| {
+            pane.query_replies.accepted() > 0
+        });
         let before = pane.snapshot_with_seq().1;
-        std::thread::sleep(Duration::from_millis(1500));
-        let after = pane.snapshot_with_seq().1;
+        // the reader keeps draining output even though replies sit unread in the child's pty
+        wait_until("output to keep flowing", &|| {
+            pane.snapshot_with_seq().1 > before + 50
+        });
         pane.kill().unwrap();
-        assert!(
-            after > before + 5,
-            "reader stalled: seq {before} -> {after}"
-        );
-        assert!(
-            pane.query_replies.accepted() > 0,
-            "the flood was never answered"
-        );
     }
 
     #[test]
@@ -1375,6 +1418,29 @@ mod tests {
         // "a" and "b" adjacent proves both the ESC[ prefix and the 6n tail are gone
         assert!(!contains_bytes(&bytes, b"\x1b[6n"), "{text:?}");
         assert!(text.contains("\r\nab"), "{text:?}");
+    }
+
+    #[test]
+    fn replay_push_and_seq_bump_should_happen_under_the_replay_lock() {
+        // If the lock were not held between push and bump, `replay_since` could return a chunk
+        // newer than its tail_seq (re-sent live: double render and double query).
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let held_every_time = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicU64::new(0));
+        let (flag, n) = (held_every_time.clone(), calls.clone());
+        *pane.push_bump_hook.lock().unwrap() = Some(Box::new(move |p: &Pane| {
+            n.fetch_add(1, Ordering::SeqCst);
+            if p.replay.try_lock().is_ok() {
+                flag.store(false, Ordering::SeqCst);
+            }
+        }));
+        pane.write_input(b"echo HO\"\"OK\n").unwrap();
+        wait_for_row(&pane, |r| r.ends_with("HOOK") && !r.contains("echo"));
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        assert!(
+            held_every_time.load(Ordering::SeqCst),
+            "replay lock not held across push+bump"
+        );
     }
 
     #[test]

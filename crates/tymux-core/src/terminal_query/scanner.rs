@@ -2,9 +2,10 @@ use std::borrow::Cow;
 
 use super::{classify_csi, osc_query};
 
-/// Longest open sequence held across a chunk boundary; past it the bytes are released and the
-/// sequence is not stripped (no query we answer is that long).
-const MAX_HELD: usize = 256;
+/// Longest open sequence held across a chunk boundary. The emulator answers a query however long
+/// its parameters are (`ESC[` + 300 zeros + `c` is a DA1), so this must be generous: past it the
+/// bytes are released and a query completing later is answered but not stripped.
+const MAX_HELD: usize = 64 * 1024;
 
 /// One chunk, as clients should see it with and without queries.
 pub(crate) struct Scanned<'a> {
@@ -117,6 +118,12 @@ pub(crate) struct QueryScanner {
 }
 
 impl QueryScanner {
+    /// Bytes held back for an unfinished sequence; call at end of stream to release them.
+    pub(crate) fn take_held(&mut self) -> Vec<u8> {
+        self.tracker.seq_start = None;
+        std::mem::take(&mut self.held)
+    }
+
     pub(crate) fn feed<'a>(&mut self, chunk: &'a [u8]) -> Scanned<'a> {
         if self.held.is_empty() && !self.tracker.non_ground && memchr::memchr(0x1b, chunk).is_none()
         {
@@ -380,5 +387,33 @@ b"
         assert_eq!(&*out.raw, sgr);
         assert!(out.removed.is_none());
         assert!(matches!(out.raw, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_long_query_split_across_chunks_should_still_be_removed_whole() {
+        let mut csi = b"\x1b[".to_vec();
+        csi.resize(2 + 300, b'0');
+        csi.push(b'c');
+        let (raw, stripped) = strip_all(&[&csi[..150], &csi[150..]]);
+        assert_eq!(raw, csi);
+        assert_eq!(stripped, b"");
+
+        let mut osc = String::from("\x1b]4");
+        for i in 0..60 {
+            osc.push_str(&format!(";{i};?"));
+        }
+        osc.push('\x07');
+        let b = osc.as_bytes();
+        let (raw, stripped) = strip_all(&[&b[..100], &b[100..200], &b[200..]]);
+        assert_eq!(raw, b);
+        assert_eq!(stripped, b"");
+    }
+
+    #[test]
+    fn take_held_should_release_an_unfinished_sequence() {
+        let mut s = QueryScanner::default();
+        assert_eq!(&*s.feed(b"x\x1b[6").raw, b"x");
+        assert_eq!(s.take_held(), b"\x1b[6");
+        assert!(s.take_held().is_empty());
     }
 }

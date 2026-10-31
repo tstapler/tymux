@@ -126,6 +126,11 @@ fn decrqm_should_report_set_reset_permanent_and_unknown_modes() {
         ["ESC[2;4$y", "ESC[12;3$y", "ESC[99;0$y"]
     );
     assert_eq!(
+        replies_to(b"\x1b[?5$p"),
+        ["ESC[?5;0$y"],
+        "xterm.js does not recognise DECSCNM"
+    );
+    assert_eq!(
         replies_to(b"\x1b[?8$p\x1b[?67$p\x1b[?1005$p\x1b[?1015$p\x1b[?1048$p"),
         [
             "ESC[?8;3$y",
@@ -514,4 +519,109 @@ fn scanner_overhead_on_sgr_heavy_output() {
         "parser only: {without:.1} MB/s; parser+scanner: {with:.1} MB/s; overhead {:.1}%",
         (without / with - 1.0) * 100.0
     );
+}
+
+/// Collects replies synchronously (no writer thread).
+#[derive(Default)]
+struct Collector(Vec<String>);
+
+impl Callbacks for Collector {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        p: &[&[u16]],
+        c: char,
+    ) {
+        if let Some(r) = csi_reply(screen, i1, i2, p, c) {
+            self.0.push(String::from_utf8_lossy(&r).into_owned());
+        }
+    }
+}
+
+/// Every arm of `mode_status`: the status before and after the mode is switched on.
+#[test]
+fn decrqm_should_report_every_known_mode_in_both_states() {
+    // (ansi, mode, sequence that turns it on, status when default, status when on)
+    let table: &[(bool, u16, &[u8], u8, u8)] = &[
+        (false, 4, b"\x1b[4h", 2, 1),
+        (false, 20, b"\x1b[20h", 2, 1),
+        (true, 1, b"\x1b[?1h", 2, 1),
+        (true, 6, b"\x1b[?6h", 2, 1),
+        (true, 7, b"\x1b[?7l", 1, 2), // autowrap is on by default; "on" here means switched off
+        (true, 9, b"\x1b[?9h", 2, 1),
+        (true, 25, b"\x1b[?25l", 1, 2), // cursor visible by default
+        (true, 47, b"\x1b[?47h", 2, 1),
+        (true, 1047, b"\x1b[?1047h", 2, 1),
+        (true, 1049, b"\x1b[?1049h", 2, 1),
+        (true, 66, b"\x1b=", 2, 1), // DECKPAM
+        (true, 1000, b"\x1b[?1000h", 2, 1),
+        (true, 1002, b"\x1b[?1002h", 2, 1),
+        (true, 1003, b"\x1b[?1003h", 2, 1),
+        (true, 1004, b"\x1b[?1004h", 2, 1),
+        (true, 1006, b"\x1b[?1006h", 2, 1),
+        (true, 2004, b"\x1b[?2004h", 2, 1),
+    ];
+    let status_of = |setup: &[u8], ansi: bool, mode: u16| -> String {
+        let mut parser = vt100::Parser::new_with_callbacks(10, 40, 0, Collector::default());
+        parser.process(setup);
+        let q = if ansi {
+            format!("\x1b[{mode}$p")
+        } else {
+            format!("\x1b[?{mode}$p")
+        };
+        parser.process(q.as_bytes());
+        parser.callbacks().0[0].clone()
+    };
+    for &(dec, mode, on, default, switched) in table {
+        let prefix = if dec { "?" } else { "" };
+        assert_eq!(
+            status_of(b"", !dec, mode),
+            format!("\x1b[{prefix}{mode};{default}$y"),
+            "default {mode}"
+        );
+        assert_eq!(
+            status_of(on, !dec, mode),
+            format!("\x1b[{prefix}{mode};{switched}$y"),
+            "switched {mode}"
+        );
+    }
+    // fixed answers, matching xterm.js's requestMode
+    let fixed: &[(bool, u16, u8)] = &[
+        (false, 2, 4),
+        (false, 12, 3),
+        (true, 8, 3),
+        (true, 67, 4),
+        (true, 1005, 4),
+        (true, 1015, 4),
+        (true, 1048, 1),
+        // not recognised: unknown, and modes xterm.js answers but vt100 cannot (client-dependent)
+        (false, 99, 0),
+        (true, 9999, 0),
+        (true, 5, 0),
+        (true, 3, 0),
+        (true, 12, 0),
+        (true, 45, 0),
+        (true, 1016, 0),
+        (true, 2026, 0),
+        (true, 9001, 0),
+    ];
+    for &(dec, mode, want) in fixed {
+        let prefix = if dec { "?" } else { "" };
+        assert_eq!(
+            status_of(b"", !dec, mode),
+            format!("\x1b[{prefix}{mode};{want}$y"),
+            "fixed {mode}"
+        );
+    }
+}
+
+#[test]
+fn a_utf8_encoded_c1_query_should_be_answered_but_not_stripped() {
+    // `C2 9B` is CSI; the emulator rewrites it, the stream scanner does not (documented limit)
+    assert_eq!(replies_to(b"\xc2\x9b6n"), ["ESC[1;1R"]);
+    let mut scanner = QueryScanner::default();
+    let out = scanner.feed(b"\xc2\x9b6n");
+    assert_eq!(out.stripped(), b"\xc2\x9b6n");
 }

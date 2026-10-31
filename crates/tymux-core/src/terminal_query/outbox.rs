@@ -74,13 +74,20 @@ impl Outbox {
         }
         st.queue.push_back(reply);
         self.shared.accepted.fetch_add(1, Ordering::Relaxed);
-        if let Some(writer) = st.writer.take() {
+        let first_reply_writer = st.writer.take();
+        drop(st);
+        if let Some(writer) = first_reply_writer {
             // First reply: start the writer lazily so panes that never see a query cost nothing.
             let shared = self.shared.clone();
-            drop(st);
-            std::thread::spawn(move || drain(&shared, writer));
-        } else {
-            drop(st);
+            let spawned = std::thread::Builder::new()
+                .name("tymux-query-replies".into())
+                .spawn(move || drain(&shared, writer));
+            if let Err(err) = spawned {
+                // No thread, no replies; never panic here, the caller holds the parser lock.
+                tracing::warn!(%err, "cannot start terminal-query reply writer; replies disabled");
+                self.shared.state.lock().unwrap().closed = true;
+                return;
+            }
         }
         self.shared.wake.notify_one();
     }
@@ -138,18 +145,32 @@ mod tests {
         }
     }
 
-    /// Blocks every write until the test drops the gate, like a full pty.
-    struct Stuck(mpsc::Receiver<()>);
+    /// Blocks every write until the test drops the gate, like a full pty; tells the test when
+    /// the first write has started.
+    struct Stuck {
+        gate: mpsc::Receiver<()>,
+        started: mpsc::Sender<()>,
+    }
     impl ReplyWriter for Stuck {
         fn write_reply(&mut self, _: &[u8]) {
-            let _ = self.0.recv();
+            let _ = self.started.send(());
+            let _ = self.gate.recv();
         }
+    }
+
+    fn stuck_outbox() -> (Outbox, mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let (gate_tx, gate) = mpsc::channel();
+        let (started, started_rx) = mpsc::channel();
+        (
+            Outbox::new(Box::new(Stuck { gate, started })),
+            gate_tx,
+            started_rx,
+        )
     }
 
     #[test]
     fn offer_should_never_block_even_when_the_writer_is_stuck() {
-        let (_gate_tx, gate_rx) = mpsc::channel();
-        let outbox = Outbox::new(Box::new(Stuck(gate_rx)));
+        let (outbox, _gate, _started) = stuck_outbox();
         let t0 = Instant::now();
         for i in 0..10_000u32 {
             outbox.offer(
@@ -163,11 +184,10 @@ mod tests {
 
     #[test]
     fn identical_pending_replies_should_coalesce_without_spending_tokens() {
-        let (_gate_tx, gate_rx) = mpsc::channel();
-        let outbox = Outbox::new(Box::new(Stuck(gate_rx)));
+        let (outbox, _gate, started) = stuck_outbox();
         let t0 = Instant::now();
         outbox.offer(b"first".to_vec(), t0); // taken by the stuck writer
-        std::thread::sleep(Duration::from_millis(50));
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
         for _ in 0..1000 {
             outbox.offer(b"DA1".to_vec(), t0);
         }

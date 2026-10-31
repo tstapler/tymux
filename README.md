@@ -126,12 +126,21 @@ the replay buffer, so a resuming client never re-answers a query.
 Replies are rate-limited and written by a separate thread, so a program that floods
 queries without reading its input cannot stall output. Limits that remain:
 
-- A query a client was meant to answer but whose chunk it lost to lag is not answered.
+- A query in a chunk the daemon sent raw because a client was registered, but that the client then never
+  received, is not answered. That happens when the client's broadcast receiver overflows (1024 chunks)
+  or its forward queue (64 events) backs up and the attach ends, or the client disconnects between the
+  decision and delivery. The lag marker only protects chunks decided afterwards.
+- With several clients attached each client's emulator answers, as before this feature.
+- Reply writes use their own pty fd and wait at most 250 ms for the child to accept data, so a child
+  that never reads stdin drops replies instead of blocking output or user input.
 - A query introduced with a UTF-8 encoded C1 control (`C2 9B`) is answered but not stripped.
-- A sequence longer than 256 bytes is not held across chunks, so it is not stripped.
+- A sequence still open after 64 KiB is released unheld, so a query completing later is answered but
+  not stripped from replay.
 - An OSC that mixes colour sets with queries is left for the client; the daemon ignores it.
-- DECRQM answers like xterm.js for the modes it knows (`mode_status` in
-  `crates/tymux-core/src/terminal_query.rs`) and reports 0 (not recognised) for others.
+- DECRQM mirrors xterm.js's answers for the modes vt100 tracks (table in `mode_status`,
+  `crates/tymux-core/src/terminal_query.rs`). Modes xterm.js answers from client state or
+  features vt100 lacks (3, 12, 45, 1016, 2026, 9001) report 0 (not recognised), as does every
+  unknown mode, so a program probing synchronized output (2026) sees it as unsupported.
 - OSC 10/11/12 report xterm.js's dark defaults (white on black); set `TYMUXD_QUERY_FG`,
   `TYMUXD_QUERY_BG` and `TYMUXD_QUERY_CURSOR` (`#rrggbb`) for a different client theme.
 - The kitty keyboard query (`CSI ? u`) is deliberately unanswered: claiming support would

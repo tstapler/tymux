@@ -3609,7 +3609,7 @@ mod tests {
         // marker-in-broadcast-stream wait unreliable here.
         const LINE_COUNT: usize = 40_000;
         let cmd = format!(
-            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; printf 'FLOOD-D''ONE\\n'\n"
+            "awk 'BEGIN{{for(i=0;i<{LINE_COUNT};i++)printf \"L%07dE\\n\", i}}'; printf 'FLOOD-D''ONE\\n'\n"
         );
         pane.write_input(cmd.as_bytes()).unwrap();
 
@@ -3781,7 +3781,7 @@ mod tests {
         let stale_resume_from_seq = 1u64;
         const LINE_COUNT: usize = 40_000;
         let cmd = format!(
-            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; printf 'FLOOD-D''ONE\\n'\n"
+            "awk 'BEGIN{{for(i=0;i<{LINE_COUNT};i++)printf \"L%07dE\\n\", i}}'; printf 'FLOOD-D''ONE\\n'\n"
         );
         pane.write_input(cmd.as_bytes()).unwrap();
 
@@ -3934,7 +3934,7 @@ mod tests {
         let stale_resume_from_seq = 1u64;
         const LINE_COUNT: usize = 40_000;
         let cmd = format!(
-            "i=0; while [ $i -lt {LINE_COUNT} ]; do printf 'L%07dE\\n' \"$i\"; i=$((i+1)); done; printf 'FLOOD-D''ONE\\n'\n"
+            "awk 'BEGIN{{for(i=0;i<{LINE_COUNT};i++)printf \"L%07dE\\n\", i}}'; printf 'FLOOD-D''ONE\\n'\n"
         );
         pane.write_input(cmd.as_bytes()).unwrap();
         let flood_deadline = Instant::now() + Duration::from_secs(20);
