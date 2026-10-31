@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::engine::{PaneEntry, SessionState};
 use crate::layout::{LayoutNode, Orientation};
+use crate::restart::{PersistedRestartState, RestartPolicy};
 
 /// Tier 0 (v1.0's only implemented tier, per ADR-002): metadata + layout
 /// shape survives a daemon restart, dead-flagged. The persisted process
@@ -33,6 +34,10 @@ pub struct PersistedPaneRecord {
     /// `tymux revive`. `#[serde(default)]` so older on-disk records load unchanged.
     #[serde(default)]
     pub launch: crate::pane::Launch,
+    /// Restart policy and counters (ADR-0007). `#[serde(default)]` so older records load as
+    /// "no policy": the pane never restarts automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Box<PersistedRestartState>>,
 }
 
 /// Mirrors [`LayoutNode`], but leaves hold a full [`PersistedPaneRecord`]
@@ -86,7 +91,11 @@ impl PersistedLayoutNode {
         }
     }
 
-    fn from_live(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> Self {
+    fn from_live(
+        node: &LayoutNode,
+        panes: &HashMap<Uuid, PaneEntry>,
+        restart: &HashMap<Uuid, PersistedRestartState>,
+    ) -> Self {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 let record = match panes.get(pane_id) {
@@ -105,6 +114,7 @@ impl PersistedLayoutNode {
                             // whole snapshot path already runs on.
                             exit_code: pane.exit_code(),
                             launch: pane.launch.clone(),
+                            restart: None,
                         }
                     }
                     // Already `Dead` (e.g. a partially-revived session, or a
@@ -112,7 +122,7 @@ impl PersistedLayoutNode {
                     // existing record, including any exit_code already
                     // captured, rather than blanking it via the fallback
                     // below.
-                    Some(PaneEntry::Dead(record)) => record.clone(),
+                    Some(PaneEntry::Dead(record)) => (**record).clone(),
                     None => PersistedPaneRecord {
                         pane_id: *pane_id,
                         command: String::new(),
@@ -121,8 +131,15 @@ impl PersistedLayoutNode {
                         cols: 0,
                         exit_code: None,
                         launch: Default::default(),
+                        restart: None,
                     },
                 };
+                let mut record = record;
+                record.restart = restart
+                    .get(pane_id)
+                    .cloned()
+                    .map(Box::new)
+                    .or(record.restart);
                 PersistedLayoutNode::Leaf { pane: record }
             }
             LayoutNode::Split {
@@ -132,7 +149,7 @@ impl PersistedLayoutNode {
                 orientation: *orientation,
                 children: children
                     .iter()
-                    .map(|(c, ratio)| (PersistedLayoutNode::from_live(c, panes), *ratio))
+                    .map(|(c, ratio)| (PersistedLayoutNode::from_live(c, panes, restart), *ratio))
                     .collect(),
             },
         }
@@ -150,7 +167,7 @@ pub(crate) fn persisted_layout_to_live(
 ) -> LayoutNode {
     match node {
         PersistedLayoutNode::Leaf { pane } => {
-            panes.insert(pane.pane_id, PaneEntry::Dead(pane.clone()));
+            panes.insert(pane.pane_id, PaneEntry::Dead(Box::new(pane.clone())));
             LayoutNode::leaf(pane.pane_id)
         }
         PersistedLayoutNode::Split {
@@ -180,6 +197,10 @@ pub struct PersistedSessionRecord {
     pub name: String,
     pub windows: Vec<PersistedWindowRecord>,
     pub active_window_id: Uuid,
+    /// Restart policy for panes added to this session later. `None` in records written before
+    /// ADR-0007, meaning "never restart".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_restart_policy: Option<RestartPolicy>,
 }
 
 impl PersistedSessionRecord {
@@ -189,6 +210,15 @@ impl PersistedSessionRecord {
     /// metadata this needs — command/cwd/rows/cols — lives in a second
     /// map `SessionState` alone doesn't have access to.
     pub fn from_session_state(session: &SessionState, panes: &HashMap<Uuid, PaneEntry>) -> Self {
+        Self::from_session_state_with_restart(session, panes, &HashMap::new())
+    }
+
+    /// [`Self::from_session_state`] plus each pane's supervision state, keyed by pane id.
+    pub fn from_session_state_with_restart(
+        session: &SessionState,
+        panes: &HashMap<Uuid, PaneEntry>,
+        restart: &HashMap<Uuid, PersistedRestartState>,
+    ) -> Self {
         PersistedSessionRecord {
             schema_version: CURRENT_SCHEMA_VERSION,
             session_id: session.id,
@@ -199,10 +229,12 @@ impl PersistedSessionRecord {
                 .map(|w| PersistedWindowRecord {
                     id: w.id,
                     name: w.name.clone(),
-                    layout: PersistedLayoutNode::from_live(&w.layout, panes),
+                    layout: PersistedLayoutNode::from_live(&w.layout, panes, restart),
                 })
                 .collect(),
             active_window_id: session.active_window_id,
+            default_restart_policy: Some(session.default_restart_policy.clone())
+                .filter(|p| *p != RestartPolicy::default()),
         }
     }
 
@@ -458,6 +490,21 @@ mod tests {
         assert_eq!(back, with);
     }
 
+    #[test]
+    fn records_written_before_restart_policy_should_load_with_no_policy() {
+        let id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"schema_version":1,"session_id":"{id}","name":"old","windows":[{{"id":"{id}","name":"0","layout":{{"kind":"Leaf","pane":{{"pane_id":"{id}","command":"/bin/sh","cwd":"/","rows":24,"cols":80}}}}}}],"active_window_id":"{id}"}}"#
+        );
+        let record: PersistedSessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record.default_restart_policy, None);
+        let PersistedLayoutNode::Leaf { pane } = &record.windows[0].layout else {
+            panic!("expected a leaf");
+        };
+        assert_eq!(pane.restart, None);
+        assert!(record.validate().is_ok());
+    }
+
     fn leaf(id: Uuid) -> PersistedLayoutNode {
         PersistedLayoutNode::Leaf {
             pane: PersistedPaneRecord {
@@ -468,6 +515,7 @@ mod tests {
                 cols: 80,
                 exit_code: None,
                 launch: Default::default(),
+                restart: None,
             },
         }
     }
@@ -490,6 +538,7 @@ mod tests {
                 },
             }],
             active_window_id: window_id,
+            default_restart_policy: None,
         }
     }
 

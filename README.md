@@ -99,6 +99,14 @@ survives a `tymuxd` restart, written to
 re-running each pane's original command in its original cwd); it does not
 replay what was on screen before the restart.
 
+**Restart policy and lifecycle control** ([ADR-0007](docs/adr/0007-pane-restart-policy-and-lifecycle.md)):
+a pane can be restarted automatically after its process exits — `tymux new
+--restart on-failure`, or `tymux policy <pane> --mode always --max-restarts 5` —
+with exponential backoff, a restart budget over a sliding window, and a
+terminal `FAILED` state when the budget runs out. The pane keeps its id,
+scrollback, size and attached clients across a restart. `tymux status|restart|stop|start`
+and the matching RPCs control it by hand. Panes without a policy never restart.
+
 **No auth** — the daemon is meant to run locally for now (loopback-trust
 model); it warns loudly at startup if `TYMUXD_ADDR` is set to a
 non-loopback address, since there's no per-pane authorization yet.

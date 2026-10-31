@@ -21,7 +21,14 @@ service TymuxService {
   // command re-run in its persisted cwd. Never triggered automatically on
   // daemon start (ADR-002); only an explicit call reaches this. A no-op
   // (ReviveSessionResponse.already_live=true) if the session is already
-  // live — never a duplicate spawn.
+  // live — never a duplicate spawn. A pane whose child exited inside this daemon (not
+  // restored from disk) is also respawned in place, same pane id and screen (ADR-0007);
+  // before that, such a session was reported already_live and nothing was respawned.
+  // A pane the operator stopped (STOPPED, StopPane) or that ran out of restarts (FAILED)
+  // is never revived by this call: it stays as it is while the session's other panes are
+  // revived, and pane_count counts only the panes started. If every pane is STOPPED or
+  // FAILED the call is FAILED_PRECONDITION. Use
+  // StartPane (STOPPED or FAILED) or RestartPane (resets the budget) for those.
   rpc ReviveSession(ReviveSessionRequest) returns (ReviveSessionResponse);
 
   // One-shot structured read of a pane's current screen — the AI-friendly
@@ -116,6 +123,38 @@ service TymuxService {
   // stdin is already closed, or the process closed its stdin / exited
   // (broken pipe). Advertised as capability "create_session.stdin_stream".
   rpc WriteStdin(stream WriteStdinRequest) returns (WriteStdinResponse);
+
+  // ---- Pane lifecycle and automatic restart (ADR-0007; capability "pane.lifecycle") ----
+  //
+  // A pane has a RestartPolicy that says whether the daemon respawns its process after it
+  // exits, how long it waits, and when it gives up (state FAILED). Panes created without a
+  // policy behave exactly as before: NEVER, so an exited pane stays exited. A restart reuses
+  // the pane: same pane id, scrollback, size, attached clients and launch spec (command, args,
+  // env, cwd), on a new pty and process. Unknown pane: NOT_FOUND.
+
+  // Sets the restart policy of one pane, or (session_id) the default for panes created later
+  // in that session. Takes effect at the pane's next exit; a pending backoff the new policy
+  // would not have scheduled is cancelled. INVALID_ARGUMENT for a nonsensical policy.
+  rpc SetRestartPolicy(SetRestartPolicyRequest) returns (SetRestartPolicyResponse);
+  // The pane's lifecycle state, policy, counters and timestamps.
+  rpc GetPaneStatus(GetPaneStatusRequest) returns (PaneStatus);
+  // Replaces the pane's process now: a running one gets SIGTERM (SIGKILL after grace) and is
+  // respawned once it exits; a dead one (any state, including STOPPED and FAILED) is respawned
+  // immediately. Not charged to the restart budget and not delayed. With reset_backoff the
+  // backoff delay and window budget start over. Returns once the new process is running (or
+  // failed to start); a failed start counts against the budget like any failed run.
+  rpc RestartPane(RestartPaneRequest) returns (PaneStatus);
+  // SIGTERM, then SIGKILL after the grace period, and parks the pane in STOPPED: it will not
+  // restart until StartPane, whatever its policy. Returns once the process is gone (or the
+  // grace period plus a short margin has passed). Cancels a pending backoff.
+  rpc StopPane(StopPaneRequest) returns (PaneStatus);
+  // Starts a pane that is STOPPED, EXITED, FAILED or in BACKOFF, with a fresh restart budget.
+  // FAILED_PRECONDITION if its process is running. Also respawns a single pane restored from
+  // disk after a daemon restart.
+  rpc StartPane(StartPaneRequest) returns (PaneStatus);
+  // Clears the backoff delay and the restart budget. A FAILED pane becomes EXITED; nothing is
+  // started (use StartPane).
+  rpc ResetRestartBudget(ResetRestartBudgetRequest) returns (PaneStatus);
 }
 
 // Whether a pane's/session's backing process is still running. proto3
@@ -182,6 +221,9 @@ message Pane {
   // The pane's working directory at spawn time (Epic 1.5) — either the
   // daemon's own cwd, or whatever CreateSessionRequest.cwd requested.
   string cwd = 5;
+  // Lifecycle state (ADR-0007). `liveness` stays LIVE only while a process is running; DEAD
+  // covers every other state, which `state` tells apart.
+  PaneState state = 6;
 }
 
 message CreateSessionRequest {
@@ -233,6 +275,12 @@ message CreateSessionRequest {
   // stream its input again (the bytes are never stored). Advertised as
   // capability "create_session.stdin_stream"; ADR-0006.
   bool stdin_stream = 9;
+  // Restart policy for the first pane, and the default for panes later added to the session.
+  // Absent means NEVER (the pane is never restarted automatically); this holds only when the
+  // message itself is absent: a present RestartPolicy with mode UNSPECIFIED is INVALID_ARGUMENT.
+  // Persisted. Advertised as
+  // capability "pane.lifecycle"; ADR-0007.
+  RestartPolicy restart_policy = 10;
 }
 
 // One argv entry.
@@ -369,6 +417,9 @@ message PaneSnapshot {
   // The cursor sits past the last column (cursor_col is clamped to cols-1); the next printed
   // character wraps to the next row, or overwrites the last column when DECAWM is off.
   bool cursor_pending_wrap = 18;
+  // Lifecycle state of the pane (ADR-0007). While the pane is in BACKOFF this snapshot is its
+  // last screen with liveness DEAD and state BACKOFF.
+  PaneState state = 20;
   // Set only when liveness is DEAD: the exited child's exit code, if it was captured. A child
   // killed by a signal reports 1, not 128+signal (portable-pty 0.8.1 collapses signal deaths).
   optional int32 exit_code = 19;
@@ -436,6 +487,11 @@ message AttachRequest {
   // PaneSnapshot. See the Attach RPC's doc comment above for the full
   // reconnect contract.
   optional uint64 resume_from_seq = 4;
+
+  // First message only: also stream LifecycleEvents (ADR-0007). Absent/false behaves as before
+  // for a pane with no restart policy; a client that does not set it never receives a
+  // `lifecycle` event, but still stays attached across restarts.
+  bool subscribe_lifecycle = 5;
 }
 
 message WriteStdinRequest {
@@ -518,6 +574,11 @@ message AttachEvent {
     // to build a `resume_from_seq` token. The daemon populates exactly
     // one of `output`/`output_chunk` per AttachEvent, not both.
     OutputChunk output_chunk = 7;
+    // ADR-0007: the pane's lifecycle changed (exited, restart scheduled, restarted, failed,
+    // stopped). Sent only to clients that set AttachRequest.subscribe_lifecycle. While a restart
+    // is pending the stream stays open and no `exited` event is sent; `exited` follows the final
+    // lifecycle event once the pane will not restart.
+    LifecycleEvent lifecycle = 8;
   }
 }
 
@@ -543,4 +604,162 @@ message ServerInfo {
   uint32 pid = 5;
   // Daemon start time, seconds since the Unix epoch.
   int64 started_at_unix = 6;
+}
+
+// ---- Pane lifecycle (ADR-0007) ----
+
+// Where a pane is in its life.
+enum PaneState {
+  PANE_STATE_UNSPECIFIED = 0;
+  // The process is running.
+  PANE_STATE_LIVE = 1;
+  // The process exited and the policy says not to restart it. Also the state of a pane
+  // restored from disk after a daemon restart (it is never started automatically, ADR-002).
+  PANE_STATE_EXITED = 2;
+  // Waiting out a backoff delay; PaneStatus.next_restart_at_unix_ms says until when.
+  PANE_STATE_BACKOFF = 3;
+  // A restart was requested and the old process has not died yet, or the new one is starting.
+  PANE_STATE_RESTARTING = 4;
+  // The restart budget is exhausted: no automatic restart until an operator acts
+  // (StartPane, RestartPane, or ResetRestartBudget).
+  PANE_STATE_FAILED = 5;
+  // Stopped with StopPane; will not restart until StartPane.
+  PANE_STATE_STOPPED = 6;
+}
+
+enum RestartMode {
+  RESTART_MODE_UNSPECIFIED = 0;
+  // Never restart (the default for a pane with no policy).
+  RESTART_MODE_NEVER = 1;
+  // Restart after a non-zero exit, or an exit whose code is unknown.
+  RESTART_MODE_ON_FAILURE = 2;
+  // Restart after every exit, including code 0.
+  RESTART_MODE_ALWAYS = 3;
+  // Same behavior as ALWAYS: StopPane parks a pane in STOPPED in every mode, so nothing else
+  // differs. Provided for callers that expect Docker's name.
+  RESTART_MODE_UNLESS_STOPPED = 4;
+}
+
+// When and how often the daemon restarts a pane's process. Unset optional fields take the
+// default shown; GetPaneStatus returns the policy with every field resolved.
+message RestartPolicy {
+  RestartMode mode = 1;
+  // Automatic restarts allowed within window_ms; the next failure after that makes the pane
+  // FAILED. 0 means the first failure is already terminal. Default 5.
+  optional uint32 max_restarts = 2;
+  // Sliding window the budget is counted over. 0 = no window: the budget is lifetime, until
+  // ResetRestartBudget or StartPane. Default 60000.
+  optional uint64 window_ms = 3;
+  // Delay before the first restart. Default 1000.
+  optional uint64 initial_delay_ms = 4;
+  // Each consecutive failure multiplies the delay by this (>= 1). Default 2.0.
+  optional double multiplier = 5;
+  // Cap on the delay (>= initial_delay_ms). Default 30000.
+  optional uint64 max_delay_ms = 6;
+  // Fraction of the delay randomized either way, in [0, 1]; the result never exceeds
+  // max_delay_ms. Default 0.2.
+  optional double jitter = 7;
+  // A run at least this long counts as healthy and resets the delay to initial_delay_ms.
+  // Default 10000.
+  optional uint64 healthy_after_ms = 8;
+}
+
+message PaneStatus {
+  string pane_id = 1;
+  PaneState state = 2;
+  // The effective policy, every field resolved.
+  RestartPolicy policy = 3;
+  // Restarts since the pane was created, automatic and manual (lifetime, not windowed).
+  uint32 restart_count = 4;
+  // Automatic restarts still counted against the budget (inside the window).
+  uint32 restarts_in_window = 5;
+  // Failed runs in a row since the last healthy one; sets the next backoff delay.
+  uint32 consecutive_failures = 6;
+  // Absent until the process has exited once.
+  optional int32 last_exit_code = 7;
+  // Set only when the daemon itself delivered the terminating signal (StopPane, RestartPane):
+  // portable-pty reports any signal death as code 1, so a signal the process took on its own
+  // is not distinguishable.
+  optional int32 last_exit_signal = 8;
+  optional int64 last_exit_at_unix_ms = 9;
+  // Set in BACKOFF and while a restart is due.
+  optional int64 next_restart_at_unix_ms = 10;
+  // Set while a process is running.
+  optional int64 started_at_unix_ms = 11;
+  // Milliseconds the running process has been up; 0 when not running.
+  uint64 uptime_ms = 12;
+  // Set while a process is running.
+  optional uint32 pid = 13;
+  // The daemon's clock when this was read, so a client can show a countdown to
+  // next_restart_at without trusting its own clock.
+  int64 now_unix_ms = 14;
+}
+
+message SetRestartPolicyRequest {
+  oneof target {
+    string pane_id = 1;
+    // Sets the default for panes created later in this session.
+    string session_id = 2;
+  }
+  RestartPolicy policy = 3;
+  // With session_id: also apply the policy to the session's existing panes.
+  bool apply_to_existing_panes = 4;
+}
+
+message SetRestartPolicyResponse {
+  // The pane's status; unset when the target was a session.
+  PaneStatus status = 1;
+}
+
+message GetPaneStatusRequest {
+  string pane_id = 1;
+}
+
+message RestartPaneRequest {
+  string pane_id = 1;
+  // Also clear the backoff delay and the window budget.
+  bool reset_backoff = 2;
+  // How long a running process gets after SIGTERM before SIGKILL. Default 5000.
+  optional uint64 grace_ms = 3;
+}
+
+message StopPaneRequest {
+  string pane_id = 1;
+  // How long the process gets after SIGTERM before SIGKILL. Default 5000.
+  optional uint64 grace_ms = 2;
+}
+
+message StartPaneRequest {
+  string pane_id = 1;
+}
+
+message ResetRestartBudgetRequest {
+  string pane_id = 1;
+}
+
+enum LifecycleEventKind {
+  LIFECYCLE_EVENT_KIND_UNSPECIFIED = 0;
+  // The process exited. Always sent, whatever happens next.
+  LIFECYCLE_EVENT_KIND_EXITED = 1;
+  // A restart was scheduled after delay_ms (at next_restart_at_unix_ms).
+  LIFECYCLE_EVENT_KIND_RESTART_SCHEDULED = 2;
+  // The process was restarted; pid is the new one.
+  LIFECYCLE_EVENT_KIND_RESTARTED = 3;
+  // The restart budget ran out; the pane is FAILED.
+  LIFECYCLE_EVENT_KIND_FAILED = 4;
+  // An operator stop took effect; the pane is STOPPED.
+  LIFECYCLE_EVENT_KIND_STOPPED = 5;
+}
+
+message LifecycleEvent {
+  LifecycleEventKind kind = 1;
+  // The pane's state after this event.
+  PaneState state = 2;
+  optional int32 exit_code = 3;
+  optional int32 exit_signal = 4;
+  optional uint64 delay_ms = 5;
+  optional int64 next_restart_at_unix_ms = 6;
+  optional uint32 pid = 7;
+  uint32 restart_count = 8;
+  int64 at_unix_ms = 9;
 }

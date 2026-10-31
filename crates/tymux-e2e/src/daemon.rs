@@ -340,6 +340,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -366,6 +367,7 @@ mod tests {
                 b"echo PRE-DROP-MARKER\n".to_vec(),
             )),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();

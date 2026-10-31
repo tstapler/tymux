@@ -26,6 +26,8 @@ struct State {
     last: Instant,
     closed: bool,
     writer: Option<Box<dyn ReplyWriter>>,
+    /// Bumped by `rearm`; a drain thread of an older generation exits.
+    generation: u64,
 }
 
 struct Shared {
@@ -49,6 +51,7 @@ impl Outbox {
                     last: Instant::now(),
                     closed: false,
                     writer: Some(writer),
+                    generation: 0,
                 }),
                 wake: Condvar::new(),
             }),
@@ -75,13 +78,14 @@ impl Outbox {
         st.queue.push_back(reply);
         self.shared.accepted.fetch_add(1, Ordering::Relaxed);
         let first_reply_writer = st.writer.take();
+        let generation = st.generation;
         drop(st);
         if let Some(writer) = first_reply_writer {
             // First reply: start the writer lazily so panes that never see a query cost nothing.
             let shared = self.shared.clone();
             let spawned = std::thread::Builder::new()
                 .name("tymux-query-replies".into())
-                .spawn(move || drain(&shared, writer));
+                .spawn(move || drain(&shared, writer, generation));
             if let Err(err) = spawned {
                 // No thread, no replies; never panic here, the caller holds the parser lock.
                 tracing::warn!(%err, "cannot start terminal-query reply writer; replies disabled");
@@ -90,6 +94,21 @@ impl Outbox {
             }
         }
         self.shared.wake.notify_one();
+    }
+
+    /// Reopens a closed outbox on a new writer (a restarted pane's new pty): pending replies for
+    /// the old process are dropped, the rate limit resets, and the old writer thread, if any,
+    /// exits at its next wake.
+    pub(crate) fn rearm(&self, writer: Box<dyn ReplyWriter>) {
+        let mut st = self.shared.state.lock().unwrap();
+        st.generation += 1;
+        st.closed = false;
+        st.queue.clear();
+        st.tokens = RATE_BURST;
+        st.last = Instant::now();
+        st.writer = Some(writer);
+        drop(st);
+        self.shared.wake.notify_all();
     }
 
     pub(crate) fn close(&self) {
@@ -114,12 +133,12 @@ impl Drop for Outbox {
     }
 }
 
-fn drain(shared: &Shared, mut writer: Box<dyn ReplyWriter>) {
+fn drain(shared: &Shared, mut writer: Box<dyn ReplyWriter>, generation: u64) {
     loop {
         let reply = {
             let mut st = shared.state.lock().unwrap();
             loop {
-                if st.closed {
+                if st.closed || st.generation != generation {
                     return;
                 }
                 if let Some(reply) = st.queue.pop_front() {
