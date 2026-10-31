@@ -416,4 +416,29 @@ b"
         assert_eq!(s.take_held(), b"\x1b[6");
         assert!(s.take_held().is_empty());
     }
+
+    #[test]
+    fn a_query_with_a_long_prefix_should_be_removed_whole_at_every_split() {
+        // 300 zeros is past a 256-byte hold cap, so a smaller MAX_HELD would let it through
+        let mut csi = b"\x1b[".to_vec();
+        csi.resize(2 + 300, b'0');
+        csi.push(b'c');
+        for split in 1..csi.len() {
+            let (raw, stripped) = strip_all(&[&csi[..split], &csi[split..]]);
+            assert_eq!(raw, csi, "split at {split}");
+            assert_eq!(stripped, b"", "split at {split}");
+        }
+    }
+
+    #[test]
+    fn an_open_sequence_past_the_hold_cap_should_be_released_and_its_late_query_left_unstripped() {
+        let mut head = b"\x1b[".to_vec();
+        head.resize(2 + MAX_HELD + 10, b'0');
+        let mut s = QueryScanner::default();
+        let first = s.feed(&head);
+        assert_eq!(&*first.raw, &head[..], "released unheld");
+        let second = s.feed(b"c");
+        assert_eq!(&*second.raw, b"c");
+        assert_eq!(second.stripped(), b"c", "documented bound: not stripped");
+    }
 }

@@ -415,10 +415,10 @@ impl Pane {
             unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?
         };
         let replies = Arc::new(QueryReplies::new(
+            #[cfg(unix)]
+            Box::new(PtyReplyWriter::new(reply_fd)),
+            #[cfg(not(unix))]
             Box::new(PtyReplyWriter {
-                #[cfg(unix)]
-                fd: reply_fd,
-                #[cfg(not(unix))]
                 writer: writer.clone(),
             }),
             Colors::from_env(),
@@ -721,12 +721,6 @@ impl Pane {
         self.output_tx.subscribe()
     }
 
-    /// Epic 2.1 Story 2.1.2: returns the output chunks produced since
-    /// `resume_from_seq`, if still retained, or `GapExceeded` if the
-    /// requested seq has already been evicted (or is otherwise out of
-    /// range). Reads `output_seq` directly rather than under `parser`'s
-    /// lock — resume doesn't need the grid, consistent with `size()`'s
-    /// existing precedent of reading atomics without `parser`.
     #[cfg(test)]
     fn run_push_bump_hook(&self) {
         if let Some(hook) = self.push_bump_hook.lock().unwrap().as_ref() {
@@ -734,6 +728,12 @@ impl Pane {
         }
     }
 
+    /// Epic 2.1 Story 2.1.2: returns the output chunks produced since
+    /// `resume_from_seq`, if still retained, or `GapExceeded` if the
+    /// requested seq has already been evicted (or is otherwise out of
+    /// range). Reads `output_seq` directly rather than under `parser`'s
+    /// lock — resume doesn't need the grid, consistent with `size()`'s
+    /// existing precedent of reading atomics without `parser`.
     pub fn replay_since(&self, resume_from_seq: u64) -> ReplayOutcome {
         self.replay
             .lock()
@@ -1247,7 +1247,7 @@ mod tests {
         // an event, not a timeout.
         pane.write_input(b"printf '\\033[6n\\033[c'; echo MA\"\"RK\n")
             .unwrap();
-        wait_for_row(&pane, |r| r == "MARK");
+        wait_for_row(&pane, |r| r.ends_with("MARK") && !r.contains("echo"));
         assert_eq!(pane.query_replies.accepted(), 0, "daemon must stay silent");
     }
 
@@ -1418,6 +1418,61 @@ mod tests {
         // "a" and "b" adjacent proves both the ESC[ prefix and the 6n tail are gone
         assert!(!contains_bytes(&bytes, b"\x1b[6n"), "{text:?}");
         assert!(text.contains("\r\nab"), "{text:?}");
+    }
+
+    #[test]
+    fn a_sequence_open_at_pty_eof_should_still_reach_subscribers_and_replay() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let mut rx = pane.subscribe();
+        pane.write_input(b"echo RE\"\"ADY\n").unwrap();
+        wait_for_row(&pane, |r| r.ends_with("READY") && !r.contains("echo"));
+        // ESC [ 6 is a query prefix the scanner holds back; EOF must release it
+        // exec: nothing else may follow the open sequence, or it would complete and not be held
+        pane.write_input(b"exec printf 'x\\033[6'\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pane.is_exited() {
+            assert!(Instant::now() < deadline, "child never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut live = Vec::new();
+        while let Ok((_, chunk)) = rx.try_recv() {
+            live.extend_from_slice(&chunk);
+        }
+        assert!(
+            contains_bytes(&live, b"x\x1b[6"),
+            "subscriber: {:?}",
+            String::from_utf8_lossy(&live)
+        );
+        let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
+            panic!("expected the history to be retained");
+        };
+        let replayed: Vec<u8> = chunks.into_iter().flat_map(|(_, b)| b).collect();
+        assert!(
+            contains_bytes(&replayed, b"x\x1b[6"),
+            "replay: {:?}",
+            String::from_utf8_lossy(&replayed)
+        );
+    }
+
+    #[test]
+    fn user_input_should_not_wait_behind_a_flood_of_unread_replies() {
+        let pane = Arc::new(Pane::spawn("/bin/sh", 24, 80).unwrap());
+        pane.write_input(b"yes \"$(printf '\\033[c')\"\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while pane.query_replies.accepted() == 0 {
+            assert!(Instant::now() < deadline, "flood never answered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let p = pane.clone();
+        std::thread::spawn(move || {
+            p.write_input(b"\x03").unwrap();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Ctrl-C write blocked behind reply writes");
+        pane.kill().unwrap();
     }
 
     #[test]

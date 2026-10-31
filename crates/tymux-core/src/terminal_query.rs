@@ -98,6 +98,8 @@ fn flag(on: bool) -> u8 {
 }
 
 /// Mirrors xterm.js's `requestMode` (the browser client's answer), limited to modes vt100 tracks.
+/// The DEC table there has no entry for mode 5 (DECSCNM), so it answers 0 and so do we:
+/// <https://github.com/xtermjs/xterm.js/blob/fe302d04f94c5b23018c96b753ec15f49b18c265/src/common/InputHandler.ts#L2337-L2398>
 fn mode_status(screen: &Screen, dec: bool, mode: u16) -> u8 {
     let mouse = screen.mouse_protocol_mode();
     let encoding = screen.mouse_protocol_encoding();
@@ -436,26 +438,47 @@ pub(crate) struct PtyReplyWriter {
 }
 
 #[cfg(unix)]
-const WRITE_WAIT_MS: libc::c_int = 250;
+const WRITE_WAIT_MS: u64 = 250;
+
+#[cfg(unix)]
+impl PtyReplyWriter {
+    pub(crate) fn new(fd: std::os::fd::OwnedFd) -> Self {
+        Self { fd }
+    }
+}
 
 impl ReplyWriter for PtyReplyWriter {
     #[cfg(unix)]
     fn write_reply(&mut self, mut bytes: &[u8]) {
         use std::os::fd::AsRawFd;
         let fd = self.fd.as_raw_fd();
+        let deadline = Instant::now() + std::time::Duration::from_millis(WRITE_WAIT_MS);
         while !bytes.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
             let mut pfd = libc::pollfd {
                 fd,
                 events: libc::POLLOUT,
                 revents: 0,
             };
             // SAFETY: `pfd` is a valid pollfd and the count matches.
-            let ready = unsafe { libc::poll(&mut pfd, 1, WRITE_WAIT_MS) };
+            let ready = unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) };
+            if ready < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
             if ready <= 0 || pfd.revents & libc::POLLOUT == 0 {
+                tracing::debug!(
+                    dropped = bytes.len(),
+                    "pty not accepting input; terminal-query reply dropped"
+                );
                 return;
             }
             // SAFETY: `bytes` is a valid readable slice; `fd` is owned by `self`.
             let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             if n <= 0 {
                 return;
             }

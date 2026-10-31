@@ -625,3 +625,69 @@ fn a_utf8_encoded_c1_query_should_be_answered_but_not_stripped() {
     let out = scanner.feed(b"\xc2\x9b6n");
     assert_eq!(out.stripped(), b"\xc2\x9b6n");
 }
+
+#[test]
+fn a_query_open_past_the_hold_cap_should_still_be_answered_by_the_emulator() {
+    let mut q = b"\x1b[".to_vec();
+    q.resize(q.len() + 70_000, b'0');
+    q.push(b'c');
+    assert_eq!(replies_to(&q), ["ESC[?1;2c"]);
+}
+
+/// A pipe whose buffer is full: like a pty whose child never reads stdin.
+#[cfg(unix)]
+fn full_pipe_write_end() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0; 2];
+    // SAFETY: valid two-element array.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: pipe() returned two fresh descriptors we now own.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    use std::os::fd::AsRawFd;
+    let w = write.as_raw_fd();
+    // SAFETY: fcntl on a descriptor we own.
+    unsafe {
+        let flags = libc::fcntl(w, libc::F_GETFL);
+        libc::fcntl(w, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let chunk = [0u8; 4096];
+        while libc::write(w, chunk.as_ptr().cast(), chunk.len()) > 0 {}
+        libc::fcntl(w, libc::F_SETFL, flags);
+    }
+    (read, write)
+}
+
+#[cfg(unix)]
+#[test]
+fn the_pty_reply_writer_should_drop_a_reply_instead_of_waiting_forever_on_a_full_pty() {
+    let (_read, write) = full_pipe_write_end();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut writer = PtyReplyWriter::new(write);
+        writer.write_reply(b"\x1b[?1;2c");
+        let _ = done_tx.send(());
+    });
+    // a poll timeout of -1 would block here forever, so fail by timeout rather than hang
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("reply writer blocked on a full pty");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_pty_reply_writer_should_deliver_a_reply_when_the_pty_has_room() {
+    let (read, write) = {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fds = [0; 2];
+        // SAFETY: valid two-element array; descriptors are owned right after.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        }
+    };
+    PtyReplyWriter::new(write).write_reply(b"\x1b[?1;2c");
+    let mut buf = [0u8; 16];
+    use std::os::fd::AsRawFd;
+    // SAFETY: reading into a valid buffer from an owned descriptor.
+    let n = unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    assert_eq!(&buf[..n as usize], b"\x1b[?1;2c");
+}

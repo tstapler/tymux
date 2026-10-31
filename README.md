@@ -134,6 +134,9 @@ queries without reading its input cannot stall output. Limits that remain:
 - Reply writes use their own pty fd and wait at most 250 ms for the child to accept data, so a child
   that never reads stdin drops replies instead of blocking output or user input.
 - A query introduced with a UTF-8 encoded C1 control (`C2 9B`) is answered but not stripped.
+- A lone trailing ESC, or an open CSI/OSC, is withheld from clients and replay until the next chunk or
+  pty EOF (there is no idle flush; releasing early could split a query across chunks). `ESC[` followed
+  only by C0 output such as newlines is withheld until a final byte arrives or 64 KiB accumulate.
 - A sequence still open after 64 KiB is released unheld, so a query completing later is answered but
   not stripped from replay.
 - An OSC that mixes colour sets with queries is left for the client; the daemon ignores it.
