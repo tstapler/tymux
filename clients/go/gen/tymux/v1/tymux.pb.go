@@ -779,7 +779,9 @@ type CreateSessionRequest struct {
 	// capability "create_session.stdin_stream"; ADR-0006.
 	StdinStream bool `protobuf:"varint,9,opt,name=stdin_stream,json=stdinStream,proto3" json:"stdin_stream,omitempty"`
 	// Restart policy for the first pane, and the default for panes later added to the session.
-	// Absent means NEVER (the pane is never restarted automatically). Persisted. Advertised as
+	// Absent means NEVER (the pane is never restarted automatically); this holds only when the
+	// message itself is absent: a present RestartPolicy with mode UNSPECIFIED is INVALID_ARGUMENT.
+	// Persisted. Advertised as
 	// capability "pane.lifecycle"; ADR-0007.
 	RestartPolicy *RestartPolicy `protobuf:"bytes,10,opt,name=restart_policy,json=restartPolicy,proto3" json:"restart_policy,omitempty"`
 	unknownFields protoimpl.UnknownFields

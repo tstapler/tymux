@@ -301,7 +301,9 @@ export type CreateSessionRequest = Message<"tymux.v1.CreateSessionRequest"> & {
 
   /**
    * Restart policy for the first pane, and the default for panes later added to the session.
-   * Absent means NEVER (the pane is never restarted automatically). Persisted. Advertised as
+   * Absent means NEVER (the pane is never restarted automatically); this holds only when the
+   * message itself is absent: a present RestartPolicy with mode UNSPECIFIED is INVALID_ARGUMENT.
+   * Persisted. Advertised as
    * capability "pane.lifecycle"; ADR-0007.
    *
    * @generated from field: tymux.v1.RestartPolicy restart_policy = 10;
@@ -2180,6 +2182,10 @@ export const TymuxService: GenService<{
    * live — never a duplicate spawn. A pane whose child exited inside this daemon (not
    * restored from disk) is also respawned in place, same pane id and screen (ADR-0007);
    * before that, such a session was reported already_live and nothing was respawned.
+   * A pane the operator stopped (STOPPED, StopPane) or that ran out of restarts (FAILED)
+   * is never revived by this call: it stays as it is while the session's other panes are
+   * revived. If every pane is STOPPED or FAILED the call is FAILED_PRECONDITION. Use
+   * StartPane (STOPPED or FAILED) or RestartPane (resets the budget) for those.
    *
    * @generated from rpc tymux.v1.TymuxService.ReviveSession
    */
