@@ -382,6 +382,11 @@ impl QueryReplies {
         self.daemon_answers.store(on, Ordering::Release);
     }
 
+    /// Points replies at a new pty after a restart and reopens them (see `Outbox::rearm`).
+    pub(crate) fn rearm(&self, writer: Box<dyn ReplyWriter>) {
+        self.outbox.rearm(writer);
+    }
+
     /// Stops the writer thread; called when the pty closes.
     pub(crate) fn close(&self) {
         self.outbox.close();

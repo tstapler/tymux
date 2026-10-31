@@ -1172,3 +1172,91 @@ func TestWriteStdinRejectsPanesWithoutStdinStreamAndConflictingCreate(t *testing
 		t.Fatalf("stdin_path+stdin_stream: got %v, want InvalidArgument", err)
 	}
 }
+
+// TestPaneLifecycleRPCsDriveRestartPolicyStopStartAndRestart exercises ADR-0007 through the
+// generated client: a policy given at creation is reported back with defaults resolved,
+// StopPane parks the pane, StartPane and RestartPane bring a process back, and starting a
+// running pane is refused.
+func TestPaneLifecycleRPCsDriveRestartPolicyStopStartAndRestart(t *testing.T) {
+	addr := startDaemon(t)
+	client := newClient(addr, "")
+	ctx := context.Background()
+
+	caps, err := capabilities.Detect(ctx, client)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if !caps.Has(capabilities.PaneLifecycle) {
+		t.Fatalf("daemon does not advertise %q", capabilities.PaneLifecycle)
+	}
+
+	maxRestarts := uint32(2)
+	created, err := client.CreateSession(ctx, connect.NewRequest(&tymuxv1.CreateSessionRequest{
+		Name:    "go-lifecycle",
+		Command: "/bin/sh",
+		Args:    []string{"-c", "exec sleep 300"},
+		RestartPolicy: &tymuxv1.RestartPolicy{
+			Mode:        tymuxv1.RestartMode_RESTART_MODE_ON_FAILURE,
+			MaxRestarts: &maxRestarts,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	paneID := firstPaneID(t, created.Msg)
+
+	status := func(resp *connect.Response[tymuxv1.PaneStatus], err error) *tymuxv1.PaneStatus {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("lifecycle RPC: %v", err)
+		}
+		return resp.Msg
+	}
+
+	st := status(client.GetPaneStatus(ctx, connect.NewRequest(&tymuxv1.GetPaneStatusRequest{PaneId: paneID})))
+	if st.GetState() != tymuxv1.PaneState_PANE_STATE_LIVE || st.GetPid() == 0 {
+		t.Fatalf("want a live pane with a pid, got state=%v pid=%d", st.GetState(), st.GetPid())
+	}
+	p := st.GetPolicy()
+	if p.GetMode() != tymuxv1.RestartMode_RESTART_MODE_ON_FAILURE || p.GetMaxRestarts() != 2 || p.GetWindowMs() != 60000 {
+		t.Fatalf("policy not reported with defaults resolved: %v", p)
+	}
+
+	st = status(client.StopPane(ctx, connect.NewRequest(&tymuxv1.StopPaneRequest{PaneId: paneID})))
+	if st.GetState() != tymuxv1.PaneState_PANE_STATE_STOPPED || st.LastExitSignal == nil || st.GetLastExitSignal() != 15 {
+		t.Fatalf("want STOPPED after SIGTERM, got state=%v signal=%v", st.GetState(), st.LastExitSignal)
+	}
+
+	st = status(client.StartPane(ctx, connect.NewRequest(&tymuxv1.StartPaneRequest{PaneId: paneID})))
+	if st.GetState() != tymuxv1.PaneState_PANE_STATE_LIVE {
+		t.Fatalf("want LIVE after StartPane, got %v", st.GetState())
+	}
+	firstPID := st.GetPid()
+
+	_, err = client.StartPane(ctx, connect.NewRequest(&tymuxv1.StartPaneRequest{PaneId: paneID}))
+	if connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("starting a running pane: want FailedPrecondition, got %v", err)
+	}
+
+	st = status(client.RestartPane(ctx, connect.NewRequest(&tymuxv1.RestartPaneRequest{PaneId: paneID})))
+	if st.GetState() != tymuxv1.PaneState_PANE_STATE_LIVE || st.GetPid() == firstPID || st.GetPid() == 0 {
+		t.Fatalf("want a new live process after RestartPane, got state=%v pid=%d (was %d)", st.GetState(), st.GetPid(), firstPID)
+	}
+
+	st = status(client.ResetRestartBudget(ctx, connect.NewRequest(&tymuxv1.ResetRestartBudgetRequest{PaneId: paneID})))
+	if st.GetRestartsInWindow() != 0 || st.GetConsecutiveFailures() != 0 {
+		t.Fatalf("budget not cleared: %v", st)
+	}
+
+	_, err = client.GetPaneStatus(ctx, connect.NewRequest(&tymuxv1.GetPaneStatusRequest{PaneId: "00000000-0000-0000-0000-000000000000"}))
+	if connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("unknown pane: want NotFound, got %v", err)
+	}
+	_, err = client.SetRestartPolicy(ctx, connect.NewRequest(&tymuxv1.SetRestartPolicyRequest{
+		Target: &tymuxv1.SetRestartPolicyRequest_PaneId{PaneId: paneID},
+		Policy: &tymuxv1.RestartPolicy{},
+	}))
+	if connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("policy without a mode: want InvalidArgument, got %v", err)
+	}
+}

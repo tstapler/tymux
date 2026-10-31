@@ -4,8 +4,10 @@ mod layout;
 mod pane;
 mod persistence;
 mod replay_buffer;
+mod restart;
 #[cfg(unix)]
 mod spawn;
+mod supervision;
 mod terminal_query;
 
 pub use engine::{
@@ -25,4 +27,10 @@ pub use persistence::{
 };
 pub use replay_buffer::ReplayOutcome;
 
+pub use restart::{
+    Clock, ExitKind, ExitRecord, FixedJitter, Jitter, LifecycleEvent, LifecycleEventKind,
+    LifecycleState, ManualClock, PaneStatusView, PaneSupervisor, PersistedRestartState,
+    RestartMode, RestartPolicy, SystemClock, SystemJitter,
+};
+pub use supervision::{PaneStatus, SignalOutcome, Supervision};
 pub use terminal_query::LiveClient;

@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,6 +8,8 @@ use anyhow::Result;
 use portable_pty::CommandBuilder;
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use tokio::sync::{broadcast, Notify};
+
+use crate::restart::LifecycleEvent;
 use uuid::Uuid;
 
 use crate::replay_buffer::{
@@ -85,6 +87,14 @@ use crate::launch::PreparedLaunch;
 #[cfg(test)]
 type PushBumpHook = Box<dyn Fn(&Pane) + Send>;
 
+/// Called on the reader thread when the child has exited, after the exit code is recorded and
+/// before `is_exited()` turns true. Returns whether a restart is pending, so attached clients
+/// stay attached (see [`Pane::wait_final_exit`]).
+pub type ExitHook = Arc<dyn Fn(&Pane, Option<i32>) -> bool + Send + Sync>;
+
+/// Lifecycle events a slow subscriber may lag behind before it starts losing the oldest.
+const LIFECYCLE_CHANNEL_CAPACITY: usize = 64;
+
 /// A single pty-backed terminal. Owns the child process, the pty master
 /// (for resize + writing input), and a `vt100::Parser` that keeps a
 /// structured screen model in sync with everything the child prints.
@@ -140,7 +150,7 @@ pub struct Pane {
     output_tx: broadcast::Sender<(u64, Vec<u8>)>,
     /// Attached clients whose emulators answer terminal queries (see `terminal_query`).
     clients: ClientRegistry,
-    #[cfg(test)]
+    /// Answers terminal queries for the process; re-armed on a new pty by `respawn`.
     query_replies: Arc<QueryReplies>,
     /// Test hook run between the replay push and the seq bump, with the replay lock held.
     #[cfg(test)]
@@ -166,8 +176,26 @@ pub struct Pane {
     /// caller that observes `is_exited() == true` is guaranteed to see the
     /// final `exit_code()` value too (write-then-flag, no separate race).
     exit_code: Mutex<Option<i32>>,
-    /// Captured at spawn so `kill` can signal without taking `_child`.
-    pid: Option<u32>,
+    /// Captured at spawn so `kill` can signal without taking `_child`; 0 = none. Replaced by
+    /// [`Self::respawn`].
+    pid: AtomicU32,
+    /// Bumped by every respawn, so a delayed SIGKILL aimed at an old process never hits its
+    /// successor.
+    generation: Arc<AtomicU64>,
+    /// The last signal this daemon sent to the child (0 = none); reported as the exit signal.
+    last_signal: AtomicI32,
+    /// A restart is scheduled or in flight, so this pane's exit is not final.
+    restart_pending: AtomicBool,
+    /// The pane was closed: `respawn` must refuse.
+    retired: AtomicBool,
+    /// Serializes `respawn` against `retire`.
+    spawn_lock: Mutex<()>,
+    exit_hook: Mutex<Option<ExitHook>>,
+    /// Set by the reader thread once it has looked for the exit hook (see `set_exit_hook`).
+    exit_checked: AtomicBool,
+    lifecycle_tx: broadcast::Sender<LifecycleEvent>,
+    /// Pulsed on every change `wait_final_exit` cares about: exit, respawn, pending cleared.
+    state_notify: Notify,
     // Held only to keep the child alive; not otherwise touched.
     _child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     // Tracked so the reader thread's lifecycle is at least observable
@@ -350,73 +378,14 @@ impl Pane {
         rows: u16,
         cols: u16,
     ) -> Result<Arc<Self>> {
-        // Before openpty so a bad argument file or stderr path fails with no
-        // pty allocated.
-        let prepared = launch.prepare()?;
-        let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-
-        #[cfg(unix)]
-        let child: Box<dyn portable_pty::Child + Send + Sync> = {
-            let master_fd = pair
-                .master
-                .as_raw_fd()
-                .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
-            // TYMUXD_TOKEN is stripped inside spawn_on_pty: it's the daemon's
-            // own secret and must never reach a pane's environment
-            // (research/pitfalls.md §2, HIGH PRIORITY).
-            crate::spawn::spawn_on_pty(master_fd, command, launch, &prepared, cwd)?
-        };
-        #[cfg(not(unix))]
-        let child = {
-            if prepared.stderr.is_some() || prepared.stdin.is_some() {
-                anyhow::bail!("stderr_path and stdin_path are only supported on unix");
-            }
-            let mut cmd = CommandBuilder::new(command);
-            cmd.args(&prepared.args);
-            for (key, value) in &launch.env {
-                cmd.env(key, value);
-            }
-            if let Some(cwd) = cwd {
-                cmd.cwd(cwd);
-            }
-            cmd.env_remove("TYMUXD_TOKEN");
-            pair.slave.spawn_command(cmd)?
-        };
-        let pid = child.process_id();
-        drop(pair.slave);
-        // The pane must not hold the pipe's read end: only then does the
-        // write end see EPIPE once the child exits.
-        let PreparedLaunch {
-            stdin_writer,
-            stdin,
-            ..
-        } = prepared;
-        drop(stdin);
-
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
-        let mut reader = pair.master.try_clone_reader()?;
+        let process = start_process(command, launch, cwd, rows, cols)?;
 
         let scrollback_lines = allocate_scrollback_budget();
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
-        #[cfg(unix)]
-        let reply_fd = {
-            use std::os::fd::{BorrowedFd, RawFd};
-            let raw: RawFd = pair
-                .master
-                .as_raw_fd()
-                .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
-            // SAFETY: the master (and so `raw`) outlives this call; the duplicate is independent.
-            unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?
-        };
+        let writer = Arc::new(Mutex::new(process.writer));
         let replies = Arc::new(QueryReplies::new(
             #[cfg(unix)]
-            Box::new(PtyReplyWriter::new(reply_fd)),
+            Box::new(PtyReplyWriter::new(process.reply_fd)),
             #[cfg(not(unix))]
             Box::new(PtyReplyWriter {
                 writer: writer.clone(),
@@ -429,6 +398,7 @@ impl Pane {
             scrollback_lines,
             QueryResponder::new(replies.clone()),
         )));
+        let (lifecycle_tx, _) = broadcast::channel(LIFECYCLE_CHANNEL_CAPACITY);
         let replay_budget_bytes = allocate_replay_budget();
 
         let effective_cwd = cwd.map(str::to_string).unwrap_or_else(|| {
@@ -442,8 +412,8 @@ impl Pane {
             launch: launch.clone(),
             cwd: effective_cwd,
             writer,
-            stdin_writer: Mutex::new(stdin_writer),
-            master: Mutex::new(pair.master),
+            stdin_writer: Mutex::new(process.stdin_writer),
+            master: Mutex::new(process.master),
             parser: parser.clone(),
             rows: AtomicU32::new(rows as u32),
             cols: AtomicU32::new(cols as u32),
@@ -452,7 +422,6 @@ impl Pane {
             replay_budget_bytes,
             output_tx: output_tx.clone(),
             clients: ClientRegistry::default(),
-            #[cfg(test)]
             query_replies: replies.clone(),
             #[cfg(test)]
             push_bump_hook: Mutex::new(None),
@@ -462,14 +431,32 @@ impl Pane {
             resize_delay_ms: std::sync::atomic::AtomicU64::new(0),
             exit_notify: Notify::new(),
             exit_code: Mutex::new(None),
-            pid,
-            _child: Mutex::new(child),
+            pid: AtomicU32::new(process.pid.unwrap_or(0)),
+            generation: Arc::new(AtomicU64::new(0)),
+            last_signal: AtomicI32::new(0),
+            restart_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            spawn_lock: Mutex::new(()),
+            exit_hook: Mutex::new(None),
+            exit_checked: AtomicBool::new(false),
+            lifecycle_tx,
+            state_notify: Notify::new(),
+            _child: Mutex::new(process.child),
             _reader_handle: Mutex::new(None),
         });
+        pane.start_reader(process.reader);
+        Ok(pane)
+    }
 
-        // portable_pty's reader is blocking std::io::Read, so it gets its
-        // own OS thread rather than a tokio task.
-        let pane_for_reader = pane.clone();
+    /// Starts the thread that feeds the child's output into the screen model, the replay buffer
+    /// and subscribers, and records the exit when the pty closes. portable_pty's reader is
+    /// blocking `std::io::Read`, so it gets an OS thread rather than a tokio task. One runs per
+    /// process generation; `respawn` starts the next only after the previous one has finished.
+    fn start_reader(self: &Arc<Self>, mut reader: Box<dyn Read + Send>) {
+        let parser = self.parser.clone();
+        let output_tx = self.output_tx.clone();
+        let replies = self.query_replies.clone();
+        let pane_for_reader = self.clone();
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; PTY_READ_BUF_SIZE];
             let mut scanner = QueryScanner::default();
@@ -547,6 +534,18 @@ impl Pane {
                 Err(_) => None,
             };
             *pane_for_reader.exit_code.lock().unwrap() = code;
+            // The supervisor decides here, before the exit becomes visible, whether a restart
+            // follows, so a client that sees `is_exited()` also sees `restart_pending()`.
+            let hook = {
+                let guard = pane_for_reader.exit_hook.lock().unwrap();
+                pane_for_reader.exit_checked.store(true, Ordering::SeqCst);
+                guard.clone()
+            };
+            // The hook sets `restart_pending` itself under the supervision lock; storing its
+            // return value here would overwrite a concurrent Stop or policy change.
+            if let Some(hook) = hook {
+                hook(&pane_for_reader, code);
+            }
             // Mark it so any current or future `wait_exit()` caller —
             // including one that started waiting after this point —
             // observes it. Stored after `exit_code` above, so any caller
@@ -554,10 +553,149 @@ impl Pane {
             // the final `exit_code()`.
             pane_for_reader.exited.store(true, Ordering::SeqCst);
             pane_for_reader.exit_notify.notify_waiters();
+            pane_for_reader.state_notify.notify_waiters();
         });
-        *pane._reader_handle.lock().unwrap() = Some(handle);
+        *self._reader_handle.lock().unwrap() = Some(handle);
+    }
 
-        Ok(pane)
+    /// Replaces the exited child with a fresh process on a new pty, keeping this pane's id,
+    /// screen, scrollback, replay buffer, size, subscribers and launch spec. Re-reads argument
+    /// files and re-opens the stdin file, as a revive does. Returns the new pid.
+    ///
+    /// Errors if the pane is still running or was closed (`retire`); on a spawn failure nothing
+    /// changes and the pane stays exited.
+    pub fn respawn(self: &Arc<Self>) -> Result<Option<u32>> {
+        self.respawn_with(&|_| Vec::new())
+    }
+
+    /// [`Self::respawn`], plus `banner(pid)` written into the output stream after the new child
+    /// has started but before anything it prints, so the stream shows the boundary in order.
+    pub fn respawn_with(
+        self: &Arc<Self>,
+        banner: &dyn Fn(Option<u32>) -> Vec<u8>,
+    ) -> Result<Option<u32>> {
+        let _guard = self.spawn_lock.lock().unwrap();
+        anyhow::ensure!(!self.retired.load(Ordering::SeqCst), "pane was closed");
+        anyhow::ensure!(self.is_exited(), "pane process is still running");
+        let (rows, cols) = self.size();
+        let process = start_process(
+            &self.command,
+            &self.launch,
+            Some(&self.cwd),
+            rows as u16,
+            cols as u16,
+        )?;
+        // `exited` is the old reader's last write, so it is on its way out and the join is
+        // immediate; doing it here (not in `Drop`) keeps at most one reader thread per pane.
+        if let Some(old) = self._reader_handle.lock().unwrap().take() {
+            let _ = old.join();
+        }
+        *self.writer.lock().unwrap() = process.writer;
+        // A fresh reply writer for the new pty, so the old fd closes and a closed outbox reopens.
+        #[cfg(unix)]
+        self.query_replies
+            .rearm(Box::new(PtyReplyWriter::new(process.reply_fd)));
+        #[cfg(not(unix))]
+        self.query_replies.rearm(Box::new(PtyReplyWriter {
+            writer: self.writer.clone(),
+        }));
+        *self.master.lock().unwrap() = process.master;
+        *self.stdin_writer.lock().unwrap() = process.stdin_writer;
+        *self._child.lock().unwrap() = process.child;
+        let pid = process.pid;
+        self.pid.store(pid.unwrap_or(0), Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.last_signal.store(0, Ordering::SeqCst);
+        *self.exit_code.lock().unwrap() = None;
+        self.exit_checked.store(false, Ordering::SeqCst);
+        // `exited` first: `restart_pending` stays set until the process is running, so a client
+        // never sees "exited and nothing pending" in between. The supervisor clears it after.
+        self.exited.store(false, Ordering::SeqCst);
+        // No reader thread exists yet, so this cannot interleave with the child's output.
+        let banner = banner(pid);
+        if !banner.is_empty() {
+            self.inject_output(&banner);
+        }
+        self.start_reader(process.reader);
+        self.state_notify.notify_waiters();
+        Ok(pid)
+    }
+
+    /// Refuses all future `respawn`s. Called when the pane is closed or its session killed;
+    /// serialized with `respawn` so a restart that is mid-flight finishes first and the caller
+    /// then kills what it started.
+    pub fn retire(&self) {
+        let _guard = self.spawn_lock.lock().unwrap();
+        self.retired.store(true, Ordering::SeqCst);
+        self.restart_pending.store(false, Ordering::SeqCst);
+        self.state_notify.notify_waiters();
+    }
+
+    /// Installs the exit hook. Returns true if the child already exited without seeing it, in
+    /// which case the caller must account for that exit itself.
+    pub fn set_exit_hook(&self, hook: ExitHook) -> bool {
+        let mut guard = self.exit_hook.lock().unwrap();
+        *guard = Some(hook);
+        self.exit_checked.load(Ordering::SeqCst)
+    }
+
+    pub fn restart_pending(&self) -> bool {
+        self.restart_pending.load(Ordering::SeqCst)
+    }
+
+    /// How many times the process has been replaced (0 for the original).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Resolves on the next exit, respawn or pending-restart change. Create it before checking
+    /// the condition being waited on, then await it, so no change is missed.
+    pub fn state_changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.state_notify.notified()
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+
+    /// The running child's pid, if any.
+    pub fn pid(&self) -> Option<u32> {
+        Some(self.pid.load(Ordering::SeqCst)).filter(|p| *p != 0)
+    }
+
+    pub fn set_restart_pending(&self, pending: bool) {
+        let was = self.restart_pending.swap(pending, Ordering::SeqCst);
+        if was != pending {
+            self.state_notify.notify_waiters();
+        }
+    }
+
+    /// The last signal this daemon sent the child, if any.
+    pub fn signal_sent(&self) -> Option<i32> {
+        Some(self.last_signal.load(Ordering::SeqCst)).filter(|s| *s != 0)
+    }
+
+    pub fn subscribe_lifecycle(&self) -> broadcast::Receiver<LifecycleEvent> {
+        self.lifecycle_tx.subscribe()
+    }
+
+    pub fn emit_lifecycle(&self, event: LifecycleEvent) {
+        // No receivers just means nobody is watching.
+        let _ = self.lifecycle_tx.send(event);
+    }
+
+    /// Writes `data` into the output stream as if the child had printed it: it lands in the
+    /// screen, the scrollback, the replay buffer and every subscriber. Used for the marker the
+    /// supervisor leaves where a process died and its successor starts. Call only while no
+    /// reader thread is running (between a child's exit and its respawn).
+    pub fn inject_output(&self, data: &[u8]) {
+        let seq = {
+            let mut parser = self.parser.lock().unwrap();
+            parser.process(data);
+            self.output_seq.fetch_add(1, Ordering::SeqCst) + 1
+        };
+        self.replay.lock().unwrap().push(seq, data);
+        let _ = self.output_tx.send((seq, data.to_vec()));
     }
 
     pub fn is_exited(&self) -> bool {
@@ -597,27 +735,62 @@ impl Pane {
     /// `KillSession` (and the engine's `panes` lock) for ~50ms per pane.
     #[cfg(unix)]
     fn kill_unix(&self) -> Result<()> {
-        let Some(pid) = self.pid else {
+        self.signal_then_kill(libc::SIGHUP, KILL_GRACE)
+    }
+
+    /// Asks the child to stop: SIGTERM now, SIGKILL after `grace` if it is still alive. Like
+    /// [`Self::kill`] it returns at once; await [`Self::wait_exit`] to see the process die.
+    pub fn terminate(&self, grace: Duration) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.signal_then_kill(libc::SIGTERM, grace)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = grace;
+            self._child.lock().unwrap().kill()?;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn signal_then_kill(&self, signal: i32, grace: Duration) -> Result<()> {
+        let pid = self.pid.load(Ordering::SeqCst);
+        if pid == 0 {
             return Ok(());
-        };
+        }
+        self.last_signal.store(signal, Ordering::SeqCst);
         // SAFETY: plain signal to a pid we spawned and have not yet reaped
         // (the reader thread reaps only after pty EOF).
-        if unsafe { libc::kill(pid as i32, libc::SIGHUP) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        if unsafe { libc::kill(pid as i32, signal) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // Already dead and reaped: the exit is on its way to being recorded.
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(err.into());
         }
         if self.is_exited() {
             return Ok(());
         }
         let exited = self.exited.clone();
+        let generation = self.generation.clone();
+        let this_generation = generation.load(Ordering::SeqCst);
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + KILL_GRACE;
+            let deadline = std::time::Instant::now() + grace;
             while std::time::Instant::now() < deadline {
-                if exited.load(Ordering::SeqCst) {
+                if exited.load(Ordering::SeqCst)
+                    || generation.load(Ordering::SeqCst) != this_generation
+                {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            if !exited.load(Ordering::SeqCst) {
+            // A respawn clears `exited`, so the generation check is what keeps this from
+            // killing the successor process.
+            if !exited.load(Ordering::SeqCst)
+                && generation.load(Ordering::SeqCst) == this_generation
+            {
                 // SAFETY: as above; `exited` is set right after the reap.
                 unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             }
@@ -636,6 +809,23 @@ impl Pane {
             }
             let notified = self.exit_notify.notified();
             if self.is_exited() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Like [`Self::wait_exit`], but keeps waiting while a restart is pending: it resolves only
+    /// when the pane has exited and nothing will bring it back (no restart scheduled, or the
+    /// pane was stopped or closed meanwhile). For a pane with no restart policy this is
+    /// identical to `wait_exit`.
+    pub async fn wait_final_exit(&self) {
+        loop {
+            if self.is_exited() && !self.restart_pending() {
+                return;
+            }
+            let notified = self.state_notify.notified();
+            if self.is_exited() && !self.restart_pending() {
                 return;
             }
             notified.await;
@@ -845,6 +1035,101 @@ impl Drop for Pane {
         release_scrollback_budget(self.scrollback_lines);
         release_replay_budget(self.replay_budget_bytes);
     }
+}
+
+/// A child process on a fresh pty, before it is attached to a [`Pane`].
+struct StartedProcess {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    pid: Option<u32>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    reader: Box<dyn Read + Send>,
+    stdin_writer: Option<std::fs::File>,
+    /// A duplicate of the pty master for the terminal-query reply writer.
+    #[cfg(unix)]
+    reply_fd: std::os::fd::OwnedFd,
+}
+
+/// Opens a pty of the given size and starts `command` on it. Shared by the first spawn and by
+/// [`Pane::respawn`], so a restart launches exactly what the original did.
+fn start_process(
+    command: &str,
+    launch: &Launch,
+    cwd: Option<&str>,
+    rows: u16,
+    cols: u16,
+) -> Result<StartedProcess> {
+    // Before openpty so a bad argument file or stderr path fails with no
+    // pty allocated.
+    let prepared = launch.prepare()?;
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    #[cfg(unix)]
+    let child: Box<dyn portable_pty::Child + Send + Sync> = {
+        let master_fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
+        // TYMUXD_TOKEN is stripped inside spawn_on_pty: it's the daemon's
+        // own secret and must never reach a pane's environment
+        // (research/pitfalls.md §2, HIGH PRIORITY).
+        crate::spawn::spawn_on_pty(master_fd, command, launch, &prepared, cwd)?
+    };
+    #[cfg(not(unix))]
+    let child = {
+        if prepared.stderr.is_some() || prepared.stdin.is_some() {
+            anyhow::bail!("stderr_path and stdin_path are only supported on unix");
+        }
+        let mut cmd = CommandBuilder::new(command);
+        cmd.args(&prepared.args);
+        for (key, value) in &launch.env {
+            cmd.env(key, value);
+        }
+        if let Some(cwd) = cwd {
+            cmd.cwd(cwd);
+        }
+        cmd.env_remove("TYMUXD_TOKEN");
+        pair.slave.spawn_command(cmd)?
+    };
+    let pid = child.process_id();
+    drop(pair.slave);
+    // The pane must not hold the pipe's read end: only then does the
+    // write end see EPIPE once the child exits.
+    let PreparedLaunch {
+        stdin_writer,
+        stdin,
+        ..
+    } = prepared;
+    drop(stdin);
+
+    let writer = pair.master.take_writer()?;
+    let reader = pair.master.try_clone_reader()?;
+    #[cfg(unix)]
+    let reply_fd = {
+        use std::os::fd::{BorrowedFd, RawFd};
+        let raw: RawFd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
+        // SAFETY: the master (and so `raw`) outlives this call; the duplicate is independent.
+        unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?
+    };
+    Ok(StartedProcess {
+        child,
+        pid,
+        master: pair.master,
+        writer,
+        reader,
+        stdin_writer,
+        #[cfg(unix)]
+        reply_fd,
+    })
 }
 
 /// Everything a snapshot holds that is computed from the emulator's screen alone (the caller

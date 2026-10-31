@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file tymux/v1/tymux.proto.
  */
 export const file_tymux_v1_tymux: GenFile = /*@__PURE__*/
-  fileDesc("ChR0eW11eC92MS90eW11eC5wcm90bxIIdHltdXgudjEibAoHU2Vzc2lvbhIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiEKB3dpbmRvd3MYAyADKAsyEC50eW11eC52MS5XaW5kb3cSJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcyJECgZXaW5kb3cSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIgCgZsYXlvdXQYAyABKAsyEC50eW11eC52MS5MYXlvdXQiUgoGTGF5b3V0Eh4KBHBhbmUYASABKAsyDi50eW11eC52MS5QYW5lSAASIAoFc3BsaXQYAiABKAsyDy50eW11eC52MS5TcGxpdEgAQgYKBG5vZGUiXAoFU3BsaXQSKgoLb3JpZW50YXRpb24YASABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhInCghjaGlsZHJlbhgCIAMoCzIVLnR5bXV4LnYxLkxheW91dENoaWxkIj4KC0xheW91dENoaWxkEiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBINCgVyYXRpbxgCIAEoAiJhCgRQYW5lEgoKAmlkGAEgASgJEgwKBHJvd3MYAiABKA0SDAoEY29scxgDIAEoDRIkCghsaXZlbmVzcxgEIAEoDjISLnR5bXV4LnYxLkxpdmVuZXNzEgsKA2N3ZBgFIAEoCSKXAgoUQ3JlYXRlU2Vzc2lvblJlcXVlc3QSDAoEbmFtZRgBIAEoCRIPCgdjb21tYW5kGAIgASgJEgsKA2N3ZBgDIAEoCRIMCgRhcmdzGAQgAygJEjQKA2VudhgFIAMoCzInLnR5bXV4LnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0LkVudkVudHJ5EhMKC3N0ZGVycl9wYXRoGAYgASgJEiQKCWFyZ19zcGVjcxgHIAMoCzIRLnR5bXV4LnYxLkFyZ1NwZWMSEgoKc3RkaW5fcGF0aBgIIAEoCRIUCgxzdGRpbl9zdHJlYW0YCSABKAgaKgoIRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJECgdBcmdTcGVjEhEKB2xpdGVyYWwYASABKAlIABIcChJmaWxlX2NvbnRlbnRzX3BhdGgYAiABKAlIAEIICgZzb3VyY2UiFQoTTGlzdFNlc3Npb25zUmVxdWVzdCI7ChRMaXN0U2Vzc2lvbnNSZXNwb25zZRIjCghzZXNzaW9ucxgBIAMoCzIRLnR5bXV4LnYxLlNlc3Npb24iKAoSS2lsbFNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiFQoTS2lsbFNlc3Npb25SZXNwb25zZSIqChRSZXZpdmVTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJImUKFVJldml2ZVNlc3Npb25SZXNwb25zZRIUCgxhbHJlYWR5X2xpdmUYASABKAgSEgoKcGFuZV9jb3VudBgCIAEoDRIiCgdzZXNzaW9uGAMgASgLMhEudHltdXgudjEuU2Vzc2lvbiJgChBTcGxpdFBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSKgoLb3JpZW50YXRpb24YAiABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhIPCgdjb21tYW5kGAMgASgJIiMKEENsb3NlUGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCSKlAQoRQ2xvc2VQYW5lUmVzcG9uc2USGAoQd2luZG93X2Nsb3NlZF9pZBgBIAEoCRIaChJ3aW5kb3dfY2xvc2VkX25hbWUYAiABKAkSGQoRc2Vzc2lvbl9jbG9zZWRfaWQYAyABKAkSGwoTc2Vzc2lvbl9jbG9zZWRfbmFtZRgEIAEoCRIiCgdzZXNzaW9uGAUgASgLMhEudHltdXgudjEuU2Vzc2lvbiI6ChNDcmVhdGVXaW5kb3dSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSDwoHY29tbWFuZBgCIAEoCSInChJXYXRjaFdpbmRvd1JlcXVlc3QSEQoJd2luZG93X2lkGAEgASgJIlQKEVdpbmRvd0xheW91dEV2ZW50EiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBIdChVhdHRhY2hlZF9jbGllbnRfY291bnQYAiABKA0iQAoSQ2FwdHVyZVBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSGQoRc2Nyb2xsYmFja19vZmZzZXQYAiABKA0iUQoXU2VhcmNoU2Nyb2xsYmFja1JlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIPCgdwYXR0ZXJuGAIgASgJEhQKDHN0YXJ0X29mZnNldBgDIAEoDSJHChhTZWFyY2hTY3JvbGxiYWNrUmVzcG9uc2USDQoFZm91bmQYASABKAgSDgoGb2Zmc2V0GAIgASgNEgwKBGxpbmUYAyABKAki7gMKDFBhbmVTbmFwc2hvdBIPCgdwYW5lX2lkGAEgASgJEgwKBHJvd3MYAiABKA0SDAoEY29scxgDIAEoDRIbCgRncmlkGAQgAygLMg0udHltdXgudjEuUm93EhIKCmN1cnNvcl9yb3cYBSABKA0SEgoKY3Vyc29yX2NvbBgGIAEoDRIkCghsaXZlbmVzcxgHIAEoDjISLnR5bXV4LnYxLkxpdmVuZXNzEicKCmh5cGVybGlua3MYCCADKAsyEy50eW11eC52MS5IeXBlcmxpbmsSDQoFdGl0bGUYCSABKAkSJgoFbW9kZXMYCiABKAsyFy50eW11eC52MS5UZXJtaW5hbE1vZGVzEhUKDWN1cnNvcl9oaWRkZW4YCyABKAgSFAoMY3Vyc29yX3N0eWxlGAwgASgNEhIKCmFsdF9zY3JlZW4YDSABKAgSEgoKc2Nyb2xsX3RvcBgOIAEoDRIVCg1zY3JvbGxfYm90dG9tGA8gASgNEhEKCXRhYl9zdG9wcxgQIAMoDRIkCghjaGFyc2V0cxgRIAEoCzISLnR5bXV4LnYxLkNoYXJzZXRzEhsKE2N1cnNvcl9wZW5kaW5nX3dyYXAYEiABKAgSFgoJZXhpdF9jb2RlGBMgASgFSACIAQFCDAoKX2V4aXRfY29kZSL0AQoNVGVybWluYWxNb2RlcxIXCg9hcHBfY3Vyc29yX2tleXMYASABKAgSEgoKYXBwX2tleXBhZBgCIAEoCBIXCg9icmFja2V0ZWRfcGFzdGUYAyABKAgSFAoMZm9jdXNfZXZlbnRzGAQgASgIEhIKCm1vdXNlX21vZGUYBSABKA0SFgoObW91c2VfZW5jb2RpbmcYBiABKA0SFQoNcmV2ZXJzZV92aWRlbxgHIAEoCBIOCgZvcmlnaW4YCCABKAgSEwoLbm9fYXV0b3dyYXAYCSABKAgSDgoGaW5zZXJ0GAogASgIEg8KB25ld2xpbmUYCyABKAgiRgoIQ2hhcnNldHMSCgoCZzAYASABKA0SCgoCZzEYAiABKA0SCgoCZzIYAyABKA0SCgoCZzMYBCABKA0SCgoCZ2wYBSABKA0iJAoJSHlwZXJsaW5rEgsKA3VyaRgBIAEoCRIKCgJpZBgCIAEoCSIkCgNSb3cSHQoFY2VsbHMYASADKAsyDi50eW11eC52MS5DZWxsIoABCgRDZWxsEgwKBHRleHQYASABKAkSCgoCZmcYAiABKA0SCgoCYmcYAyABKA0SDQoFYXR0cnMYBCABKA0SFwoPdW5kZXJsaW5lX3N0eWxlGAUgASgNEhcKD3VuZGVybGluZV9jb2xvchgGIAEoDRIRCgloeXBlcmxpbmsYByABKA0ilAEKDUF0dGFjaFJlcXVlc3QSEQoHcGFuZV9pZBgBIAEoCUgAEg8KBWlucHV0GAIgASgMSAASIgoGcmVzaXplGAMgASgLMhAudHltdXgudjEuUmVzaXplSAASHAoPcmVzdW1lX2Zyb21fc2VxGAQgASgESAGIAQFCCQoHcGF5bG9hZEISChBfcmVzdW1lX2Zyb21fc2VxIlIKEVdyaXRlU3RkaW5SZXF1ZXN0EhEKB3BhbmVfaWQYASABKAlIABIOCgRkYXRhGAIgASgMSAASDwoFY2xvc2UYAyABKAhIAEIJCgdwYXlsb2FkIisKEldyaXRlU3RkaW5SZXNwb25zZRIVCg1ieXRlc193cml0dGVuGAEgASgEIiQKBlJlc2l6ZRIMCgRyb3dzGAEgASgNEgwKBGNvbHMYAiABKA0iKAoKRXhpdFN0YXR1cxIRCgRjb2RlGAEgASgFSACIAQFCBwoFX2NvZGUiKAoLT3V0cHV0Q2h1bmsSCwoDc2VxGAEgASgEEgwKBGRhdGEYAiABKAwiKwoLR2FwRXhjZWVkZWQSHAoUb2xkZXN0X2F2YWlsYWJsZV9zZXEYASABKAQiCwoJSGVhcnRiZWF0IpwCCgtBdHRhY2hFdmVudBIQCgZvdXRwdXQYASABKAxIABIqCghzbmFwc2hvdBgCIAEoCzIWLnR5bXV4LnYxLlBhbmVTbmFwc2hvdEgAEiYKBmV4aXRlZBgDIAEoCzIULnR5bXV4LnYxLkV4aXRTdGF0dXNIABIUCgpvdXRwdXRfZ2FwGAQgASgISAASLQoMZ2FwX2V4Y2VlZGVkGAUgASgLMhUudHltdXgudjEuR2FwRXhjZWVkZWRIABIoCgloZWFydGJlYXQYBiABKAsyEy50eW11eC52MS5IZWFydGJlYXRIABItCgxvdXRwdXRfY2h1bmsYByABKAsyFS50eW11eC52MS5PdXRwdXRDaHVua0gAQgkKB3BheWxvYWQiNwoUR2V0U2VydmVySW5mb1JlcXVlc3QSHwoXY2xpZW50X3Byb3RvY29sX3ZlcnNpb24YASABKA0imAEKClNlcnZlckluZm8SDwoHdmVyc2lvbhgBIAEoCRIYChBwcm90b2NvbF92ZXJzaW9uGAIgASgNEiMKG21pbl9jbGllbnRfcHJvdG9jb2xfdmVyc2lvbhgDIAEoDRIUCgxjYXBhYmlsaXRpZXMYBCADKAkSCwoDcGlkGAUgASgNEhcKD3N0YXJ0ZWRfYXRfdW5peBgGIAEoAypKCghMaXZlbmVzcxIYChRMSVZFTkVTU19VTlNQRUNJRklFRBAAEhEKDUxJVkVORVNTX0xJVkUQARIRCg1MSVZFTkVTU19ERUFEEAIqYAoLT3JpZW50YXRpb24SGwoXT1JJRU5UQVRJT05fVU5TUEVDSUZJRUQQABIaChZPUklFTlRBVElPTl9IT1JJWk9OVEFMEAESGAoUT1JJRU5UQVRJT05fVkVSVElDQUwQAjK/BwoMVHltdXhTZXJ2aWNlEkUKDUdldFNlcnZlckluZm8SHi50eW11eC52MS5HZXRTZXJ2ZXJJbmZvUmVxdWVzdBoULnR5bXV4LnYxLlNlcnZlckluZm8SQgoNQ3JlYXRlU2Vzc2lvbhIeLnR5bXV4LnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0GhEudHltdXgudjEuU2Vzc2lvbhJNCgxMaXN0U2Vzc2lvbnMSHS50eW11eC52MS5MaXN0U2Vzc2lvbnNSZXF1ZXN0Gh4udHltdXgudjEuTGlzdFNlc3Npb25zUmVzcG9uc2USSgoLS2lsbFNlc3Npb24SHC50eW11eC52MS5LaWxsU2Vzc2lvblJlcXVlc3QaHS50eW11eC52MS5LaWxsU2Vzc2lvblJlc3BvbnNlElAKDVJldml2ZVNlc3Npb24SHi50eW11eC52MS5SZXZpdmVTZXNzaW9uUmVxdWVzdBofLnR5bXV4LnYxLlJldml2ZVNlc3Npb25SZXNwb25zZRJDCgtDYXB0dXJlUGFuZRIcLnR5bXV4LnYxLkNhcHR1cmVQYW5lUmVxdWVzdBoWLnR5bXV4LnYxLlBhbmVTbmFwc2hvdBJZChBTZWFyY2hTY3JvbGxiYWNrEiEudHltdXgudjEuU2VhcmNoU2Nyb2xsYmFja1JlcXVlc3QaIi50eW11eC52MS5TZWFyY2hTY3JvbGxiYWNrUmVzcG9uc2USOgoJU3BsaXRQYW5lEhoudHltdXgudjEuU3BsaXRQYW5lUmVxdWVzdBoRLnR5bXV4LnYxLlNlc3Npb24SRAoJQ2xvc2VQYW5lEhoudHltdXgudjEuQ2xvc2VQYW5lUmVxdWVzdBobLnR5bXV4LnYxLkNsb3NlUGFuZVJlc3BvbnNlEkAKDENyZWF0ZVdpbmRvdxIdLnR5bXV4LnYxLkNyZWF0ZVdpbmRvd1JlcXVlc3QaES50eW11eC52MS5TZXNzaW9uEkoKC1dhdGNoV2luZG93EhwudHltdXgudjEuV2F0Y2hXaW5kb3dSZXF1ZXN0GhsudHltdXgudjEuV2luZG93TGF5b3V0RXZlbnQwARI8CgZBdHRhY2gSFy50eW11eC52MS5BdHRhY2hSZXF1ZXN0GhUudHltdXgudjEuQXR0YWNoRXZlbnQoATABEkkKCldyaXRlU3RkaW4SGy50eW11eC52MS5Xcml0ZVN0ZGluUmVxdWVzdBocLnR5bXV4LnYxLldyaXRlU3RkaW5SZXNwb25zZSgBQpYBCgxjb20udHltdXgudjFCClR5bXV4UHJvdG9QAVo5Z2l0aHViLmNvbS90c3RhcGxlci90eW11eC9jbGllbnRzL2dvL2dlbi90eW11eC92MTt0eW11eHYxogIDVFhYqgIIVHltdXguVjHKAghUeW11eFxWMeICFFR5bXV4XFYxXEdQQk1ldGFkYXRh6gIJVHltdXg6OlYxYgZwcm90bzM");
+  fileDesc("ChR0eW11eC92MS90eW11eC5wcm90bxIIdHltdXgudjEibAoHU2Vzc2lvbhIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiEKB3dpbmRvd3MYAyADKAsyEC50eW11eC52MS5XaW5kb3cSJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcyJECgZXaW5kb3cSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIgCgZsYXlvdXQYAyABKAsyEC50eW11eC52MS5MYXlvdXQiUgoGTGF5b3V0Eh4KBHBhbmUYASABKAsyDi50eW11eC52MS5QYW5lSAASIAoFc3BsaXQYAiABKAsyDy50eW11eC52MS5TcGxpdEgAQgYKBG5vZGUiXAoFU3BsaXQSKgoLb3JpZW50YXRpb24YASABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhInCghjaGlsZHJlbhgCIAMoCzIVLnR5bXV4LnYxLkxheW91dENoaWxkIj4KC0xheW91dENoaWxkEiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBINCgVyYXRpbxgCIAEoAiKFAQoEUGFuZRIKCgJpZBgBIAEoCRIMCgRyb3dzGAIgASgNEgwKBGNvbHMYAyABKA0SJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcxILCgNjd2QYBSABKAkSIgoFc3RhdGUYBiABKA4yEy50eW11eC52MS5QYW5lU3RhdGUiyAIKFENyZWF0ZVNlc3Npb25SZXF1ZXN0EgwKBG5hbWUYASABKAkSDwoHY29tbWFuZBgCIAEoCRILCgNjd2QYAyABKAkSDAoEYXJncxgEIAMoCRI0CgNlbnYYBSADKAsyJy50eW11eC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdC5FbnZFbnRyeRITCgtzdGRlcnJfcGF0aBgGIAEoCRIkCglhcmdfc3BlY3MYByADKAsyES50eW11eC52MS5BcmdTcGVjEhIKCnN0ZGluX3BhdGgYCCABKAkSFAoMc3RkaW5fc3RyZWFtGAkgASgIEi8KDnJlc3RhcnRfcG9saWN5GAogASgLMhcudHltdXgudjEuUmVzdGFydFBvbGljeRoqCghFbnZFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIkQKB0FyZ1NwZWMSEQoHbGl0ZXJhbBgBIAEoCUgAEhwKEmZpbGVfY29udGVudHNfcGF0aBgCIAEoCUgAQggKBnNvdXJjZSIVChNMaXN0U2Vzc2lvbnNSZXF1ZXN0IjsKFExpc3RTZXNzaW9uc1Jlc3BvbnNlEiMKCHNlc3Npb25zGAEgAygLMhEudHltdXgudjEuU2Vzc2lvbiIoChJLaWxsU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSIVChNLaWxsU2Vzc2lvblJlc3BvbnNlIioKFFJldml2ZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiZQoVUmV2aXZlU2Vzc2lvblJlc3BvbnNlEhQKDGFscmVhZHlfbGl2ZRgBIAEoCBISCgpwYW5lX2NvdW50GAIgASgNEiIKB3Nlc3Npb24YAyABKAsyES50eW11eC52MS5TZXNzaW9uImAKEFNwbGl0UGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIqCgtvcmllbnRhdGlvbhgCIAEoDjIVLnR5bXV4LnYxLk9yaWVudGF0aW9uEg8KB2NvbW1hbmQYAyABKAkiIwoQQ2xvc2VQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJIqUBChFDbG9zZVBhbmVSZXNwb25zZRIYChB3aW5kb3dfY2xvc2VkX2lkGAEgASgJEhoKEndpbmRvd19jbG9zZWRfbmFtZRgCIAEoCRIZChFzZXNzaW9uX2Nsb3NlZF9pZBgDIAEoCRIbChNzZXNzaW9uX2Nsb3NlZF9uYW1lGAQgASgJEiIKB3Nlc3Npb24YBSABKAsyES50eW11eC52MS5TZXNzaW9uIjoKE0NyZWF0ZVdpbmRvd1JlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIPCgdjb21tYW5kGAIgASgJIicKEldhdGNoV2luZG93UmVxdWVzdBIRCgl3aW5kb3dfaWQYASABKAkiVAoRV2luZG93TGF5b3V0RXZlbnQSIAoGbGF5b3V0GAEgASgLMhAudHltdXgudjEuTGF5b3V0Eh0KFWF0dGFjaGVkX2NsaWVudF9jb3VudBgCIAEoDSJAChJDYXB0dXJlUGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIZChFzY3JvbGxiYWNrX29mZnNldBgCIAEoDSJRChdTZWFyY2hTY3JvbGxiYWNrUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEg8KB3BhdHRlcm4YAiABKAkSFAoMc3RhcnRfb2Zmc2V0GAMgASgNIkcKGFNlYXJjaFNjcm9sbGJhY2tSZXNwb25zZRINCgVmb3VuZBgBIAEoCBIOCgZvZmZzZXQYAiABKA0SDAoEbGluZRgDIAEoCSKSBAoMUGFuZVNuYXBzaG90Eg8KB3BhbmVfaWQYASABKAkSDAoEcm93cxgCIAEoDRIMCgRjb2xzGAMgASgNEhsKBGdyaWQYBCADKAsyDS50eW11eC52MS5Sb3cSEgoKY3Vyc29yX3JvdxgFIAEoDRISCgpjdXJzb3JfY29sGAYgASgNEiQKCGxpdmVuZXNzGAcgASgOMhIudHltdXgudjEuTGl2ZW5lc3MSJwoKaHlwZXJsaW5rcxgIIAMoCzITLnR5bXV4LnYxLkh5cGVybGluaxINCgV0aXRsZRgJIAEoCRImCgVtb2RlcxgKIAEoCzIXLnR5bXV4LnYxLlRlcm1pbmFsTW9kZXMSFQoNY3Vyc29yX2hpZGRlbhgLIAEoCBIUCgxjdXJzb3Jfc3R5bGUYDCABKA0SEgoKYWx0X3NjcmVlbhgNIAEoCBISCgpzY3JvbGxfdG9wGA4gASgNEhUKDXNjcm9sbF9ib3R0b20YDyABKA0SEQoJdGFiX3N0b3BzGBAgAygNEiQKCGNoYXJzZXRzGBEgASgLMhIudHltdXgudjEuQ2hhcnNldHMSGwoTY3Vyc29yX3BlbmRpbmdfd3JhcBgSIAEoCBIiCgVzdGF0ZRgUIAEoDjITLnR5bXV4LnYxLlBhbmVTdGF0ZRIWCglleGl0X2NvZGUYEyABKAVIAIgBAUIMCgpfZXhpdF9jb2RlIvQBCg1UZXJtaW5hbE1vZGVzEhcKD2FwcF9jdXJzb3Jfa2V5cxgBIAEoCBISCgphcHBfa2V5cGFkGAIgASgIEhcKD2JyYWNrZXRlZF9wYXN0ZRgDIAEoCBIUCgxmb2N1c19ldmVudHMYBCABKAgSEgoKbW91c2VfbW9kZRgFIAEoDRIWCg5tb3VzZV9lbmNvZGluZxgGIAEoDRIVCg1yZXZlcnNlX3ZpZGVvGAcgASgIEg4KBm9yaWdpbhgIIAEoCBITCgtub19hdXRvd3JhcBgJIAEoCBIOCgZpbnNlcnQYCiABKAgSDwoHbmV3bGluZRgLIAEoCCJGCghDaGFyc2V0cxIKCgJnMBgBIAEoDRIKCgJnMRgCIAEoDRIKCgJnMhgDIAEoDRIKCgJnMxgEIAEoDRIKCgJnbBgFIAEoDSIkCglIeXBlcmxpbmsSCwoDdXJpGAEgASgJEgoKAmlkGAIgASgJIiQKA1JvdxIdCgVjZWxscxgBIAMoCzIOLnR5bXV4LnYxLkNlbGwigAEKBENlbGwSDAoEdGV4dBgBIAEoCRIKCgJmZxgCIAEoDRIKCgJiZxgDIAEoDRINCgVhdHRycxgEIAEoDRIXCg91bmRlcmxpbmVfc3R5bGUYBSABKA0SFwoPdW5kZXJsaW5lX2NvbG9yGAYgASgNEhEKCWh5cGVybGluaxgHIAEoDSKxAQoNQXR0YWNoUmVxdWVzdBIRCgdwYW5lX2lkGAEgASgJSAASDwoFaW5wdXQYAiABKAxIABIiCgZyZXNpemUYAyABKAsyEC50eW11eC52MS5SZXNpemVIABIcCg9yZXN1bWVfZnJvbV9zZXEYBCABKARIAYgBARIbChNzdWJzY3JpYmVfbGlmZWN5Y2xlGAUgASgIQgkKB3BheWxvYWRCEgoQX3Jlc3VtZV9mcm9tX3NlcSJSChFXcml0ZVN0ZGluUmVxdWVzdBIRCgdwYW5lX2lkGAEgASgJSAASDgoEZGF0YRgCIAEoDEgAEg8KBWNsb3NlGAMgASgISABCCQoHcGF5bG9hZCIrChJXcml0ZVN0ZGluUmVzcG9uc2USFQoNYnl0ZXNfd3JpdHRlbhgBIAEoBCIkCgZSZXNpemUSDAoEcm93cxgBIAEoDRIMCgRjb2xzGAIgASgNIigKCkV4aXRTdGF0dXMSEQoEY29kZRgBIAEoBUgAiAEBQgcKBV9jb2RlIigKC091dHB1dENodW5rEgsKA3NlcRgBIAEoBBIMCgRkYXRhGAIgASgMIisKC0dhcEV4Y2VlZGVkEhwKFG9sZGVzdF9hdmFpbGFibGVfc2VxGAEgASgEIgsKCUhlYXJ0YmVhdCLLAgoLQXR0YWNoRXZlbnQSEAoGb3V0cHV0GAEgASgMSAASKgoIc25hcHNob3QYAiABKAsyFi50eW11eC52MS5QYW5lU25hcHNob3RIABImCgZleGl0ZWQYAyABKAsyFC50eW11eC52MS5FeGl0U3RhdHVzSAASFAoKb3V0cHV0X2dhcBgEIAEoCEgAEi0KDGdhcF9leGNlZWRlZBgFIAEoCzIVLnR5bXV4LnYxLkdhcEV4Y2VlZGVkSAASKAoJaGVhcnRiZWF0GAYgASgLMhMudHltdXgudjEuSGVhcnRiZWF0SAASLQoMb3V0cHV0X2NodW5rGAcgASgLMhUudHltdXgudjEuT3V0cHV0Q2h1bmtIABItCglsaWZlY3ljbGUYCCABKAsyGC50eW11eC52MS5MaWZlY3ljbGVFdmVudEgAQgkKB3BheWxvYWQiNwoUR2V0U2VydmVySW5mb1JlcXVlc3QSHwoXY2xpZW50X3Byb3RvY29sX3ZlcnNpb24YASABKA0imAEKClNlcnZlckluZm8SDwoHdmVyc2lvbhgBIAEoCRIYChBwcm90b2NvbF92ZXJzaW9uGAIgASgNEiMKG21pbl9jbGllbnRfcHJvdG9jb2xfdmVyc2lvbhgDIAEoDRIUCgxjYXBhYmlsaXRpZXMYBCADKAkSCwoDcGlkGAUgASgNEhcKD3N0YXJ0ZWRfYXRfdW5peBgGIAEoAyLiAgoNUmVzdGFydFBvbGljeRIjCgRtb2RlGAEgASgOMhUudHltdXgudjEuUmVzdGFydE1vZGUSGQoMbWF4X3Jlc3RhcnRzGAIgASgNSACIAQESFgoJd2luZG93X21zGAMgASgESAGIAQESHQoQaW5pdGlhbF9kZWxheV9tcxgEIAEoBEgCiAEBEhcKCm11bHRpcGxpZXIYBSABKAFIA4gBARIZCgxtYXhfZGVsYXlfbXMYBiABKARIBIgBARITCgZqaXR0ZXIYByABKAFIBYgBARIdChBoZWFsdGh5X2FmdGVyX21zGAggASgESAaIAQFCDwoNX21heF9yZXN0YXJ0c0IMCgpfd2luZG93X21zQhMKEV9pbml0aWFsX2RlbGF5X21zQg0KC19tdWx0aXBsaWVyQg8KDV9tYXhfZGVsYXlfbXNCCQoHX2ppdHRlckITChFfaGVhbHRoeV9hZnRlcl9tcyKXBAoKUGFuZVN0YXR1cxIPCgdwYW5lX2lkGAEgASgJEiIKBXN0YXRlGAIgASgOMhMudHltdXgudjEuUGFuZVN0YXRlEicKBnBvbGljeRgDIAEoCzIXLnR5bXV4LnYxLlJlc3RhcnRQb2xpY3kSFQoNcmVzdGFydF9jb3VudBgEIAEoDRIaChJyZXN0YXJ0c19pbl93aW5kb3cYBSABKA0SHAoUY29uc2VjdXRpdmVfZmFpbHVyZXMYBiABKA0SGwoObGFzdF9leGl0X2NvZGUYByABKAVIAIgBARIdChBsYXN0X2V4aXRfc2lnbmFsGAggASgFSAGIAQESIQoUbGFzdF9leGl0X2F0X3VuaXhfbXMYCSABKANIAogBARIkChduZXh0X3Jlc3RhcnRfYXRfdW5peF9tcxgKIAEoA0gDiAEBEh8KEnN0YXJ0ZWRfYXRfdW5peF9tcxgLIAEoA0gEiAEBEhEKCXVwdGltZV9tcxgMIAEoBBIQCgNwaWQYDSABKA1IBYgBARITCgtub3dfdW5peF9tcxgOIAEoA0IRCg9fbGFzdF9leGl0X2NvZGVCEwoRX2xhc3RfZXhpdF9zaWduYWxCFwoVX2xhc3RfZXhpdF9hdF91bml4X21zQhoKGF9uZXh0X3Jlc3RhcnRfYXRfdW5peF9tc0IVChNfc3RhcnRlZF9hdF91bml4X21zQgYKBF9waWQilgEKF1NldFJlc3RhcnRQb2xpY3lSZXF1ZXN0EhEKB3BhbmVfaWQYASABKAlIABIUCgpzZXNzaW9uX2lkGAIgASgJSAASJwoGcG9saWN5GAMgASgLMhcudHltdXgudjEuUmVzdGFydFBvbGljeRIfChdhcHBseV90b19leGlzdGluZ19wYW5lcxgEIAEoCEIICgZ0YXJnZXQiQAoYU2V0UmVzdGFydFBvbGljeVJlc3BvbnNlEiQKBnN0YXR1cxgBIAEoCzIULnR5bXV4LnYxLlBhbmVTdGF0dXMiJwoUR2V0UGFuZVN0YXR1c1JlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCSJgChJSZXN0YXJ0UGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIVCg1yZXNldF9iYWNrb2ZmGAIgASgIEhUKCGdyYWNlX21zGAMgASgESACIAQFCCwoJX2dyYWNlX21zIkYKD1N0b3BQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEhUKCGdyYWNlX21zGAIgASgESACIAQFCCwoJX2dyYWNlX21zIiMKEFN0YXJ0UGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCSIsChlSZXNldFJlc3RhcnRCdWRnZXRSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAki2wIKDkxpZmVjeWNsZUV2ZW50EioKBGtpbmQYASABKA4yHC50eW11eC52MS5MaWZlY3ljbGVFdmVudEtpbmQSIgoFc3RhdGUYAiABKA4yEy50eW11eC52MS5QYW5lU3RhdGUSFgoJZXhpdF9jb2RlGAMgASgFSACIAQESGAoLZXhpdF9zaWduYWwYBCABKAVIAYgBARIVCghkZWxheV9tcxgFIAEoBEgCiAEBEiQKF25leHRfcmVzdGFydF9hdF91bml4X21zGAYgASgDSAOIAQESEAoDcGlkGAcgASgNSASIAQESFQoNcmVzdGFydF9jb3VudBgIIAEoDRISCgphdF91bml4X21zGAkgASgDQgwKCl9leGl0X2NvZGVCDgoMX2V4aXRfc2lnbmFsQgsKCV9kZWxheV9tc0IaChhfbmV4dF9yZXN0YXJ0X2F0X3VuaXhfbXNCBgoEX3BpZCpKCghMaXZlbmVzcxIYChRMSVZFTkVTU19VTlNQRUNJRklFRBAAEhEKDUxJVkVORVNTX0xJVkUQARIRCg1MSVZFTkVTU19ERUFEEAIqYAoLT3JpZW50YXRpb24SGwoXT1JJRU5UQVRJT05fVU5TUEVDSUZJRUQQABIaChZPUklFTlRBVElPTl9IT1JJWk9OVEFMEAESGAoUT1JJRU5UQVRJT05fVkVSVElDQUwQAiq1AQoJUGFuZVN0YXRlEhoKFlBBTkVfU1RBVEVfVU5TUEVDSUZJRUQQABITCg9QQU5FX1NUQVRFX0xJVkUQARIVChFQQU5FX1NUQVRFX0VYSVRFRBACEhYKElBBTkVfU1RBVEVfQkFDS09GRhADEhkKFVBBTkVfU1RBVEVfUkVTVEFSVElORxAEEhUKEVBBTkVfU1RBVEVfRkFJTEVEEAUSFgoSUEFORV9TVEFURV9TVE9QUEVEEAYqmgEKC1Jlc3RhcnRNb2RlEhwKGFJFU1RBUlRfTU9ERV9VTlNQRUNJRklFRBAAEhYKElJFU1RBUlRfTU9ERV9ORVZFUhABEhsKF1JFU1RBUlRfTU9ERV9PTl9GQUlMVVJFEAISFwoTUkVTVEFSVF9NT0RFX0FMV0FZUxADEh8KG1JFU1RBUlRfTU9ERV9VTkxFU1NfU1RPUFBFRBAEKu4BChJMaWZlY3ljbGVFdmVudEtpbmQSJAogTElGRUNZQ0xFX0VWRU5UX0tJTkRfVU5TUEVDSUZJRUQQABIfChtMSUZFQ1lDTEVfRVZFTlRfS0lORF9FWElURUQQARIqCiZMSUZFQ1lDTEVfRVZFTlRfS0lORF9SRVNUQVJUX1NDSEVEVUxFRBACEiIKHkxJRkVDWUNMRV9FVkVOVF9LSU5EX1JFU1RBUlRFRBADEh8KG0xJRkVDWUNMRV9FVkVOVF9LSU5EX0ZBSUxFRBAEEiAKHExJRkVDWUNMRV9FVkVOVF9LSU5EX1NUT1BQRUQQBTLxCgoMVHltdXhTZXJ2aWNlEkUKDUdldFNlcnZlckluZm8SHi50eW11eC52MS5HZXRTZXJ2ZXJJbmZvUmVxdWVzdBoULnR5bXV4LnYxLlNlcnZlckluZm8SQgoNQ3JlYXRlU2Vzc2lvbhIeLnR5bXV4LnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0GhEudHltdXgudjEuU2Vzc2lvbhJNCgxMaXN0U2Vzc2lvbnMSHS50eW11eC52MS5MaXN0U2Vzc2lvbnNSZXF1ZXN0Gh4udHltdXgudjEuTGlzdFNlc3Npb25zUmVzcG9uc2USSgoLS2lsbFNlc3Npb24SHC50eW11eC52MS5LaWxsU2Vzc2lvblJlcXVlc3QaHS50eW11eC52MS5LaWxsU2Vzc2lvblJlc3BvbnNlElAKDVJldml2ZVNlc3Npb24SHi50eW11eC52MS5SZXZpdmVTZXNzaW9uUmVxdWVzdBofLnR5bXV4LnYxLlJldml2ZVNlc3Npb25SZXNwb25zZRJDCgtDYXB0dXJlUGFuZRIcLnR5bXV4LnYxLkNhcHR1cmVQYW5lUmVxdWVzdBoWLnR5bXV4LnYxLlBhbmVTbmFwc2hvdBJZChBTZWFyY2hTY3JvbGxiYWNrEiEudHltdXgudjEuU2VhcmNoU2Nyb2xsYmFja1JlcXVlc3QaIi50eW11eC52MS5TZWFyY2hTY3JvbGxiYWNrUmVzcG9uc2USOgoJU3BsaXRQYW5lEhoudHltdXgudjEuU3BsaXRQYW5lUmVxdWVzdBoRLnR5bXV4LnYxLlNlc3Npb24SRAoJQ2xvc2VQYW5lEhoudHltdXgudjEuQ2xvc2VQYW5lUmVxdWVzdBobLnR5bXV4LnYxLkNsb3NlUGFuZVJlc3BvbnNlEkAKDENyZWF0ZVdpbmRvdxIdLnR5bXV4LnYxLkNyZWF0ZVdpbmRvd1JlcXVlc3QaES50eW11eC52MS5TZXNzaW9uEkoKC1dhdGNoV2luZG93EhwudHltdXgudjEuV2F0Y2hXaW5kb3dSZXF1ZXN0GhsudHltdXgudjEuV2luZG93TGF5b3V0RXZlbnQwARI8CgZBdHRhY2gSFy50eW11eC52MS5BdHRhY2hSZXF1ZXN0GhUudHltdXgudjEuQXR0YWNoRXZlbnQoATABEkkKCldyaXRlU3RkaW4SGy50eW11eC52MS5Xcml0ZVN0ZGluUmVxdWVzdBocLnR5bXV4LnYxLldyaXRlU3RkaW5SZXNwb25zZSgBElkKEFNldFJlc3RhcnRQb2xpY3kSIS50eW11eC52MS5TZXRSZXN0YXJ0UG9saWN5UmVxdWVzdBoiLnR5bXV4LnYxLlNldFJlc3RhcnRQb2xpY3lSZXNwb25zZRJFCg1HZXRQYW5lU3RhdHVzEh4udHltdXgudjEuR2V0UGFuZVN0YXR1c1JlcXVlc3QaFC50eW11eC52MS5QYW5lU3RhdHVzEkEKC1Jlc3RhcnRQYW5lEhwudHltdXgudjEuUmVzdGFydFBhbmVSZXF1ZXN0GhQudHltdXgudjEuUGFuZVN0YXR1cxI7CghTdG9wUGFuZRIZLnR5bXV4LnYxLlN0b3BQYW5lUmVxdWVzdBoULnR5bXV4LnYxLlBhbmVTdGF0dXMSPQoJU3RhcnRQYW5lEhoudHltdXgudjEuU3RhcnRQYW5lUmVxdWVzdBoULnR5bXV4LnYxLlBhbmVTdGF0dXMSTwoSUmVzZXRSZXN0YXJ0QnVkZ2V0EiMudHltdXgudjEuUmVzZXRSZXN0YXJ0QnVkZ2V0UmVxdWVzdBoULnR5bXV4LnYxLlBhbmVTdGF0dXNClgEKDGNvbS50eW11eC52MUIKVHltdXhQcm90b1ABWjlnaXRodWIuY29tL3RzdGFwbGVyL3R5bXV4L2NsaWVudHMvZ28vZ2VuL3R5bXV4L3YxO3R5bXV4djGiAgNUWFiqAghUeW11eC5WMcoCCFR5bXV4XFYx4gIUVHltdXhcVjFcR1BCTWV0YWRhdGHqAglUeW11eDo6VjFiBnByb3RvMw");
 
 /**
  * @generated from message tymux.v1.Session
@@ -185,6 +185,14 @@ export type Pane = Message<"tymux.v1.Pane"> & {
    * @generated from field: string cwd = 5;
    */
   cwd: string;
+
+  /**
+   * Lifecycle state (ADR-0007). `liveness` stays LIVE only while a process is running; DEAD
+   * covers every other state, which `state` tells apart.
+   *
+   * @generated from field: tymux.v1.PaneState state = 6;
+   */
+  state: PaneState;
 };
 
 /**
@@ -290,6 +298,15 @@ export type CreateSessionRequest = Message<"tymux.v1.CreateSessionRequest"> & {
    * @generated from field: bool stdin_stream = 9;
    */
   stdinStream: boolean;
+
+  /**
+   * Restart policy for the first pane, and the default for panes later added to the session.
+   * Absent means NEVER (the pane is never restarted automatically). Persisted. Advertised as
+   * capability "pane.lifecycle"; ADR-0007.
+   *
+   * @generated from field: tymux.v1.RestartPolicy restart_policy = 10;
+   */
+  restartPolicy?: RestartPolicy | undefined;
 };
 
 /**
@@ -821,6 +838,14 @@ export type PaneSnapshot = Message<"tymux.v1.PaneSnapshot"> & {
   cursorPendingWrap: boolean;
 
   /**
+   * Lifecycle state of the pane (ADR-0007). While the pane is in BACKOFF this snapshot is its
+   * last screen with liveness DEAD and state BACKOFF.
+   *
+   * @generated from field: tymux.v1.PaneState state = 20;
+   */
+  state: PaneState;
+
+  /**
    * Set only when liveness is DEAD: the exited child's exit code, if it was captured. A child
    * killed by a signal reports 1, not 128+signal (portable-pty 0.8.1 collapses signal deaths).
    *
@@ -1109,6 +1134,15 @@ export type AttachRequest = Message<"tymux.v1.AttachRequest"> & {
    * @generated from field: optional uint64 resume_from_seq = 4;
    */
   resumeFromSeq?: bigint | undefined;
+
+  /**
+   * First message only: also stream LifecycleEvents (ADR-0007). Absent/false behaves as before
+   * for a pane with no restart policy; a client that does not set it never receives a
+   * `lifecycle` event, but still stays attached across restarts.
+   *
+   * @generated from field: bool subscribe_lifecycle = 5;
+   */
+  subscribeLifecycle: boolean;
 };
 
 /**
@@ -1367,6 +1401,17 @@ export type AttachEvent = Message<"tymux.v1.AttachEvent"> & {
      */
     value: OutputChunk;
     case: "outputChunk";
+  } | {
+    /**
+     * ADR-0007: the pane's lifecycle changed (exited, restart scheduled, restarted, failed,
+     * stopped). Sent only to clients that set AttachRequest.subscribe_lifecycle. While a restart
+     * is pending the stream stays open and no `exited` event is sent; `exited` follows the final
+     * lifecycle event once the pane will not restart.
+     *
+     * @generated from field: tymux.v1.LifecycleEvent lifecycle = 8;
+     */
+    value: LifecycleEvent;
+    case: "lifecycle";
   } | { case: undefined; value?: undefined };
 };
 
@@ -1455,6 +1500,413 @@ export const ServerInfoSchema: GenMessage<ServerInfo> = /*@__PURE__*/
   messageDesc(file_tymux_v1_tymux, 39);
 
 /**
+ * When and how often the daemon restarts a pane's process. Unset optional fields take the
+ * default shown; GetPaneStatus returns the policy with every field resolved.
+ *
+ * @generated from message tymux.v1.RestartPolicy
+ */
+export type RestartPolicy = Message<"tymux.v1.RestartPolicy"> & {
+  /**
+   * @generated from field: tymux.v1.RestartMode mode = 1;
+   */
+  mode: RestartMode;
+
+  /**
+   * Automatic restarts allowed within window_ms; the next failure after that makes the pane
+   * FAILED. 0 means the first failure is already terminal. Default 5.
+   *
+   * @generated from field: optional uint32 max_restarts = 2;
+   */
+  maxRestarts?: number | undefined;
+
+  /**
+   * Sliding window the budget is counted over. 0 = no window: the budget is lifetime, until
+   * ResetRestartBudget or StartPane. Default 60000.
+   *
+   * @generated from field: optional uint64 window_ms = 3;
+   */
+  windowMs?: bigint | undefined;
+
+  /**
+   * Delay before the first restart. Default 1000.
+   *
+   * @generated from field: optional uint64 initial_delay_ms = 4;
+   */
+  initialDelayMs?: bigint | undefined;
+
+  /**
+   * Each consecutive failure multiplies the delay by this (>= 1). Default 2.0.
+   *
+   * @generated from field: optional double multiplier = 5;
+   */
+  multiplier?: number | undefined;
+
+  /**
+   * Cap on the delay (>= initial_delay_ms). Default 30000.
+   *
+   * @generated from field: optional uint64 max_delay_ms = 6;
+   */
+  maxDelayMs?: bigint | undefined;
+
+  /**
+   * Fraction of the delay randomized either way, in [0, 1]; the result never exceeds
+   * max_delay_ms. Default 0.2.
+   *
+   * @generated from field: optional double jitter = 7;
+   */
+  jitter?: number | undefined;
+
+  /**
+   * A run at least this long counts as healthy and resets the delay to initial_delay_ms.
+   * Default 10000.
+   *
+   * @generated from field: optional uint64 healthy_after_ms = 8;
+   */
+  healthyAfterMs?: bigint | undefined;
+};
+
+/**
+ * Describes the message tymux.v1.RestartPolicy.
+ * Use `create(RestartPolicySchema)` to create a new message.
+ */
+export const RestartPolicySchema: GenMessage<RestartPolicy> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 40);
+
+/**
+ * @generated from message tymux.v1.PaneStatus
+ */
+export type PaneStatus = Message<"tymux.v1.PaneStatus"> & {
+  /**
+   * @generated from field: string pane_id = 1;
+   */
+  paneId: string;
+
+  /**
+   * @generated from field: tymux.v1.PaneState state = 2;
+   */
+  state: PaneState;
+
+  /**
+   * The effective policy, every field resolved.
+   *
+   * @generated from field: tymux.v1.RestartPolicy policy = 3;
+   */
+  policy?: RestartPolicy | undefined;
+
+  /**
+   * Restarts since the pane was created, automatic and manual (lifetime, not windowed).
+   *
+   * @generated from field: uint32 restart_count = 4;
+   */
+  restartCount: number;
+
+  /**
+   * Automatic restarts still counted against the budget (inside the window).
+   *
+   * @generated from field: uint32 restarts_in_window = 5;
+   */
+  restartsInWindow: number;
+
+  /**
+   * Failed runs in a row since the last healthy one; sets the next backoff delay.
+   *
+   * @generated from field: uint32 consecutive_failures = 6;
+   */
+  consecutiveFailures: number;
+
+  /**
+   * Absent until the process has exited once.
+   *
+   * @generated from field: optional int32 last_exit_code = 7;
+   */
+  lastExitCode?: number | undefined;
+
+  /**
+   * Set only when the daemon itself delivered the terminating signal (StopPane, RestartPane):
+   * portable-pty reports any signal death as code 1, so a signal the process took on its own
+   * is not distinguishable.
+   *
+   * @generated from field: optional int32 last_exit_signal = 8;
+   */
+  lastExitSignal?: number | undefined;
+
+  /**
+   * @generated from field: optional int64 last_exit_at_unix_ms = 9;
+   */
+  lastExitAtUnixMs?: bigint | undefined;
+
+  /**
+   * Set in BACKOFF and while a restart is due.
+   *
+   * @generated from field: optional int64 next_restart_at_unix_ms = 10;
+   */
+  nextRestartAtUnixMs?: bigint | undefined;
+
+  /**
+   * Set while a process is running.
+   *
+   * @generated from field: optional int64 started_at_unix_ms = 11;
+   */
+  startedAtUnixMs?: bigint | undefined;
+
+  /**
+   * Milliseconds the running process has been up; 0 when not running.
+   *
+   * @generated from field: uint64 uptime_ms = 12;
+   */
+  uptimeMs: bigint;
+
+  /**
+   * Set while a process is running.
+   *
+   * @generated from field: optional uint32 pid = 13;
+   */
+  pid?: number | undefined;
+
+  /**
+   * The daemon's clock when this was read, so a client can show a countdown to
+   * next_restart_at without trusting its own clock.
+   *
+   * @generated from field: int64 now_unix_ms = 14;
+   */
+  nowUnixMs: bigint;
+};
+
+/**
+ * Describes the message tymux.v1.PaneStatus.
+ * Use `create(PaneStatusSchema)` to create a new message.
+ */
+export const PaneStatusSchema: GenMessage<PaneStatus> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 41);
+
+/**
+ * @generated from message tymux.v1.SetRestartPolicyRequest
+ */
+export type SetRestartPolicyRequest = Message<"tymux.v1.SetRestartPolicyRequest"> & {
+  /**
+   * @generated from oneof tymux.v1.SetRestartPolicyRequest.target
+   */
+  target: {
+    /**
+     * @generated from field: string pane_id = 1;
+     */
+    value: string;
+    case: "paneId";
+  } | {
+    /**
+     * Sets the default for panes created later in this session.
+     *
+     * @generated from field: string session_id = 2;
+     */
+    value: string;
+    case: "sessionId";
+  } | { case: undefined; value?: undefined };
+
+  /**
+   * @generated from field: tymux.v1.RestartPolicy policy = 3;
+   */
+  policy?: RestartPolicy | undefined;
+
+  /**
+   * With session_id: also apply the policy to the session's existing panes.
+   *
+   * @generated from field: bool apply_to_existing_panes = 4;
+   */
+  applyToExistingPanes: boolean;
+};
+
+/**
+ * Describes the message tymux.v1.SetRestartPolicyRequest.
+ * Use `create(SetRestartPolicyRequestSchema)` to create a new message.
+ */
+export const SetRestartPolicyRequestSchema: GenMessage<SetRestartPolicyRequest> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 42);
+
+/**
+ * @generated from message tymux.v1.SetRestartPolicyResponse
+ */
+export type SetRestartPolicyResponse = Message<"tymux.v1.SetRestartPolicyResponse"> & {
+  /**
+   * The pane's status; unset when the target was a session.
+   *
+   * @generated from field: tymux.v1.PaneStatus status = 1;
+   */
+  status?: PaneStatus | undefined;
+};
+
+/**
+ * Describes the message tymux.v1.SetRestartPolicyResponse.
+ * Use `create(SetRestartPolicyResponseSchema)` to create a new message.
+ */
+export const SetRestartPolicyResponseSchema: GenMessage<SetRestartPolicyResponse> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 43);
+
+/**
+ * @generated from message tymux.v1.GetPaneStatusRequest
+ */
+export type GetPaneStatusRequest = Message<"tymux.v1.GetPaneStatusRequest"> & {
+  /**
+   * @generated from field: string pane_id = 1;
+   */
+  paneId: string;
+};
+
+/**
+ * Describes the message tymux.v1.GetPaneStatusRequest.
+ * Use `create(GetPaneStatusRequestSchema)` to create a new message.
+ */
+export const GetPaneStatusRequestSchema: GenMessage<GetPaneStatusRequest> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 44);
+
+/**
+ * @generated from message tymux.v1.RestartPaneRequest
+ */
+export type RestartPaneRequest = Message<"tymux.v1.RestartPaneRequest"> & {
+  /**
+   * @generated from field: string pane_id = 1;
+   */
+  paneId: string;
+
+  /**
+   * Also clear the backoff delay and the window budget.
+   *
+   * @generated from field: bool reset_backoff = 2;
+   */
+  resetBackoff: boolean;
+
+  /**
+   * How long a running process gets after SIGTERM before SIGKILL. Default 5000.
+   *
+   * @generated from field: optional uint64 grace_ms = 3;
+   */
+  graceMs?: bigint | undefined;
+};
+
+/**
+ * Describes the message tymux.v1.RestartPaneRequest.
+ * Use `create(RestartPaneRequestSchema)` to create a new message.
+ */
+export const RestartPaneRequestSchema: GenMessage<RestartPaneRequest> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 45);
+
+/**
+ * @generated from message tymux.v1.StopPaneRequest
+ */
+export type StopPaneRequest = Message<"tymux.v1.StopPaneRequest"> & {
+  /**
+   * @generated from field: string pane_id = 1;
+   */
+  paneId: string;
+
+  /**
+   * How long the process gets after SIGTERM before SIGKILL. Default 5000.
+   *
+   * @generated from field: optional uint64 grace_ms = 2;
+   */
+  graceMs?: bigint | undefined;
+};
+
+/**
+ * Describes the message tymux.v1.StopPaneRequest.
+ * Use `create(StopPaneRequestSchema)` to create a new message.
+ */
+export const StopPaneRequestSchema: GenMessage<StopPaneRequest> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 46);
+
+/**
+ * @generated from message tymux.v1.StartPaneRequest
+ */
+export type StartPaneRequest = Message<"tymux.v1.StartPaneRequest"> & {
+  /**
+   * @generated from field: string pane_id = 1;
+   */
+  paneId: string;
+};
+
+/**
+ * Describes the message tymux.v1.StartPaneRequest.
+ * Use `create(StartPaneRequestSchema)` to create a new message.
+ */
+export const StartPaneRequestSchema: GenMessage<StartPaneRequest> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 47);
+
+/**
+ * @generated from message tymux.v1.ResetRestartBudgetRequest
+ */
+export type ResetRestartBudgetRequest = Message<"tymux.v1.ResetRestartBudgetRequest"> & {
+  /**
+   * @generated from field: string pane_id = 1;
+   */
+  paneId: string;
+};
+
+/**
+ * Describes the message tymux.v1.ResetRestartBudgetRequest.
+ * Use `create(ResetRestartBudgetRequestSchema)` to create a new message.
+ */
+export const ResetRestartBudgetRequestSchema: GenMessage<ResetRestartBudgetRequest> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 48);
+
+/**
+ * @generated from message tymux.v1.LifecycleEvent
+ */
+export type LifecycleEvent = Message<"tymux.v1.LifecycleEvent"> & {
+  /**
+   * @generated from field: tymux.v1.LifecycleEventKind kind = 1;
+   */
+  kind: LifecycleEventKind;
+
+  /**
+   * The pane's state after this event.
+   *
+   * @generated from field: tymux.v1.PaneState state = 2;
+   */
+  state: PaneState;
+
+  /**
+   * @generated from field: optional int32 exit_code = 3;
+   */
+  exitCode?: number | undefined;
+
+  /**
+   * @generated from field: optional int32 exit_signal = 4;
+   */
+  exitSignal?: number | undefined;
+
+  /**
+   * @generated from field: optional uint64 delay_ms = 5;
+   */
+  delayMs?: bigint | undefined;
+
+  /**
+   * @generated from field: optional int64 next_restart_at_unix_ms = 6;
+   */
+  nextRestartAtUnixMs?: bigint | undefined;
+
+  /**
+   * @generated from field: optional uint32 pid = 7;
+   */
+  pid?: number | undefined;
+
+  /**
+   * @generated from field: uint32 restart_count = 8;
+   */
+  restartCount: number;
+
+  /**
+   * @generated from field: int64 at_unix_ms = 9;
+   */
+  atUnixMs: bigint;
+};
+
+/**
+ * Describes the message tymux.v1.LifecycleEvent.
+ * Use `create(LifecycleEventSchema)` to create a new message.
+ */
+export const LifecycleEventSchema: GenMessage<LifecycleEvent> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 49);
+
+/**
  * Whether a pane's/session's backing process is still running. proto3
  * reserves 0 for UNSPECIFIED rather than overloading it as a real state, so
  * an absent/default field is never silently misread as LIVE or DEAD.
@@ -1515,6 +1967,164 @@ export const OrientationSchema: GenEnum<Orientation> = /*@__PURE__*/
   enumDesc(file_tymux_v1_tymux, 1);
 
 /**
+ * Where a pane is in its life.
+ *
+ * @generated from enum tymux.v1.PaneState
+ */
+export enum PaneState {
+  /**
+   * @generated from enum value: PANE_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * The process is running.
+   *
+   * @generated from enum value: PANE_STATE_LIVE = 1;
+   */
+  LIVE = 1,
+
+  /**
+   * The process exited and the policy says not to restart it. Also the state of a pane
+   * restored from disk after a daemon restart (it is never started automatically, ADR-002).
+   *
+   * @generated from enum value: PANE_STATE_EXITED = 2;
+   */
+  EXITED = 2,
+
+  /**
+   * Waiting out a backoff delay; PaneStatus.next_restart_at_unix_ms says until when.
+   *
+   * @generated from enum value: PANE_STATE_BACKOFF = 3;
+   */
+  BACKOFF = 3,
+
+  /**
+   * A restart was requested and the old process has not died yet, or the new one is starting.
+   *
+   * @generated from enum value: PANE_STATE_RESTARTING = 4;
+   */
+  RESTARTING = 4,
+
+  /**
+   * The restart budget is exhausted: no automatic restart until an operator acts
+   * (StartPane, RestartPane, or ResetRestartBudget).
+   *
+   * @generated from enum value: PANE_STATE_FAILED = 5;
+   */
+  FAILED = 5,
+
+  /**
+   * Stopped with StopPane; will not restart until StartPane.
+   *
+   * @generated from enum value: PANE_STATE_STOPPED = 6;
+   */
+  STOPPED = 6,
+}
+
+/**
+ * Describes the enum tymux.v1.PaneState.
+ */
+export const PaneStateSchema: GenEnum<PaneState> = /*@__PURE__*/
+  enumDesc(file_tymux_v1_tymux, 2);
+
+/**
+ * @generated from enum tymux.v1.RestartMode
+ */
+export enum RestartMode {
+  /**
+   * @generated from enum value: RESTART_MODE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * Never restart (the default for a pane with no policy).
+   *
+   * @generated from enum value: RESTART_MODE_NEVER = 1;
+   */
+  NEVER = 1,
+
+  /**
+   * Restart after a non-zero exit, or an exit whose code is unknown.
+   *
+   * @generated from enum value: RESTART_MODE_ON_FAILURE = 2;
+   */
+  ON_FAILURE = 2,
+
+  /**
+   * Restart after every exit, including code 0.
+   *
+   * @generated from enum value: RESTART_MODE_ALWAYS = 3;
+   */
+  ALWAYS = 3,
+
+  /**
+   * Same behavior as ALWAYS: StopPane parks a pane in STOPPED in every mode, so nothing else
+   * differs. Provided for callers that expect Docker's name.
+   *
+   * @generated from enum value: RESTART_MODE_UNLESS_STOPPED = 4;
+   */
+  UNLESS_STOPPED = 4,
+}
+
+/**
+ * Describes the enum tymux.v1.RestartMode.
+ */
+export const RestartModeSchema: GenEnum<RestartMode> = /*@__PURE__*/
+  enumDesc(file_tymux_v1_tymux, 3);
+
+/**
+ * @generated from enum tymux.v1.LifecycleEventKind
+ */
+export enum LifecycleEventKind {
+  /**
+   * @generated from enum value: LIFECYCLE_EVENT_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * The process exited. Always sent, whatever happens next.
+   *
+   * @generated from enum value: LIFECYCLE_EVENT_KIND_EXITED = 1;
+   */
+  EXITED = 1,
+
+  /**
+   * A restart was scheduled after delay_ms (at next_restart_at_unix_ms).
+   *
+   * @generated from enum value: LIFECYCLE_EVENT_KIND_RESTART_SCHEDULED = 2;
+   */
+  RESTART_SCHEDULED = 2,
+
+  /**
+   * The process was restarted; pid is the new one.
+   *
+   * @generated from enum value: LIFECYCLE_EVENT_KIND_RESTARTED = 3;
+   */
+  RESTARTED = 3,
+
+  /**
+   * The restart budget ran out; the pane is FAILED.
+   *
+   * @generated from enum value: LIFECYCLE_EVENT_KIND_FAILED = 4;
+   */
+  FAILED = 4,
+
+  /**
+   * An operator stop took effect; the pane is STOPPED.
+   *
+   * @generated from enum value: LIFECYCLE_EVENT_KIND_STOPPED = 5;
+   */
+  STOPPED = 5,
+}
+
+/**
+ * Describes the enum tymux.v1.LifecycleEventKind.
+ */
+export const LifecycleEventKindSchema: GenEnum<LifecycleEventKind> = /*@__PURE__*/
+  enumDesc(file_tymux_v1_tymux, 4);
+
+/**
  * TymuxService is the daemon's public API. It's the thing tmux never had:
  * a typed, cross-language RPC surface, so a web UI, an AI agent, or a CLI
  * can all drive the same multiplexer without scraping terminal escape codes.
@@ -1567,7 +2177,9 @@ export const TymuxService: GenService<{
    * command re-run in its persisted cwd. Never triggered automatically on
    * daemon start (ADR-002); only an explicit call reaches this. A no-op
    * (ReviveSessionResponse.already_live=true) if the session is already
-   * live — never a duplicate spawn.
+   * live — never a duplicate spawn. A pane whose child exited inside this daemon (not
+   * restored from disk) is also respawned in place, same pane id and screen (ADR-0007);
+   * before that, such a session was reported already_live and nothing was respawned.
    *
    * @generated from rpc tymux.v1.TymuxService.ReviveSession
    */
@@ -1728,6 +2340,77 @@ export const TymuxService: GenService<{
     methodKind: "client_streaming";
     input: typeof WriteStdinRequestSchema;
     output: typeof WriteStdinResponseSchema;
+  },
+  /**
+   * Sets the restart policy of one pane, or (session_id) the default for panes created later
+   * in that session. Takes effect at the pane's next exit; a pending backoff the new policy
+   * would not have scheduled is cancelled. INVALID_ARGUMENT for a nonsensical policy.
+   *
+   * @generated from rpc tymux.v1.TymuxService.SetRestartPolicy
+   */
+  setRestartPolicy: {
+    methodKind: "unary";
+    input: typeof SetRestartPolicyRequestSchema;
+    output: typeof SetRestartPolicyResponseSchema;
+  },
+  /**
+   * The pane's lifecycle state, policy, counters and timestamps.
+   *
+   * @generated from rpc tymux.v1.TymuxService.GetPaneStatus
+   */
+  getPaneStatus: {
+    methodKind: "unary";
+    input: typeof GetPaneStatusRequestSchema;
+    output: typeof PaneStatusSchema;
+  },
+  /**
+   * Replaces the pane's process now: a running one gets SIGTERM (SIGKILL after grace) and is
+   * respawned once it exits; a dead one (any state, including STOPPED and FAILED) is respawned
+   * immediately. Not charged to the restart budget and not delayed. With reset_backoff the
+   * backoff delay and window budget start over. Returns once the new process is running (or
+   * failed to start); a failed start counts against the budget like any failed run.
+   *
+   * @generated from rpc tymux.v1.TymuxService.RestartPane
+   */
+  restartPane: {
+    methodKind: "unary";
+    input: typeof RestartPaneRequestSchema;
+    output: typeof PaneStatusSchema;
+  },
+  /**
+   * SIGTERM, then SIGKILL after the grace period, and parks the pane in STOPPED: it will not
+   * restart until StartPane, whatever its policy. Returns once the process is gone (or the
+   * grace period plus a short margin has passed). Cancels a pending backoff.
+   *
+   * @generated from rpc tymux.v1.TymuxService.StopPane
+   */
+  stopPane: {
+    methodKind: "unary";
+    input: typeof StopPaneRequestSchema;
+    output: typeof PaneStatusSchema;
+  },
+  /**
+   * Starts a pane that is STOPPED, EXITED, FAILED or in BACKOFF, with a fresh restart budget.
+   * FAILED_PRECONDITION if its process is running. Also respawns a single pane restored from
+   * disk after a daemon restart.
+   *
+   * @generated from rpc tymux.v1.TymuxService.StartPane
+   */
+  startPane: {
+    methodKind: "unary";
+    input: typeof StartPaneRequestSchema;
+    output: typeof PaneStatusSchema;
+  },
+  /**
+   * Clears the backoff delay and the restart budget. A FAILED pane becomes EXITED; nothing is
+   * started (use StartPane).
+   *
+   * @generated from rpc tymux.v1.TymuxService.ResetRestartBudget
+   */
+  resetRestartBudget: {
+    methodKind: "unary";
+    input: typeof ResetRestartBudgetRequestSchema;
+    output: typeof PaneStatusSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_tymux_v1_tymux, 0);

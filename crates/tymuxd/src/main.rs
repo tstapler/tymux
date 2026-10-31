@@ -28,6 +28,13 @@ use tymux_proto::v1::{
     SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
     WriteStdinRequest, WriteStdinResponse,
 };
+use tymux_proto::v1::{
+    GetPaneStatusRequest, LifecycleEvent as ProtoLifecycleEvent,
+    LifecycleEventKind as ProtoLifecycleEventKind, PaneState, PaneStatus as ProtoPaneStatus,
+    ResetRestartBudgetRequest, RestartMode as ProtoRestartMode, RestartPaneRequest,
+    RestartPolicy as ProtoRestartPolicy, SetRestartPolicyRequest, SetRestartPolicyResponse,
+    StartPaneRequest, StopPaneRequest,
+};
 
 mod auth;
 
@@ -118,6 +125,39 @@ impl TymuxDaemon {
             grace_period_duration,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn pane_status_response(&self, pane_id: Uuid) -> Result<Response<ProtoPaneStatus>, Status> {
+        self.engine
+            .pane_status(pane_id)
+            .map(|status| Response::new(status_to_proto(&status)))
+            .ok_or_else(|| Status::not_found(format!("no such pane: {pane_id}")))
+    }
+
+    /// Waits for the pane's process to die (bounded by `grace` plus a margin), then runs the
+    /// supervisor so a restart that was waiting on the exit happens before the caller replies.
+    async fn wait_for_restart(&self, pane_id: Uuid, generation_before: u64, grace: Duration) {
+        let Some(pane) = self.engine.held_pane(pane_id) else {
+            return;
+        };
+        let _ = tokio::time::timeout(grace + REAP_MARGIN, async {
+            loop {
+                let changed = pane.state_changed();
+                if pane.generation() > generation_before {
+                    return;
+                }
+                if pane.is_exited() {
+                    let engine = self.engine.clone();
+                    let _ = tokio::task::spawn_blocking(move || engine.supervise_tick()).await;
+                    if pane.generation() > generation_before {
+                        return;
+                    }
+                }
+                changed.await;
+            }
+        })
+        .await;
     }
 }
 
@@ -264,6 +304,151 @@ fn purge_disconnect_tracker(tracker: &Mutex<HashMap<Uuid, Instant>>, pane_id: Uu
     tracker.lock().unwrap().remove(&pane_id);
 }
 
+fn state_to_proto(state: tymux_core::LifecycleState) -> PaneState {
+    use tymux_core::LifecycleState as S;
+    match state {
+        S::Live => PaneState::Live,
+        S::Exited => PaneState::Exited,
+        S::Backoff => PaneState::Backoff,
+        S::Restarting => PaneState::Restarting,
+        S::Failed => PaneState::Failed,
+        S::Stopped => PaneState::Stopped,
+    }
+}
+
+fn policy_to_proto(p: &tymux_core::RestartPolicy) -> ProtoRestartPolicy {
+    use tymux_core::RestartMode as M;
+    ProtoRestartPolicy {
+        mode: match p.mode {
+            M::Never => ProtoRestartMode::Never,
+            M::OnFailure => ProtoRestartMode::OnFailure,
+            M::Always => ProtoRestartMode::Always,
+            M::UnlessStopped => ProtoRestartMode::UnlessStopped,
+        } as i32,
+        max_restarts: Some(p.max_restarts),
+        window_ms: Some(p.window_ms),
+        initial_delay_ms: Some(p.initial_delay_ms),
+        multiplier: Some(p.multiplier),
+        max_delay_ms: Some(p.max_delay_ms),
+        jitter: Some(p.jitter),
+        healthy_after_ms: Some(p.healthy_after_ms),
+    }
+}
+
+/// Unset optional fields take [`tymux_core::RestartPolicy::default`]'s values.
+#[allow(clippy::result_large_err)]
+fn policy_from_proto(p: ProtoRestartPolicy) -> Result<tymux_core::RestartPolicy, Status> {
+    use tymux_core::RestartMode as M;
+    let d = tymux_core::RestartPolicy::default();
+    let mode =
+        match ProtoRestartMode::try_from(p.mode) {
+            Ok(ProtoRestartMode::Never) => M::Never,
+            Ok(ProtoRestartMode::OnFailure) => M::OnFailure,
+            Ok(ProtoRestartMode::Always) => M::Always,
+            Ok(ProtoRestartMode::UnlessStopped) => M::UnlessStopped,
+            Ok(ProtoRestartMode::Unspecified) | Err(_) => return Err(Status::invalid_argument(
+                "restart policy: mode must be set (NEVER, ON_FAILURE, ALWAYS or UNLESS_STOPPED)",
+            )),
+        };
+    let policy = tymux_core::RestartPolicy {
+        mode,
+        max_restarts: p.max_restarts.unwrap_or(d.max_restarts),
+        window_ms: p.window_ms.unwrap_or(d.window_ms),
+        initial_delay_ms: p.initial_delay_ms.unwrap_or(d.initial_delay_ms),
+        multiplier: p.multiplier.unwrap_or(d.multiplier),
+        max_delay_ms: p.max_delay_ms.unwrap_or(d.max_delay_ms),
+        jitter: p.jitter.unwrap_or(d.jitter),
+        healthy_after_ms: p.healthy_after_ms.unwrap_or(d.healthy_after_ms),
+    };
+    policy
+        .validate()
+        .map_err(|e| Status::invalid_argument(format!("restart policy: {e}")))?;
+    Ok(policy)
+}
+
+fn unix_ms(ms: u64) -> i64 {
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
+fn status_to_proto(status: &tymux_core::PaneStatus) -> ProtoPaneStatus {
+    let v = &status.view;
+    ProtoPaneStatus {
+        pane_id: status.pane_id.to_string(),
+        state: state_to_proto(v.state) as i32,
+        policy: Some(policy_to_proto(&v.policy)),
+        restart_count: v.restart_count,
+        restarts_in_window: v.restarts_in_window,
+        consecutive_failures: v.consecutive_failures,
+        last_exit_code: v.last_exit.and_then(|e| e.code),
+        last_exit_signal: v.last_exit.and_then(|e| e.signal),
+        last_exit_at_unix_ms: v.last_exit.map(|e| unix_ms(e.at_ms)),
+        next_restart_at_unix_ms: v.next_restart_at_ms.map(unix_ms),
+        started_at_unix_ms: v.started_at_ms.map(unix_ms),
+        uptime_ms: match (status.pid, v.started_at_ms) {
+            (Some(_), Some(started)) => status.now_ms.saturating_sub(started),
+            _ => 0,
+        },
+        pid: status.pid,
+        now_unix_ms: unix_ms(status.now_ms),
+    }
+}
+
+fn lifecycle_event_to_proto(e: &tymux_core::LifecycleEvent) -> ProtoLifecycleEvent {
+    use tymux_core::LifecycleEventKind as K;
+    ProtoLifecycleEvent {
+        kind: match e.kind {
+            K::Exited => ProtoLifecycleEventKind::Exited,
+            K::RestartScheduled => ProtoLifecycleEventKind::RestartScheduled,
+            K::Restarted => ProtoLifecycleEventKind::Restarted,
+            K::Failed => ProtoLifecycleEventKind::Failed,
+            K::Stopped => ProtoLifecycleEventKind::Stopped,
+        } as i32,
+        state: state_to_proto(e.state) as i32,
+        exit_code: e.exit_code,
+        exit_signal: e.exit_signal,
+        delay_ms: e.delay_ms,
+        next_restart_at_unix_ms: e.next_restart_at_ms.map(unix_ms),
+        pid: e.pid,
+        restart_count: e.restart_count,
+        at_unix_ms: unix_ms(e.at_ms),
+    }
+}
+
+/// Runs the engine's restart supervision: wakes when a pane exits or a restart timer is due,
+/// respawns what is due, persists what changed. Without it a pane with a restart policy would
+/// never come back.
+fn spawn_supervisor(engine: Arc<Engine>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let wake = engine.supervisor_wake();
+        loop {
+            // Spawning a process and writing session records block, so keep them off the reactor.
+            let ticking = engine.clone();
+            let next_due = tokio::task::spawn_blocking(move || ticking.supervise_tick())
+                .await
+                .unwrap_or(None);
+            match next_due {
+                Some(at_ms) => {
+                    let wait = at_ms.saturating_sub(engine.supervision_now_ms());
+                    tokio::select! {
+                        () = wake.notified() => {}
+                        () = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                    }
+                }
+                None => wake.notified().await,
+            }
+        }
+    })
+}
+
+/// Default time a process gets between SIGTERM and SIGKILL when a request does not say.
+const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long past the grace period StopPane/RestartPane wait for a SIGKILLed process to be reaped.
+const REAP_MARGIN: Duration = Duration::from_secs(2);
+
+fn grace_of(grace_ms: Option<u64>) -> Duration {
+    grace_ms.map_or(DEFAULT_STOP_GRACE, Duration::from_millis)
+}
+
 fn layout_snapshot_to_proto(layout: &CoreLayout) -> ProtoLayout {
     use tymux_proto::v1::layout::Node;
     let node = match layout {
@@ -273,6 +458,7 @@ fn layout_snapshot_to_proto(layout: &CoreLayout) -> ProtoLayout {
             cols: info.cols,
             liveness: liveness_of(info.live) as i32,
             cwd: info.cwd.clone(),
+            state: state_to_proto(info.state) as i32,
         }),
         CoreLayout::Split {
             orientation,
@@ -316,6 +502,7 @@ fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot, live: bool) 
         cursor_row: snap.cursor_row,
         cursor_col: snap.cursor_col,
         cursor_pending_wrap: snap.cursor_pending_wrap,
+        state: PaneState::Unspecified as i32,
         exit_code: None,
         grid: snap
             .grid
@@ -475,6 +662,15 @@ fn engine_error_to_status(e: tymux_core::EngineError) -> Status {
         tymux_core::EngineError::ReviveLaunch { pane_id, message } => {
             Status::failed_precondition(format!("cannot revive pane {pane_id}: {message}"))
         }
+        tymux_core::EngineError::PaneRunning(id) => {
+            Status::failed_precondition(format!("pane {id} is already running"))
+        }
+        tymux_core::EngineError::InvalidRestartPolicy(why) => {
+            Status::invalid_argument(format!("restart policy: {why}"))
+        }
+        tymux_core::EngineError::PaneStart { pane_id, message } => {
+            Status::failed_precondition(format!("cannot start pane {pane_id}: {message}"))
+        }
     }
 }
 
@@ -506,6 +702,38 @@ fn resolve_live_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::P
              restored pane can be respawned with ReviveSession"
         ))),
         PaneLookup::Unknown => Err(Status::not_found("no such pane")),
+    }
+}
+
+/// For Attach: a running pane, or one whose process is gone but a restart is on its way, so a
+/// client can attach during a backoff and be there when the new process starts.
+#[allow(clippy::result_large_err)]
+fn resolve_attachable_pane(
+    engine: &Engine,
+    pane_id: Uuid,
+) -> Result<Arc<tymux_core::Pane>, Status> {
+    resolve_live_pane(engine, pane_id).or_else(|status| match engine.held_pane(pane_id) {
+        Some(pane) if pane.restart_pending() => Ok(pane),
+        _ => Err(status),
+    })
+}
+
+/// The next lifecycle event for an attach that asked for them; never resolves for one that did
+/// not (or whose pane is gone, which the output channel reports separately).
+async fn next_lifecycle_event(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<tymux_core::LifecycleEvent>>,
+) -> tymux_core::LifecycleEvent {
+    use tokio::sync::broadcast::error::RecvError;
+    let Some(rx) = rx.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        match rx.recv().await {
+            Ok(event) => return event,
+            // A slow client misses the oldest events; the next GetPaneStatus is authoritative.
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => return std::future::pending().await,
+        }
     }
 }
 
@@ -656,9 +884,14 @@ impl TymuxService for TymuxDaemon {
         } else {
             Some(req.cwd)
         };
+        let policy = req
+            .restart_policy
+            .map(policy_from_proto)
+            .transpose()?
+            .unwrap_or_default();
         let id = self
             .engine
-            .create_session_with(
+            .create_session_supervised(
                 req.name,
                 command,
                 tymux_core::Launch {
@@ -674,6 +907,7 @@ impl TymuxService for TymuxDaemon {
                     stdin_stream: req.stdin_stream,
                 },
                 cwd,
+                policy,
             )
             .map_err(spawn_error_to_status)?;
         // O(1) lookup, not list_sessions().find() — the latter rebuilds a
@@ -773,6 +1007,10 @@ impl TymuxService for TymuxDaemon {
         if !live {
             snapshot.exit_code = pane.exit_code();
         }
+        snapshot.state = self
+            .engine
+            .pane_state(pane_id)
+            .map_or(PaneState::Unspecified, state_to_proto) as i32;
         Ok(Response::new(snapshot))
     }
 
@@ -920,6 +1158,122 @@ impl TymuxService for TymuxDaemon {
         ))
     }
 
+    async fn set_restart_policy(
+        &self,
+        request: Request<SetRestartPolicyRequest>,
+    ) -> Result<Response<SetRestartPolicyResponse>, Status> {
+        use tymux_proto::v1::set_restart_policy_request::Target;
+        let req = request.into_inner();
+        let policy = policy_from_proto(
+            req.policy
+                .ok_or_else(|| Status::invalid_argument("policy is required"))?,
+        )?;
+        let status = match req.target {
+            Some(Target::PaneId(id)) => {
+                let pane_id = parse_uuid(&id)?;
+                let status = self
+                    .engine
+                    .set_restart_policy(pane_id, policy)
+                    .map_err(engine_error_to_status)?;
+                tracing::info!(pane_id = %pane_id, "restart policy set");
+                Some(status_to_proto(&status))
+            }
+            Some(Target::SessionId(id)) => {
+                let session_id = parse_uuid(&id)?;
+                self.engine
+                    .set_session_restart_policy(session_id, policy, req.apply_to_existing_panes)
+                    .map_err(engine_error_to_status)?;
+                tracing::info!(session_id = %session_id, "session default restart policy set");
+                None
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "set pane_id or session_id as the target",
+                ))
+            }
+        };
+        Ok(Response::new(SetRestartPolicyResponse { status }))
+    }
+
+    async fn get_pane_status(
+        &self,
+        request: Request<GetPaneStatusRequest>,
+    ) -> Result<Response<ProtoPaneStatus>, Status> {
+        let pane_id = parse_uuid(&request.into_inner().pane_id)?;
+        self.pane_status_response(pane_id)
+    }
+
+    async fn restart_pane(
+        &self,
+        request: Request<RestartPaneRequest>,
+    ) -> Result<Response<ProtoPaneStatus>, Status> {
+        let req = request.into_inner();
+        let pane_id = parse_uuid(&req.pane_id)?;
+        let grace = grace_of(req.grace_ms);
+        let generation_before = self.engine.held_pane(pane_id).map_or(0, |p| p.generation());
+        let engine = self.engine.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            engine.restart_pane(pane_id, req.reset_backoff, grace)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(engine_error_to_status)?;
+        if outcome == tymux_core::SignalOutcome::Signaled {
+            // The old process must die before the new one starts; the supervisor does the
+            // respawn on its own, but running it here too makes this call return a running pane.
+            self.wait_for_restart(pane_id, generation_before, grace)
+                .await;
+        }
+        tracing::info!(pane_id = %pane_id, "pane restarted");
+        self.pane_status_response(pane_id)
+    }
+
+    async fn stop_pane(
+        &self,
+        request: Request<StopPaneRequest>,
+    ) -> Result<Response<ProtoPaneStatus>, Status> {
+        let req = request.into_inner();
+        let pane_id = parse_uuid(&req.pane_id)?;
+        let grace = grace_of(req.grace_ms);
+        let engine = self.engine.clone();
+        let outcome = tokio::task::spawn_blocking(move || engine.stop_pane(pane_id, grace))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(engine_error_to_status)?;
+        if outcome == tymux_core::SignalOutcome::Signaled {
+            if let Some(pane) = self.engine.held_pane(pane_id) {
+                let _ = tokio::time::timeout(grace + REAP_MARGIN, pane.wait_exit()).await;
+            }
+        }
+        tracing::info!(pane_id = %pane_id, "pane stopped");
+        self.pane_status_response(pane_id)
+    }
+
+    async fn start_pane(
+        &self,
+        request: Request<StartPaneRequest>,
+    ) -> Result<Response<ProtoPaneStatus>, Status> {
+        let pane_id = parse_uuid(&request.into_inner().pane_id)?;
+        let engine = self.engine.clone();
+        tokio::task::spawn_blocking(move || engine.start_pane(pane_id))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(engine_error_to_status)?;
+        tracing::info!(pane_id = %pane_id, "pane started");
+        self.pane_status_response(pane_id)
+    }
+
+    async fn reset_restart_budget(
+        &self,
+        request: Request<ResetRestartBudgetRequest>,
+    ) -> Result<Response<ProtoPaneStatus>, Status> {
+        let pane_id = parse_uuid(&request.into_inner().pane_id)?;
+        self.engine
+            .reset_restart_budget(pane_id)
+            .map_err(engine_error_to_status)?;
+        self.pane_status_response(pane_id)
+    }
+
     async fn write_stdin(
         &self,
         request: Request<Streaming<WriteStdinRequest>>,
@@ -993,8 +1347,9 @@ impl TymuxService for TymuxDaemon {
         // plan.md's Pattern Decisions; regression-tested by
         // `attach_should_reject_before_reading_resume_from_seq_when_first_message_omits_pane_id`).
         let resume_from_seq = first.resume_from_seq;
+        let subscribe_lifecycle = first.subscribe_lifecycle;
         let pane_id = parse_uuid(&pane_id_str)?;
-        let pane = resolve_live_pane(&self.engine, pane_id).inspect_err(|status| {
+        let pane = resolve_attachable_pane(&self.engine, pane_id).inspect_err(|status| {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "attach: pane unavailable");
         })?;
         tracing::info!(pane_id = %pane_id, "attach started");
@@ -1035,6 +1390,7 @@ impl TymuxService for TymuxDaemon {
         // Until `go_live_after` below the daemon keeps answering terminal queries: chunks at or
         // below the priming threshold never reach this client's emulator.
         let live_client = pane.register_live_client();
+        let mut lifecycle_rx = subscribe_lifecycle.then(|| pane.subscribe_lifecycle());
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let (priming_events, live_threshold_seq, emit_output_chunk, replay_chunks): (
             Vec<AttachEvent>,
@@ -1146,7 +1502,7 @@ impl TymuxService for TymuxDaemon {
                             return;
                         }
                     }
-                    _ = pane_for_exit.wait_exit() => {
+                    _ = pane_for_exit.wait_final_exit() => {
                         send_exited_event(
                             &pane_for_exit,
                             &forward_tx,
@@ -1200,7 +1556,17 @@ impl TymuxService for TymuxDaemon {
                             ForwardStep::End => return,
                         }
                     }
-                    _ = pane_for_exit.wait_exit() => {
+                    event = next_lifecycle_event(&mut lifecycle_rx) => {
+                        let event = AttachEvent {
+                            payload: Some(attach_event::Payload::Lifecycle(
+                                lifecycle_event_to_proto(&event),
+                            )),
+                        };
+                        if forward_tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = pane_for_exit.wait_final_exit() => {
                         send_exited_event(
                             &pane_for_exit,
                             &forward_tx,
@@ -1230,6 +1596,8 @@ impl TymuxService for TymuxDaemon {
         let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
+                    // Typing into a pane whose process is between lives has nowhere to go.
+                    Some(attach_request::Payload::Input(_)) if pane_for_input.is_exited() => {}
                     Some(attach_request::Payload::Input(bytes)) => {
                         if let Err(e) = pane_for_input.write_input(&bytes) {
                             tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input failed");
@@ -1639,6 +2007,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let _supervisor = spawn_supervisor(engine.clone());
     let daemon = TymuxDaemon::new(engine);
 
     // Bind the TCP listener eagerly here, before the "tymuxd listening" log
@@ -2003,6 +2372,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use std::time::Duration;
     use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 
@@ -2209,6 +2579,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -2223,6 +2594,7 @@ mod tests {
                 cols,
             })),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -2670,6 +3042,7 @@ mod tests {
             "create_session.file_args",
             "create_session.stdin_file",
             "create_session.stdin_stream",
+            "pane.lifecycle",
         ] {
             assert!(
                 info.capabilities.iter().any(|c| c == feature),
@@ -3028,6 +3401,7 @@ mod tests {
         let legacy_request = AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         };
         let encoded = prost::Message::encode_to_vec(&legacy_request);
         let decoded: AttachRequest = prost::Message::decode(encoded.as_slice()).unwrap();
@@ -3038,6 +3412,7 @@ mod tests {
         let resuming_request = AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: Some(0),
+            subscribe_lifecycle: false,
         };
         let encoded = prost::Message::encode_to_vec(&resuming_request);
         let decoded: AttachRequest = prost::Message::decode(encoded.as_slice()).unwrap();
@@ -3140,6 +3515,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: None,
             resume_from_seq: Some(5),
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -3260,6 +3636,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -3467,6 +3844,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -3633,6 +4011,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -3726,6 +4105,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -3805,6 +4185,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -3868,6 +4249,7 @@ mod tests {
         tx1.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str.clone())),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -3912,6 +4294,7 @@ mod tests {
         tx2.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str.clone())),
             resume_from_seq: Some(resume_from_seq),
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -3957,6 +4340,7 @@ mod tests {
         tx3.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4053,6 +4437,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4160,6 +4545,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4194,6 +4580,7 @@ mod tests {
                 format!("printf '%s\\n' {MARKER}\n").into_bytes(),
             )),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4278,12 +4665,14 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4339,12 +4728,14 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::Input(b"exit 7\n".to_vec())),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4409,12 +4800,14 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4477,6 +4870,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4853,6 +5247,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -4900,6 +5295,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -5530,6 +5926,7 @@ mod tests {
                 cols: 80,
                 exit_code: None,
                 launch: Default::default(),
+                restart: None,
             },
         };
         let dead_leaf = PersistedLayoutNode::Leaf {
@@ -5541,6 +5938,7 @@ mod tests {
                 cols: 0,
                 exit_code: None,
                 launch: Default::default(),
+                restart: None,
             },
         };
         let record = PersistedSessionRecord {
@@ -5560,6 +5958,7 @@ mod tests {
                 },
             ],
             active_window_id: Uuid::new_v4(),
+            default_restart_policy: None,
         };
 
         assert_eq!(count_orphan_candidates(&[record]), 1);
@@ -5588,6 +5987,7 @@ mod tests {
                 cols: 80,
                 exit_code: Some(0),
                 launch: Default::default(),
+                restart: None,
             },
         };
         let record = PersistedSessionRecord {
@@ -5600,6 +6000,7 @@ mod tests {
                 layout: exited_leaf,
             }],
             active_window_id: Uuid::new_v4(),
+            default_restart_policy: None,
         };
 
         assert_eq!(count_orphan_candidates(&[record]), 0);
@@ -5646,6 +6047,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(Uuid::new_v4().to_string())),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -5689,6 +6091,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -6030,5 +6433,519 @@ mod tests {
             !text.contains("should-never-be-echoed"),
             "help text must never echo an env var's current value: {text}"
         );
+    }
+
+    // ---- Pane lifecycle (ADR-0007) ----
+
+    const T0: u64 = 1_000_000;
+
+    /// A daemon whose supervision runs on a clock the test moves by hand. No supervisor task
+    /// is started: tests call `supervise_tick` themselves, so nothing waits on a timer.
+    fn supervised_daemon() -> (TymuxDaemon, Arc<tymux_core::ManualClock>) {
+        let clock = Arc::new(tymux_core::ManualClock::new(T0));
+        let engine = Arc::new(Engine::with_supervision(
+            Box::new(tymux_core::NullPersistenceBackend),
+            clock.clone(),
+            Arc::new(tymux_core::FixedJitter(0.5)),
+        ));
+        (TymuxDaemon::new(engine), clock)
+    }
+
+    fn policy_req(mode: ProtoRestartMode) -> ProtoRestartPolicy {
+        ProtoRestartPolicy {
+            mode: mode as i32,
+            max_restarts: Some(3),
+            window_ms: Some(60_000),
+            initial_delay_ms: Some(1_000),
+            multiplier: Some(2.0),
+            max_delay_ms: Some(8_000),
+            jitter: Some(0.0),
+            healthy_after_ms: Some(10_000),
+        }
+    }
+
+    /// `/bin/sh -c SCRIPT` with a restart policy.
+    fn script_req(
+        name: &str,
+        script: &str,
+        policy: Option<ProtoRestartPolicy>,
+    ) -> CreateSessionRequest {
+        CreateSessionRequest {
+            name: name.to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            restart_policy: policy,
+            ..Default::default()
+        }
+    }
+
+    fn marker_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("tymuxd-lifecycle-{name}-{}", Uuid::new_v4()))
+            .display()
+            .to_string()
+    }
+
+    /// Waits on the first run for a line of input, then exits 3; every later run sleeps.
+    fn crash_once_script(marker: &str) -> String {
+        format!("if [ -e '{marker}' ]; then exec sleep 300; fi; touch '{marker}'; read go; exit 3")
+    }
+
+    async fn tick(daemon: &TymuxDaemon) {
+        let engine = daemon.engine.clone();
+        tokio::task::spawn_blocking(move || engine.supervise_tick())
+            .await
+            .unwrap();
+    }
+
+    async fn attach_with_lifecycle(
+        client: &mut TymuxServiceClient<tonic::transport::Channel>,
+        pane_id: &str,
+        subscribe_lifecycle: bool,
+    ) -> (
+        tokio::sync::mpsc::Sender<AttachRequest>,
+        tonic::Streaming<AttachEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
+            resume_from_seq: None,
+            subscribe_lifecycle,
+        })
+        .await
+        .unwrap();
+        let inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+        (tx, inbound)
+    }
+
+    async fn next_lifecycle(inbound: &mut tonic::Streaming<AttachEvent>) -> ProtoLifecycleEvent {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = inbound.message().await.unwrap() {
+                match event.payload {
+                    Some(attach_event::Payload::Lifecycle(e)) => return e,
+                    Some(attach_event::Payload::Exited(_)) => panic!("stream ended with exited"),
+                    _ => {}
+                }
+            }
+            panic!("stream closed before a lifecycle event");
+        })
+        .await
+        .expect("a lifecycle event within 10s")
+    }
+
+    #[tokio::test]
+    async fn set_restart_policy_and_get_pane_status_should_round_trip_with_resolved_defaults() {
+        let (daemon, _clock) = supervised_daemon();
+        let mut client = spawn_test_server(daemon).await;
+        let session = client
+            .create_session(create_req("t"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane = sole_pane(&session.windows[0]);
+        assert_eq!(pane.state, PaneState::Live as i32);
+
+        let status = client
+            .get_pane_status(GetPaneStatusRequest {
+                pane_id: pane.id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.state, PaneState::Live as i32);
+        let default_policy = status.policy.unwrap();
+        assert_eq!(default_policy.mode, ProtoRestartMode::Never as i32);
+        assert!(status.pid.is_some());
+
+        let set = client
+            .set_restart_policy(SetRestartPolicyRequest {
+                target: Some(tymux_proto::v1::set_restart_policy_request::Target::PaneId(
+                    pane.id.clone(),
+                )),
+                policy: Some(ProtoRestartPolicy {
+                    mode: ProtoRestartMode::OnFailure as i32,
+                    max_restarts: Some(2),
+                    ..Default::default()
+                }),
+                apply_to_existing_panes: false,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .status
+            .unwrap();
+        let policy = set.policy.unwrap();
+        assert_eq!(policy.mode, ProtoRestartMode::OnFailure as i32);
+        assert_eq!(policy.max_restarts, Some(2));
+        assert_eq!(
+            policy.window_ms,
+            Some(60_000),
+            "unset fields resolve to defaults"
+        );
+        assert_eq!(policy.jitter, Some(0.2));
+        let again = client
+            .get_pane_status(GetPaneStatusRequest {
+                pane_id: pane.id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(again.policy.unwrap(), policy);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_rpcs_should_reject_bad_input_with_distinct_codes() {
+        let (daemon, _clock) = supervised_daemon();
+        let mut client = spawn_test_server(daemon).await;
+        let session = client
+            .create_session(create_req("t"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let target = |id: &str| {
+            Some(tymux_proto::v1::set_restart_policy_request::Target::PaneId(
+                id.to_string(),
+            ))
+        };
+
+        let unspecified = client
+            .set_restart_policy(SetRestartPolicyRequest {
+                target: target(&pane_id),
+                policy: Some(ProtoRestartPolicy::default()),
+                apply_to_existing_panes: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(unspecified.code(), tonic::Code::InvalidArgument);
+
+        let mut bad = policy_req(ProtoRestartMode::Always);
+        bad.multiplier = Some(0.5);
+        let bad = client
+            .set_restart_policy(SetRestartPolicyRequest {
+                target: target(&pane_id),
+                policy: Some(bad),
+                apply_to_existing_panes: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::InvalidArgument);
+
+        let no_target = client
+            .set_restart_policy(SetRestartPolicyRequest {
+                target: None,
+                policy: Some(policy_req(ProtoRestartMode::Always)),
+                apply_to_existing_panes: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(no_target.code(), tonic::Code::InvalidArgument);
+
+        let unknown = Uuid::new_v4().to_string();
+        let missing = client
+            .get_pane_status(GetPaneStatusRequest {
+                pane_id: unknown.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        let missing = client
+            .stop_pane(StopPaneRequest {
+                pane_id: unknown,
+                grace_ms: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        let running = client
+            .start_pane(StartPaneRequest { pane_id })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            running.code(),
+            tonic::Code::FailedPrecondition,
+            "cannot start a running pane"
+        );
+
+        let bad_create = client
+            .create_session(CreateSessionRequest {
+                restart_policy: Some(ProtoRestartPolicy::default()),
+                ..create_req("t2")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(bad_create.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn an_attached_client_should_stay_attached_across_a_restart_and_see_lifecycle_events() {
+        let (daemon, clock) = supervised_daemon();
+        let engine_daemon = daemon.clone();
+        let mut client = spawn_test_server(daemon).await;
+        let marker = marker_path("attach");
+        let session = client
+            .create_session(script_req(
+                "t",
+                &crash_once_script(&marker),
+                Some(policy_req(ProtoRestartMode::OnFailure)),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let (tx, mut opted_in) = attach_with_lifecycle(&mut client, &pane_id, true).await;
+        let (_tx2, mut legacy) = attach_with_lifecycle(&mut client, &pane_id, false).await;
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Input(b"go\n".to_vec())),
+            resume_from_seq: None,
+            subscribe_lifecycle: false,
+        })
+        .await
+        .unwrap();
+
+        let exited = next_lifecycle(&mut opted_in).await;
+        assert_eq!(exited.kind, ProtoLifecycleEventKind::Exited as i32);
+        assert_eq!(exited.exit_code, Some(3));
+        let scheduled = next_lifecycle(&mut opted_in).await;
+        assert_eq!(
+            scheduled.kind,
+            ProtoLifecycleEventKind::RestartScheduled as i32
+        );
+        assert_eq!(scheduled.delay_ms, Some(1_000));
+        assert_eq!(scheduled.next_restart_at_unix_ms, Some(T0 as i64 + 1_000));
+        assert_eq!(scheduled.state, PaneState::Backoff as i32);
+
+        let status = client
+            .get_pane_status(GetPaneStatusRequest {
+                pane_id: pane_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.state, PaneState::Backoff as i32);
+        let snapshot = client
+            .capture_pane(capture_req(pane_id.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(snapshot.liveness, Liveness::Dead as i32);
+        assert_eq!(
+            snapshot.state,
+            PaneState::Backoff as i32,
+            "last screen plus the new state"
+        );
+        assert_eq!(snapshot.exit_code, Some(3));
+        let listed = client
+            .list_sessions(ListSessionsRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            sole_pane(&listed.sessions[0].windows[0]).state,
+            PaneState::Backoff as i32
+        );
+
+        clock.advance(1_000);
+        tick(&engine_daemon).await;
+        let restarted = next_lifecycle(&mut opted_in).await;
+        assert_eq!(restarted.kind, ProtoLifecycleEventKind::Restarted as i32);
+        assert!(restarted.pid.is_some());
+        assert_eq!(restarted.restart_count, 1);
+
+        // Still attached: operator stop ends it, with the final lifecycle events first.
+        let stopped = client
+            .stop_pane(StopPaneRequest {
+                pane_id: pane_id.clone(),
+                grace_ms: Some(2_000),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stopped.state, PaneState::Stopped as i32);
+        assert_eq!(stopped.last_exit_signal, Some(15));
+        assert_eq!(stopped.pid, None);
+        let _exited = next_lifecycle(&mut opted_in).await;
+        let stop_event = next_lifecycle(&mut opted_in).await;
+        assert_eq!(stop_event.kind, ProtoLifecycleEventKind::Stopped as i32);
+        let mut saw_exited = false;
+        while let Some(event) = opted_in.message().await.unwrap() {
+            saw_exited |= matches!(event.payload, Some(attach_event::Payload::Exited(_)));
+        }
+        assert!(
+            saw_exited,
+            "exited follows the final lifecycle event, then the stream closes"
+        );
+
+        // A client that never opted in saw no lifecycle events, only the legacy stream.
+        let mut legacy_saw_lifecycle = false;
+        let mut legacy_saw_exited = false;
+        while let Some(event) = legacy.message().await.unwrap() {
+            legacy_saw_lifecycle |=
+                matches!(event.payload, Some(attach_event::Payload::Lifecycle(_)));
+            legacy_saw_exited |= matches!(event.payload, Some(attach_event::Payload::Exited(_)));
+        }
+        assert!(!legacy_saw_lifecycle);
+        assert!(legacy_saw_exited);
+    }
+
+    #[tokio::test]
+    async fn stop_start_restart_and_reset_rpcs_should_drive_the_state_machine() {
+        let (daemon, _clock) = supervised_daemon();
+        let mut client = spawn_test_server(daemon).await;
+        let session = client
+            .create_session(script_req(
+                "t",
+                "exec sleep 300",
+                Some(policy_req(ProtoRestartMode::Always)),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+
+        let first = client
+            .get_pane_status(GetPaneStatusRequest {
+                pane_id: pane_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let restarted = client
+            .restart_pane(RestartPaneRequest {
+                pane_id: pane_id.clone(),
+                reset_backoff: false,
+                grace_ms: Some(2_000),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            restarted.state,
+            PaneState::Live as i32,
+            "returns once the new process runs"
+        );
+        assert_ne!(restarted.pid, first.pid);
+        assert_eq!(restarted.restart_count, 1);
+        assert_eq!(restarted.restarts_in_window, 0, "manual restarts are free");
+
+        let stopped = client
+            .stop_pane(StopPaneRequest {
+                pane_id: pane_id.clone(),
+                grace_ms: Some(2_000),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stopped.state, PaneState::Stopped as i32);
+        let started = client
+            .start_pane(StartPaneRequest {
+                pane_id: pane_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(started.state, PaneState::Live as i32);
+        assert!(started.pid.is_some());
+        assert_eq!(
+            started.policy.unwrap().mode,
+            ProtoRestartMode::Always as i32
+        );
+
+        let reset = client
+            .reset_restart_budget(ResetRestartBudgetRequest {
+                pane_id: pane_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reset.restarts_in_window, 0);
+        assert_eq!(reset.consecutive_failures, 0);
+        client
+            .kill_session(KillSessionRequest {
+                session_id: session.id,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revive_session_rpc_should_respawn_a_pane_whose_child_exited_in_this_daemon() {
+        let (daemon, _clock) = supervised_daemon();
+        let engine = daemon.engine.clone();
+        let mut client = spawn_test_server(daemon).await;
+        let session = client
+            .create_session(script_req("t", "exit 0", None))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+        engine.held_pane(pane_id).unwrap().wait_exit().await;
+
+        let revived = client
+            .revive_session(ReviveSessionRequest {
+                session_id: session.id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            !revived.already_live,
+            "an exited pane in this daemon is not 'live'"
+        );
+        assert_eq!(revived.pane_count, 1);
+        assert_eq!(engine.pane_status(pane_id).unwrap().view.restart_count, 1);
+    }
+
+    /// The real supervisor task, real timers (1 ms backoff), no scripted clock: a pane that
+    /// always crashes is restarted its whole budget and then parked in FAILED. Events, not
+    /// sleeps, say when to look.
+    #[tokio::test]
+    async fn the_supervisor_task_should_restart_a_crashing_pane_until_its_budget_is_spent() {
+        let engine = Arc::new(Engine::new());
+        let _supervisor = spawn_supervisor(engine.clone());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let mut client = spawn_test_server(daemon).await;
+        let marker = marker_path("budget");
+        let script =
+            format!("if [ -e '{marker}' ]; then exit 1; fi; touch '{marker}'; read go; exit 1");
+        let mut policy = policy_req(ProtoRestartMode::Always);
+        policy.max_restarts = Some(3);
+        policy.window_ms = Some(0);
+        policy.initial_delay_ms = Some(1);
+        policy.multiplier = Some(1.0);
+        policy.max_delay_ms = Some(1);
+        let session = client
+            .create_session(script_req("t", &script, Some(policy)))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = parse_uuid(&sole_pane(&session.windows[0]).id).unwrap();
+        let pane = engine.held_pane(pane_id).unwrap();
+        let mut events = pane.subscribe_lifecycle();
+        pane.write_input(b"go\n").unwrap();
+
+        let (mut restarted, mut scheduled) = (0, 0);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match events.recv().await.unwrap().kind {
+                    tymux_core::LifecycleEventKind::Restarted => restarted += 1,
+                    tymux_core::LifecycleEventKind::RestartScheduled => scheduled += 1,
+                    tymux_core::LifecycleEventKind::Failed => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the pane must reach FAILED");
+        assert_eq!((scheduled, restarted), (3, 3));
+        let status = engine.pane_status(pane_id).unwrap();
+        assert_eq!(status.view.state, tymux_core::LifecycleState::Failed);
+        assert!(pane.wait_final_exit().now_or_never().is_some());
     }
 }

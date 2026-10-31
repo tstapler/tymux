@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::sync::broadcast;
@@ -15,6 +16,8 @@ use crate::persistence::{
     persisted_layout_to_live, NullPersistenceBackend, PersistedPaneRecord, PersistedSessionRecord,
     PersistedWindowRecord, PersistenceBackend,
 };
+use crate::restart::{Clock, Jitter, LifecycleState, RestartPolicy, SystemClock, SystemJitter};
+use crate::supervision::{PaneStatus, SignalOutcome, Supervision};
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
@@ -44,6 +47,8 @@ pub struct SessionState {
     pub name: String,
     pub windows: Vec<WindowState>,
     pub active_window_id: Uuid,
+    /// Restart policy given to panes created later in this session (SplitPane, CreateWindow).
+    pub default_restart_policy: RestartPolicy,
 }
 
 /// `Engine.panes`' value type. `Dead(record)` means a session was loaded
@@ -54,7 +59,7 @@ pub struct SessionState {
 /// that (see `pane_lookup`), no separate entry state is needed for it.
 pub enum PaneEntry {
     Live(Arc<Pane>),
-    Dead(PersistedPaneRecord),
+    Dead(Box<PersistedPaneRecord>),
 }
 
 /// The one place a client-reported viewport is clamped to what a pane can actually run at, so the
@@ -94,6 +99,14 @@ pub enum EngineError {
         pane_id: Uuid,
         message: String,
     },
+    /// The pane has a running process, so it cannot be started.
+    PaneRunning(Uuid),
+    InvalidRestartPolicy(String),
+    /// Starting or stopping the pane's process failed.
+    PaneStart {
+        pane_id: Uuid,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for EngineError {
@@ -115,6 +128,11 @@ impl std::fmt::Display for EngineError {
             EngineError::ReviveLaunch { pane_id, message } => {
                 write!(f, "cannot revive pane {pane_id}: {message}")
             }
+            EngineError::PaneRunning(id) => write!(f, "pane {id} is already running"),
+            EngineError::InvalidRestartPolicy(why) => write!(f, "invalid restart policy: {why}"),
+            EngineError::PaneStart { pane_id, message } => {
+                write!(f, "cannot start pane {pane_id}: {message}")
+            }
         }
     }
 }
@@ -132,6 +150,8 @@ pub struct PaneInfo {
     /// `None`/`Missing`, which shouldn't happen for a leaf with a live
     /// `pane_id`).
     pub cwd: String,
+    /// Supervision state: LIVE, EXITED, BACKOFF, RESTARTING, FAILED or STOPPED.
+    pub state: LifecycleState,
 }
 
 /// A read-only snapshot of one window's layout tree, with each leaf's
@@ -227,6 +247,10 @@ pub struct Engine {
     /// disk unless they opt in via `Engine::with_persistence`); `tymuxd`'s
     /// `main()` supplies a real `FsPersistenceBackend`.
     persistence: Box<dyn PersistenceBackend>,
+    /// Restart policy and lifecycle state for every pane (ADR-0007).
+    supervision: Arc<Supervision>,
+    /// Orders snapshot-then-save in `persist_session` against `persistence.delete`.
+    persist_lock: Mutex<()>,
 }
 
 /// Reverse indices (pane_id -> window_id -> session_id) for O(1) pane/window
@@ -277,6 +301,8 @@ impl Default for Engine {
             window_index: Mutex::new(WindowIndex::default()),
             resize_locks: Mutex::new(HashMap::new()),
             persistence: Box::new(NullPersistenceBackend),
+            supervision: Supervision::new(Arc::new(SystemClock), Arc::new(SystemJitter::default())),
+            persist_lock: Mutex::new(()),
         }
     }
 }
@@ -293,6 +319,20 @@ impl Engine {
         }
     }
 
+    /// An engine whose restart supervision reads `clock` and draws backoff jitter from
+    /// `jitter`, so tests drive time and randomness by hand.
+    pub fn with_supervision(
+        persistence: Box<dyn PersistenceBackend>,
+        clock: Arc<dyn Clock>,
+        jitter: Arc<dyn Jitter>,
+    ) -> Self {
+        Self {
+            persistence,
+            supervision: Supervision::new(clock, jitter),
+            ..Self::default()
+        }
+    }
+
     /// Populates the engine with dead-flagged sessions reconstructed from
     /// already-validated persisted records (Story 4.3) — only called at
     /// daemon startup, before serving any RPC. Every leaf's `pane_id`
@@ -305,6 +345,7 @@ impl Engine {
         let mut window_index = self.window_index.lock().unwrap();
         for record in records {
             let session_id = record.session_id;
+            let default_restart_policy = record.default_restart_policy.clone().unwrap_or_default();
             let windows: Vec<WindowState> = record
                 .windows
                 .into_iter()
@@ -319,6 +360,15 @@ impl Engine {
                     window_index.insert_window(window.id, session_id);
                     for pane_id in window.layout.leaves() {
                         window_index.insert_pane(pane_id, window.id);
+                        let restored = match panes.get(&pane_id) {
+                            Some(PaneEntry::Dead(r)) => r.restart.clone().map(|b| *b),
+                            _ => None,
+                        };
+                        self.supervision.register_restored(
+                            pane_id,
+                            restored,
+                            default_restart_policy.clone(),
+                        );
                     }
                     window
                 })
@@ -330,6 +380,7 @@ impl Engine {
                     name: record.name,
                     windows,
                     active_window_id: record.active_window_id,
+                    default_restart_policy,
                 },
             );
         }
@@ -358,13 +409,20 @@ impl Engine {
     /// session (Story 4.2 AC2) — the same single-owner-writer shape
     /// already established for `Pane::resize()`.
     fn snapshot_persisted_record(
+        &self,
         sessions: &HashMap<Uuid, SessionState>,
         panes: &HashMap<Uuid, PaneEntry>,
         session_id: Uuid,
     ) -> Option<PersistedSessionRecord> {
-        sessions
-            .get(&session_id)
-            .map(|session| PersistedSessionRecord::from_session_state(session, panes))
+        sessions.get(&session_id).map(|session| {
+            let pane_ids: Vec<Uuid> = session
+                .windows
+                .iter()
+                .flat_map(|w| w.layout.leaves())
+                .collect();
+            let restart = self.supervision.persisted_for(&pane_ids);
+            PersistedSessionRecord::from_session_state_with_restart(session, panes, &restart)
+        })
     }
 
     fn save_persisted(&self, record: Option<PersistedSessionRecord>) {
@@ -392,6 +450,22 @@ impl Engine {
         launch: Launch,
         cwd: Option<String>,
     ) -> Result<Uuid> {
+        self.create_session_supervised(name, command, launch, cwd, RestartPolicy::default())
+    }
+
+    /// [`Self::create_session_with`] with a restart policy for the first pane, which also
+    /// becomes the session's default for panes added later.
+    pub fn create_session_supervised(
+        &self,
+        name: String,
+        command: Option<String>,
+        launch: Launch,
+        cwd: Option<String>,
+        policy: RestartPolicy,
+    ) -> Result<Uuid> {
+        policy
+            .validate()
+            .map_err(|e| anyhow!(EngineError::InvalidRestartPolicy(e)))?;
         let shell = command.unwrap_or_else(default_shell);
         let pane = Pane::spawn_launch(
             &shell,
@@ -416,6 +490,7 @@ impl Engine {
             name,
             windows: vec![window],
             active_window_id: window_id,
+            default_restart_policy: policy.clone(),
         };
         let id = session.id;
 
@@ -424,7 +499,8 @@ impl Engine {
         self.panes
             .lock()
             .unwrap()
-            .insert(pane_id, PaneEntry::Live(pane));
+            .insert(pane_id, PaneEntry::Live(pane.clone()));
+        self.supervision.register_live(&pane, policy);
         {
             let mut window_index = self.window_index.lock().unwrap();
             window_index.insert_window(window_id, id);
@@ -434,7 +510,7 @@ impl Engine {
         let record = {
             let sessions = self.sessions.lock().unwrap();
             let panes = self.panes.lock().unwrap();
-            Self::snapshot_persisted_record(&sessions, &panes, id)
+            self.snapshot_persisted_record(&sessions, &panes, id)
         };
         self.save_persisted(record);
         Ok(id)
@@ -483,7 +559,7 @@ impl Engine {
                     .map(|w| WindowSnapshot {
                         id: w.id,
                         name: w.name,
-                        layout: handle_to_layout_snapshot(&w.layout),
+                        layout: handle_to_layout_snapshot(&w.layout, &self.supervision),
                     })
                     .collect();
                 let live = windows.iter().any(|w| window_has_live_pane(&w.layout));
@@ -528,6 +604,8 @@ impl Engine {
 
         let mut panes = self.panes.lock().unwrap();
         for pane_id in pane_ids {
+            // Before the kill, so the exit is not mistaken for a crash to restart.
+            self.supervision.forget(pane_id);
             if let Some(PaneEntry::Live(pane)) = panes.remove(&pane_id) {
                 if !pane.is_exited() {
                     if let Err(e) = pane.kill() {
@@ -537,6 +615,7 @@ impl Engine {
             }
         }
         drop(panes);
+        let _serialized = self.persist_lock.lock().unwrap();
         self.persistence.delete(id);
         Ok(())
     }
@@ -604,6 +683,7 @@ impl Engine {
         let session = sessions
             .get_mut(&session_id)
             .ok_or(EngineError::PaneNotFound(pane_id))?;
+        let policy = session.default_restart_policy.clone();
         let window = session
             .windows
             .iter_mut()
@@ -631,7 +711,8 @@ impl Engine {
         self.panes
             .lock()
             .unwrap()
-            .insert(new_pane_id, PaneEntry::Live(new_pane));
+            .insert(new_pane_id, PaneEntry::Live(new_pane.clone()));
+        self.supervision.register_live(&new_pane, policy);
         self.window_index
             .lock()
             .unwrap()
@@ -640,8 +721,8 @@ impl Engine {
         let (snapshot, record) = {
             let sessions = self.sessions.lock().unwrap();
             let panes = self.panes.lock().unwrap();
-            let snapshot = session_to_snapshot(&sessions[&session_id], &panes);
-            let record = Self::snapshot_persisted_record(&sessions, &panes, session_id);
+            let snapshot = session_to_snapshot(&sessions[&session_id], &panes, &self.supervision);
+            let record = self.snapshot_persisted_record(&sessions, &panes, session_id);
             (snapshot, record)
         };
         self.save_persisted(record);
@@ -703,9 +784,13 @@ impl Engine {
         } else {
             let (snapshot, record) = {
                 let panes = self.panes.lock().unwrap();
-                let record = Self::snapshot_persisted_record(&sessions, &panes, session_id);
+                let record = self.snapshot_persisted_record(&sessions, &panes, session_id);
                 (
-                    Some(session_to_snapshot(&sessions[&session_id], &panes)),
+                    Some(session_to_snapshot(
+                        &sessions[&session_id],
+                        &panes,
+                        &self.supervision,
+                    )),
                     record,
                 )
             };
@@ -713,6 +798,7 @@ impl Engine {
         };
         drop(sessions);
         if removed_session.is_some() {
+            let _serialized = self.persist_lock.lock().unwrap();
             self.persistence.delete(session_id);
         }
         self.save_persisted(record);
@@ -733,6 +819,7 @@ impl Engine {
         // Kill the closed pane's process, and (if the session closed too)
         // every other pane that went down with it.
         let mut panes = self.panes.lock().unwrap();
+        self.supervision.forget(pane_id);
         if let Some(PaneEntry::Live(pane)) = panes.remove(&pane_id) {
             if !pane.is_exited() {
                 let _ = pane.kill();
@@ -740,6 +827,7 @@ impl Engine {
         }
         if let Some(session) = &removed_session {
             for other_pane_id in session.windows.iter().flat_map(|w| w.layout.leaves()) {
+                self.supervision.forget(other_pane_id);
                 if let Some(PaneEntry::Live(pane)) = panes.remove(&other_pane_id) {
                     if !pane.is_exited() {
                         let _ = pane.kill();
@@ -787,7 +875,9 @@ impl Engine {
         self.panes
             .lock()
             .unwrap()
-            .insert(pane_id, PaneEntry::Live(pane));
+            .insert(pane_id, PaneEntry::Live(pane.clone()));
+        self.supervision
+            .register_live(&pane, session.default_restart_policy.clone());
         {
             let mut window_index = self.window_index.lock().unwrap();
             window_index.insert_window(window_id, session_id);
@@ -795,8 +885,8 @@ impl Engine {
         }
 
         let panes = self.panes.lock().unwrap();
-        let record = Self::snapshot_persisted_record(&sessions, &panes, session_id);
-        let snapshot = session_to_snapshot(&sessions[&session_id], &panes);
+        let record = self.snapshot_persisted_record(&sessions, &panes, session_id);
+        let snapshot = session_to_snapshot(&sessions[&session_id], &panes, &self.supervision);
         drop(sessions);
         drop(panes);
         self.save_persisted(record);
@@ -837,62 +927,43 @@ impl Engine {
             .iter()
             .flat_map(|w| w.layout.leaves())
             .collect();
+        let fallback_policy = session.default_restart_policy.clone();
         drop(sessions);
 
-        // Guard clause (Story 4.4 AC3): if any pane is already live, this
-        // session isn't dead — never double-spawn. Checked before any
-        // respawn work begins.
+        // Guard clause (Story 4.4 AC3): if any pane's process is running, this session isn't
+        // dead — never double-spawn. Checked before any respawn work begins. A pane whose
+        // child exited but is still held in memory does not count as running.
         let panes = self.panes.lock().unwrap();
         let already_live = pane_ids
             .iter()
-            .any(|id| matches!(panes.get(id), Some(PaneEntry::Live(_))));
+            .any(|id| matches!(panes.get(id), Some(PaneEntry::Live(p)) if !p.is_exited()));
         drop(panes);
         if already_live {
             return Ok(ReviveOutcome::AlreadyLive);
         }
 
-        // Resolve every dead pane's launch first, so a file deleted since the
-        // session died fails the whole revive instead of respawning some panes
-        // without the argument they were created with.
+        // Resolve every pane's launch first, so a file deleted since the session died fails
+        // the whole revive instead of respawning some panes without the argument they were
+        // created with.
         {
             let panes = self.panes.lock().unwrap();
             for pane_id in &pane_ids {
-                if let Some(PaneEntry::Dead(record)) = panes.get(pane_id) {
-                    record
-                        .launch
-                        .prepare()
-                        .map_err(|e| EngineError::ReviveLaunch {
-                            pane_id: *pane_id,
-                            message: e.to_string(),
-                        })?;
-                }
+                let launch = match panes.get(pane_id) {
+                    Some(PaneEntry::Dead(record)) => &record.launch,
+                    Some(PaneEntry::Live(pane)) => &pane.launch,
+                    None => continue,
+                };
+                launch.prepare().map_err(|e| EngineError::ReviveLaunch {
+                    pane_id: *pane_id,
+                    message: e.to_string(),
+                })?;
             }
         }
 
         let mut revived = 0usize;
         for pane_id in &pane_ids {
-            let record = {
-                let panes = self.panes.lock().unwrap();
-                match panes.get(pane_id) {
-                    Some(PaneEntry::Dead(record)) => record.clone(),
-                    _ => continue,
-                }
-            };
-            match Pane::spawn_launch(
-                &record.command,
-                &record.launch,
-                Some(&record.cwd),
-                Some(*pane_id),
-                record.rows.max(MIN_PANE_ROWS),
-                record.cols.max(MIN_PANE_COLS),
-            ) {
-                Ok(new_pane) => {
-                    self.panes
-                        .lock()
-                        .unwrap()
-                        .insert(*pane_id, PaneEntry::Live(new_pane));
-                    revived += 1;
-                }
+            match self.start_pane_inner(*pane_id, &fallback_policy) {
+                Ok(()) => revived += 1,
                 Err(e) => {
                     tracing::warn!(pane_id = %pane_id, error = %e, "revive_session: failed to respawn pane");
                 }
@@ -902,7 +973,7 @@ impl Engine {
         let record = {
             let sessions = self.sessions.lock().unwrap();
             let panes = self.panes.lock().unwrap();
-            Self::snapshot_persisted_record(&sessions, &panes, session_id)
+            self.snapshot_persisted_record(&sessions, &panes, session_id)
         };
         self.save_persisted(record);
 
@@ -910,6 +981,212 @@ impl Engine {
         Ok(ReviveOutcome::Revived {
             pane_count: revived,
         })
+    }
+
+    /// Starts one pane whose process is not running: a record restored from disk gets a new
+    /// pane (same id), a pane whose child exited in this daemon is respawned in place (same
+    /// pane, screen and subscribers). The restart budget starts over.
+    fn start_pane_inner(
+        &self,
+        pane_id: Uuid,
+        fallback_policy: &RestartPolicy,
+    ) -> Result<(), EngineError> {
+        // For a restored record the panes lock stays held across the spawn, so a concurrent
+        // ClosePane runs first (we find nothing) or after (it forgets and kills what we
+        // started). A pane that exited here is respawned by supervision, which serializes
+        // with ClosePane through `forget`/`retire` instead.
+        let mut panes = self.panes.lock().unwrap();
+        match panes.get(&pane_id) {
+            None => Err(EngineError::PaneNotFound(pane_id)),
+            Some(PaneEntry::Live(pane)) if !pane.is_exited() => {
+                Err(EngineError::PaneRunning(pane_id))
+            }
+            Some(PaneEntry::Live(_)) => {
+                drop(panes);
+                self.supervision.start(pane_id)
+            }
+            Some(PaneEntry::Dead(record)) => {
+                let new_pane = Pane::spawn_launch(
+                    &record.command,
+                    &record.launch,
+                    Some(&record.cwd),
+                    Some(pane_id),
+                    record.rows.max(MIN_PANE_ROWS),
+                    record.cols.max(MIN_PANE_COLS),
+                )
+                .map_err(|e| EngineError::PaneStart {
+                    pane_id,
+                    message: e.to_string(),
+                })?;
+                panes.insert(pane_id, PaneEntry::Live(new_pane.clone()));
+                self.supervision
+                    .adopt_started(&new_pane, fallback_policy.clone());
+                Ok(())
+            }
+        }
+    }
+
+    fn session_of_pane(&self, pane_id: Uuid) -> Result<Uuid, EngineError> {
+        self.window_and_session_for_pane(pane_id).map(|(_, s)| s)
+    }
+
+    /// Persists the session that owns `pane_id` (after its supervision changed).
+    fn persist_session(&self, session_id: Uuid) {
+        // Snapshot and save under one lock, and delete under it too, so a stale snapshot cannot
+        // be written after the session was killed.
+        let _serialized = self.persist_lock.lock().unwrap();
+        let record = {
+            let sessions = self.sessions.lock().unwrap();
+            let panes = self.panes.lock().unwrap();
+            self.snapshot_persisted_record(&sessions, &panes, session_id)
+        };
+        self.save_persisted(record);
+    }
+
+    fn is_restored_record(&self, pane_id: Uuid) -> bool {
+        matches!(
+            self.panes.lock().unwrap().get(&pane_id),
+            Some(PaneEntry::Dead(_))
+        )
+    }
+
+    /// Wakes whoever drives [`Self::supervise_tick`] (the daemon's supervisor task) when a pane
+    /// exits or a restart timer needs re-arming.
+    pub fn supervisor_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.supervision.wake()
+    }
+
+    /// Runs every restart that is due, persists supervision changes, and returns when the next
+    /// restart is due (unix ms). Call it on every wake and when that time arrives.
+    pub fn supervise_tick(&self) -> Option<u64> {
+        let next = self.supervision.run_due();
+        self.persist_dirty_supervision();
+        next
+    }
+
+    fn persist_dirty_supervision(&self) {
+        let sessions: std::collections::HashSet<Uuid> = self
+            .supervision
+            .take_dirty()
+            .into_iter()
+            .filter_map(|pane_id| self.session_of_pane(pane_id).ok())
+            .collect();
+        for session_id in sessions {
+            self.persist_session(session_id);
+        }
+    }
+
+    /// Current unix time on the clock supervision runs on.
+    pub fn supervision_now_ms(&self) -> u64 {
+        self.supervision.now_ms()
+    }
+
+    pub fn pane_status(&self, pane_id: Uuid) -> Option<PaneStatus> {
+        self.supervision.status(pane_id)
+    }
+
+    /// The pane's supervision state alone (cheap).
+    pub fn pane_state(&self, pane_id: Uuid) -> Option<LifecycleState> {
+        self.supervision.state_of(pane_id)
+    }
+
+    /// The pane while the engine holds it in memory, running or not (so a client can still read
+    /// and subscribe to a pane that is in backoff). `None` for unknown panes and records
+    /// restored from disk.
+    pub fn held_pane(&self, pane_id: Uuid) -> Option<Arc<Pane>> {
+        match self.panes.lock().unwrap().get(&pane_id) {
+            Some(PaneEntry::Live(pane)) => Some(pane.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn set_restart_policy(
+        &self,
+        pane_id: Uuid,
+        policy: RestartPolicy,
+    ) -> Result<PaneStatus, EngineError> {
+        let session_id = self.session_of_pane(pane_id)?;
+        self.supervision.set_policy(pane_id, policy)?;
+        self.persist_session(session_id);
+        self.supervision
+            .status(pane_id)
+            .ok_or(EngineError::PaneNotFound(pane_id))
+    }
+
+    /// Sets the policy new panes in the session start with, and with `apply_to_existing` every
+    /// pane already in it.
+    pub fn set_session_restart_policy(
+        &self,
+        session_id: Uuid,
+        policy: RestartPolicy,
+        apply_to_existing: bool,
+    ) -> Result<(), EngineError> {
+        policy
+            .validate()
+            .map_err(EngineError::InvalidRestartPolicy)?;
+        let pane_ids: Vec<Uuid> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let session = sessions
+                .get_mut(&session_id)
+                .ok_or(EngineError::SessionNotFound(session_id))?;
+            session.default_restart_policy = policy.clone();
+            session
+                .windows
+                .iter()
+                .flat_map(|w| w.layout.leaves())
+                .collect()
+        };
+        if apply_to_existing {
+            for pane_id in pane_ids {
+                self.supervision.set_policy(pane_id, policy.clone())?;
+            }
+        }
+        self.persist_session(session_id);
+        Ok(())
+    }
+
+    /// Stops the pane (SIGTERM, SIGKILL after `grace`) and keeps it from restarting until
+    /// [`Self::start_pane`]. See [`SignalOutcome`] for whether to wait for the process.
+    pub fn stop_pane(&self, pane_id: Uuid, grace: Duration) -> Result<SignalOutcome, EngineError> {
+        let session_id = self.session_of_pane(pane_id)?;
+        let outcome = self.supervision.stop(pane_id, grace)?;
+        self.persist_session(session_id);
+        Ok(outcome)
+    }
+
+    /// Restarts the pane: a running process is signaled and replaced once it dies (the
+    /// supervisor task does the respawn), a dead one is respawned now.
+    pub fn restart_pane(
+        &self,
+        pane_id: Uuid,
+        reset_backoff: bool,
+        grace: Duration,
+    ) -> Result<SignalOutcome, EngineError> {
+        let session_id = self.session_of_pane(pane_id)?;
+        let outcome = if self.is_restored_record(pane_id) {
+            self.start_pane_inner(pane_id, &RestartPolicy::default())?;
+            SignalOutcome::Immediate
+        } else {
+            self.supervision.restart(pane_id, reset_backoff, grace)?
+        };
+        self.persist_session(session_id);
+        Ok(outcome)
+    }
+
+    /// Starts a pane that is stopped, exited, failed or in backoff; fails with `PaneRunning`
+    /// if its process is running.
+    pub fn start_pane(&self, pane_id: Uuid) -> Result<(), EngineError> {
+        let session_id = self.session_of_pane(pane_id)?;
+        self.start_pane_inner(pane_id, &RestartPolicy::default())?;
+        self.persist_session(session_id);
+        Ok(())
+    }
+
+    pub fn reset_restart_budget(&self, pane_id: Uuid) -> Result<(), EngineError> {
+        let session_id = self.session_of_pane(pane_id)?;
+        self.supervision.reset_budget(pane_id)?;
+        self.persist_session(session_id);
+        Ok(())
     }
 
     /// Registers (or updates) `client_id`'s reported viewport for
@@ -1054,7 +1331,7 @@ impl Engine {
         let record = {
             let sessions = self.sessions.lock().unwrap();
             let panes = self.panes.lock().unwrap();
-            Self::snapshot_persisted_record(&sessions, &panes, session_id)
+            self.snapshot_persisted_record(&sessions, &panes, session_id)
         };
         self.save_persisted(record);
 
@@ -1112,7 +1389,7 @@ impl Engine {
             .map(|w| WindowSnapshot {
                 id: w.id,
                 name: w.name.clone(),
-                layout: layout_to_snapshot(&w.layout, &panes),
+                layout: layout_to_snapshot(&w.layout, &panes, &self.supervision),
             })
     }
 
@@ -1128,7 +1405,7 @@ impl Engine {
         let panes = self.panes.lock().unwrap();
         sessions
             .get(&session_id)
-            .map(|session| session_to_snapshot(session, &panes))
+            .map(|session| session_to_snapshot(session, &panes, &self.supervision))
     }
 
     /// How many clients are currently attached to a pane within this
@@ -1148,6 +1425,7 @@ impl Engine {
 fn session_to_snapshot(
     session: &SessionState,
     panes: &HashMap<Uuid, PaneEntry>,
+    supervision: &Supervision,
 ) -> SessionSnapshot {
     let windows: Vec<WindowSnapshot> = session
         .windows
@@ -1155,7 +1433,7 @@ fn session_to_snapshot(
         .map(|w| WindowSnapshot {
             id: w.id,
             name: w.name.clone(),
-            layout: layout_to_snapshot(&w.layout, panes),
+            layout: layout_to_snapshot(&w.layout, panes, supervision),
         })
         .collect();
     let live = windows.iter().any(|w| window_has_live_pane(&w.layout));
@@ -1176,7 +1454,11 @@ fn window_has_live_pane(layout: &LayoutSnapshot) -> bool {
     }
 }
 
-fn layout_to_snapshot(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> LayoutSnapshot {
+fn layout_to_snapshot(
+    node: &LayoutNode,
+    panes: &HashMap<Uuid, PaneEntry>,
+    supervision: &Supervision,
+) -> LayoutSnapshot {
     match node {
         LayoutNode::Leaf { pane_id } => {
             let (rows, cols, live, cwd) = match panes.get(pane_id) {
@@ -1198,6 +1480,7 @@ fn layout_to_snapshot(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> La
                 cols,
                 live,
                 cwd,
+                state: pane_state(supervision, *pane_id, live),
             })
         }
         LayoutNode::Split {
@@ -1207,7 +1490,7 @@ fn layout_to_snapshot(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> La
             orientation: *orientation,
             children: children
                 .iter()
-                .map(|(c, ratio)| (layout_to_snapshot(c, panes), *ratio))
+                .map(|(c, ratio)| (layout_to_snapshot(c, panes, supervision), *ratio))
                 .collect(),
         },
     }
@@ -1218,7 +1501,7 @@ fn layout_to_snapshot(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> La
 /// touched yet. See [`layout_to_handle`]/[`handle_to_layout_snapshot`].
 enum PaneHandle {
     Live(Arc<Pane>),
-    Dead(PersistedPaneRecord),
+    Dead(Box<PersistedPaneRecord>),
     Missing,
 }
 
@@ -1290,7 +1573,7 @@ fn layout_to_handle(node: &LayoutNode, panes: &HashMap<Uuid, PaneEntry>) -> Layo
 /// reintroduce, on the read side, the exact lock-held-across-a-blocking-
 /// call hang class the write side (window resize itself) was already
 /// designed to avoid (Story 3.4 AC3).
-fn handle_to_layout_snapshot(handle: &LayoutHandle) -> LayoutSnapshot {
+fn handle_to_layout_snapshot(handle: &LayoutHandle, supervision: &Supervision) -> LayoutSnapshot {
     match handle {
         LayoutHandle::Leaf { pane_id, handle } => {
             let (rows, cols, live, cwd) = match handle {
@@ -1312,6 +1595,7 @@ fn handle_to_layout_snapshot(handle: &LayoutHandle) -> LayoutSnapshot {
                 cols,
                 live,
                 cwd,
+                state: pane_state(supervision, *pane_id, live),
             })
         }
         LayoutHandle::Split {
@@ -1321,10 +1605,20 @@ fn handle_to_layout_snapshot(handle: &LayoutHandle) -> LayoutSnapshot {
             orientation: *orientation,
             children: children
                 .iter()
-                .map(|(c, ratio)| (handle_to_layout_snapshot(c), *ratio))
+                .map(|(c, ratio)| (handle_to_layout_snapshot(c, supervision), *ratio))
                 .collect(),
         },
     }
+}
+
+/// The supervision state, falling back to what liveness alone says for a pane the supervisor
+/// does not know (never the case for panes the engine created).
+fn pane_state(supervision: &Supervision, pane_id: Uuid, live: bool) -> LifecycleState {
+    supervision.state_of(pane_id).unwrap_or(if live {
+        LifecycleState::Live
+    } else {
+        LifecycleState::Exited
+    })
 }
 
 fn default_shell() -> String {
@@ -1774,7 +2068,7 @@ mod tests {
             let mut panes = engine.panes.lock().unwrap();
             panes.insert(
                 pane_a,
-                PaneEntry::Dead(PersistedPaneRecord {
+                PaneEntry::Dead(Box::new(PersistedPaneRecord {
                     pane_id: pane_a,
                     command: "/bin/sh".to_string(),
                     cwd: "/".to_string(),
@@ -1782,7 +2076,8 @@ mod tests {
                     cols: 40,
                     exit_code: None,
                     launch: Default::default(),
-                }),
+                    restart: None,
+                })),
             );
         }
 

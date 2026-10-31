@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Code, ConnectError, createClient, type ConnectRouter } from "@connectrpc/connect";
 import { connectNodeAdapter, createGrpcTransport } from "@connectrpc/connect-node";
-import { TymuxService, type AttachRequest } from "../gen/tymux/v1/tymux_pb.js";
+import { PaneState, RestartMode, TymuxService, type AttachRequest } from "../gen/tymux/v1/tymux_pb.js";
 import { runAttachDemo } from "../examples/attach.js";
 import { tymuxClient } from "../examples/client.js";
 import { capturePane } from "../examples/capture-pane.js";
@@ -584,3 +584,49 @@ test(
     }
   },
 );
+
+// ADR-0007: restart policy and lifecycle RPCs through the generated client. A policy given at
+// creation is reported with defaults resolved, StopPane parks the pane, StartPane and
+// RestartPane bring a process back, and starting a running pane is refused.
+test("pane lifecycle RPCs drive restart policy, stop, start and restart", async () => {
+  const info = await client.getServerInfo({});
+  assert.ok(info.capabilities.includes("pane.lifecycle"), "daemon advertises pane.lifecycle");
+
+  const session = await client.createSession({
+    name: "ts-lifecycle",
+    command: "/bin/sh",
+    args: ["-c", "exec sleep 300"],
+    restartPolicy: { mode: RestartMode.ON_FAILURE, maxRestarts: 2 },
+  });
+  const node = session.windows[0]?.layout?.node;
+  assert.equal(node?.case, "pane");
+  const paneId = node?.case === "pane" ? node.value.id : "";
+
+  let status = await client.getPaneStatus({ paneId });
+  assert.equal(status.state, PaneState.LIVE);
+  assert.ok(status.pid);
+  assert.equal(status.policy?.mode, RestartMode.ON_FAILURE);
+  assert.equal(status.policy?.maxRestarts, 2);
+  assert.equal(status.policy?.windowMs, 60000n, "unset fields come back resolved to defaults");
+
+  status = await client.stopPane({ paneId });
+  assert.equal(status.state, PaneState.STOPPED);
+  assert.equal(status.lastExitSignal, 15);
+
+  status = await client.startPane({ paneId });
+  assert.equal(status.state, PaneState.LIVE);
+  const firstPid = status.pid;
+  await assert.rejects(client.startPane({ paneId }), (err: unknown) => {
+    return err instanceof ConnectError && err.code === Code.FailedPrecondition;
+  });
+
+  status = await client.restartPane({ paneId });
+  assert.equal(status.state, PaneState.LIVE);
+  assert.notEqual(status.pid, firstPid);
+
+  await assert.rejects(
+    client.setRestartPolicy({ target: { case: "paneId", value: paneId }, policy: {} }),
+    (err: unknown) => err instanceof ConnectError && err.code === Code.InvalidArgument,
+  );
+  await client.killSession({ sessionId: session.id });
+});

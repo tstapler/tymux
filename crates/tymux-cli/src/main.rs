@@ -17,9 +17,11 @@ use tonic::Request;
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
     attach_event, attach_request, layout::Node, AttachRequest, CapturePaneRequest,
-    ClosePaneRequest, CreateSessionRequest, CreateWindowRequest, KillSessionRequest,
-    ListSessionsRequest, Orientation, Pane as ProtoPane, Resize, ReviveSessionRequest,
-    ReviveSessionResponse, Session, SplitPaneRequest, Window,
+    ClosePaneRequest, CreateSessionRequest, CreateWindowRequest, GetPaneStatusRequest,
+    KillSessionRequest, ListSessionsRequest, Orientation, Pane as ProtoPane, PaneState, PaneStatus,
+    ResetRestartBudgetRequest, Resize, RestartMode, RestartPaneRequest, RestartPolicy,
+    ReviveSessionRequest, ReviveSessionResponse, Session, SetRestartPolicyRequest,
+    SplitPaneRequest, StartPaneRequest, StopPaneRequest, Window,
 };
 
 use config::{Action, TymuxConfig};
@@ -381,6 +383,10 @@ enum Command {
         /// is what `tymux kill` takes.
         #[arg(short = 'd', long)]
         detach: bool,
+        /// Restart the process automatically after it exits (see `tymux policy` for the
+        /// backoff and budget settings; default: never).
+        #[arg(long, value_enum)]
+        restart: Option<RestartModeArg>,
     },
     /// List sessions on the daemon.
     Ls,
@@ -404,6 +410,184 @@ enum Command {
     KillPane { target: String },
     /// Print a pane's current screen as plain text, e.g. `tymux capture myproject:0.0`.
     Capture { target: String },
+    /// Show a pane's lifecycle state, restart policy and counters, e.g. `tymux status myproject:0.0`.
+    Status { target: String },
+    /// Replace a pane's process now (SIGTERM, then SIGKILL after the grace period); a dead pane
+    /// is started immediately. Not charged to the restart budget.
+    Restart {
+        target: String,
+        /// Also clear the backoff delay and the restart budget.
+        #[arg(long)]
+        reset_backoff: bool,
+        /// Milliseconds between SIGTERM and SIGKILL (default 5000).
+        #[arg(long)]
+        grace_ms: Option<u64>,
+    },
+    /// Stop a pane's process and keep it from restarting until `tymux start`.
+    Stop {
+        target: String,
+        /// Milliseconds between SIGTERM and SIGKILL (default 5000).
+        #[arg(long)]
+        grace_ms: Option<u64>,
+    },
+    /// Start a pane that is stopped, exited or failed, with a fresh restart budget.
+    Start { target: String },
+    /// Show a pane's restart policy, or change it with the flags below (unset flags keep their
+    /// current value).
+    Policy {
+        target: String,
+        #[command(flatten)]
+        flags: PolicyFlags,
+        /// Clear the backoff delay and the restart budget (a failed pane becomes exited; use
+        /// `tymux start` to run it).
+        #[arg(long)]
+        reset_budget: bool,
+    },
+}
+
+/// When a pane's process is restarted automatically.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartModeArg {
+    Never,
+    OnFailure,
+    Always,
+    UnlessStopped,
+}
+
+impl From<RestartModeArg> for RestartMode {
+    fn from(m: RestartModeArg) -> Self {
+        match m {
+            RestartModeArg::Never => RestartMode::Never,
+            RestartModeArg::OnFailure => RestartMode::OnFailure,
+            RestartModeArg::Always => RestartMode::Always,
+            RestartModeArg::UnlessStopped => RestartMode::UnlessStopped,
+        }
+    }
+}
+
+#[derive(clap::Args, Debug, Default)]
+struct PolicyFlags {
+    #[arg(long, value_enum)]
+    mode: Option<RestartModeArg>,
+    /// Automatic restarts allowed within the window before the pane is marked failed.
+    #[arg(long)]
+    max_restarts: Option<u32>,
+    /// Sliding window the budget is counted over; 0 = lifetime budget.
+    #[arg(long)]
+    window_ms: Option<u64>,
+    #[arg(long)]
+    initial_delay_ms: Option<u64>,
+    #[arg(long)]
+    multiplier: Option<f64>,
+    #[arg(long)]
+    max_delay_ms: Option<u64>,
+    /// Fraction of the delay randomized either way, 0 to 1.
+    #[arg(long)]
+    jitter: Option<f64>,
+    /// A run at least this long resets the backoff delay.
+    #[arg(long)]
+    healthy_after_ms: Option<u64>,
+}
+
+impl PolicyFlags {
+    fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.max_restarts.is_none()
+            && self.window_ms.is_none()
+            && self.initial_delay_ms.is_none()
+            && self.multiplier.is_none()
+            && self.max_delay_ms.is_none()
+            && self.jitter.is_none()
+            && self.healthy_after_ms.is_none()
+    }
+
+    /// `current` with every flag that was given laid over it.
+    fn apply_to(&self, mut current: RestartPolicy) -> RestartPolicy {
+        if let Some(mode) = self.mode {
+            current.mode = RestartMode::from(mode) as i32;
+        }
+        current.max_restarts = self.max_restarts.or(current.max_restarts);
+        current.window_ms = self.window_ms.or(current.window_ms);
+        current.initial_delay_ms = self.initial_delay_ms.or(current.initial_delay_ms);
+        current.multiplier = self.multiplier.or(current.multiplier);
+        current.max_delay_ms = self.max_delay_ms.or(current.max_delay_ms);
+        current.jitter = self.jitter.or(current.jitter);
+        current.healthy_after_ms = self.healthy_after_ms.or(current.healthy_after_ms);
+        current
+    }
+}
+
+fn state_label(state: i32) -> &'static str {
+    match PaneState::try_from(state) {
+        Ok(PaneState::Live) => "LIVE",
+        Ok(PaneState::Exited) => "EXITED",
+        Ok(PaneState::Backoff) => "BACKOFF",
+        Ok(PaneState::Restarting) => "RESTARTING",
+        Ok(PaneState::Failed) => "FAILED",
+        Ok(PaneState::Stopped) => "STOPPED",
+        Ok(PaneState::Unspecified) | Err(_) => "UNKNOWN",
+    }
+}
+
+fn mode_label(mode: i32) -> &'static str {
+    match RestartMode::try_from(mode) {
+        Ok(RestartMode::Never) => "never",
+        Ok(RestartMode::OnFailure) => "on-failure",
+        Ok(RestartMode::Always) => "always",
+        Ok(RestartMode::UnlessStopped) => "unless-stopped",
+        Ok(RestartMode::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+fn seconds(ms: u64) -> String {
+    format!("{:.1}s", ms as f64 / 1000.0)
+}
+
+fn format_policy(p: &RestartPolicy) -> String {
+    let window = match p.window_ms.unwrap_or_default() {
+        0 => "lifetime".to_string(),
+        ms => format!("per {}", seconds(ms)),
+    };
+    format!(
+        "{} (max {} restarts {window}; backoff {} x{} up to {}, jitter {:.0}%; healthy after {})",
+        mode_label(p.mode),
+        p.max_restarts.unwrap_or_default(),
+        seconds(p.initial_delay_ms.unwrap_or_default()),
+        p.multiplier.unwrap_or_default(),
+        seconds(p.max_delay_ms.unwrap_or_default()),
+        p.jitter.unwrap_or_default() * 100.0,
+        seconds(p.healthy_after_ms.unwrap_or_default()),
+    )
+}
+
+/// The `tymux status` text: state with what it is waiting for, then policy, counters, last exit.
+fn format_status(s: &PaneStatus) -> String {
+    let now = u64::try_from(s.now_unix_ms).unwrap_or_default();
+    let mut state = state_label(s.state).to_string();
+    if let Some(at) = s.next_restart_at_unix_ms {
+        let wait = u64::try_from(at).unwrap_or_default().saturating_sub(now);
+        state.push_str(&format!(" (restart in {})", seconds(wait)));
+    }
+    if let Some(pid) = s.pid {
+        state.push_str(&format!(" (pid {pid}, up {})", seconds(s.uptime_ms)));
+    }
+    let last_exit = match (s.last_exit_code, s.last_exit_at_unix_ms) {
+        (code, Some(at)) => {
+            let ago = now.saturating_sub(u64::try_from(at).unwrap_or_default());
+            let how = match (code, s.last_exit_signal) {
+                (_, Some(sig)) => format!("signal {sig}"),
+                (Some(c), None) => format!("code {c}"),
+                (None, None) => "unknown status".to_string(),
+            };
+            format!("{how}, {} ago", seconds(ago))
+        }
+        _ => "never".to_string(),
+    };
+    let policy = s.policy.as_ref().map(format_policy).unwrap_or_default();
+    format!(
+        "pane:      {}\nstate:     {state}\npolicy:    {policy}\nrestarts:  {} total, {} in window, {} consecutive failures\nlast exit: {last_exit}\n",
+        s.pane_id, s.restart_count, s.restarts_in_window, s.consecutive_failures
+    )
 }
 
 /// Restores the local terminal out of raw mode on drop, including on
@@ -555,12 +739,17 @@ async fn run() -> Result<()> {
             name,
             command,
             detach,
+            restart,
         } => {
             let session = client
                 .create_session(CreateSessionRequest {
                     name: name.clone(),
                     command: command.unwrap_or_default(),
                     cwd: String::new(),
+                    restart_policy: restart.map(|mode| RestartPolicy {
+                        mode: RestartMode::from(mode) as i32,
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 })
                 .await?
@@ -660,6 +849,84 @@ async fn run() -> Result<()> {
                 .await?
                 .into_inner();
             print_close_pane_outcome(&resp);
+        }
+        Command::Status { target } => {
+            let pane = resolve_target(&mut client, &TargetString::parse(&target)?).await?;
+            let status = client
+                .get_pane_status(GetPaneStatusRequest { pane_id: pane.id })
+                .await?
+                .into_inner();
+            print!("{}", format_status(&status));
+        }
+        Command::Restart {
+            target,
+            reset_backoff,
+            grace_ms,
+        } => {
+            let pane = resolve_target(&mut client, &TargetString::parse(&target)?).await?;
+            let status = client
+                .restart_pane(RestartPaneRequest {
+                    pane_id: pane.id,
+                    reset_backoff,
+                    grace_ms,
+                })
+                .await?
+                .into_inner();
+            print!("{}", format_status(&status));
+        }
+        Command::Stop { target, grace_ms } => {
+            let pane = resolve_target(&mut client, &TargetString::parse(&target)?).await?;
+            let status = client
+                .stop_pane(StopPaneRequest {
+                    pane_id: pane.id,
+                    grace_ms,
+                })
+                .await?
+                .into_inner();
+            print!("{}", format_status(&status));
+        }
+        Command::Start { target } => {
+            let pane = resolve_target(&mut client, &TargetString::parse(&target)?).await?;
+            let status = client
+                .start_pane(StartPaneRequest { pane_id: pane.id })
+                .await?
+                .into_inner();
+            print!("{}", format_status(&status));
+        }
+        Command::Policy {
+            target,
+            flags,
+            reset_budget,
+        } => {
+            let pane = resolve_target(&mut client, &TargetString::parse(&target)?).await?;
+            let mut status = client
+                .get_pane_status(GetPaneStatusRequest {
+                    pane_id: pane.id.clone(),
+                })
+                .await?
+                .into_inner();
+            if !flags.is_empty() {
+                let policy = flags.apply_to(status.policy.unwrap_or_default());
+                status = client
+                    .set_restart_policy(SetRestartPolicyRequest {
+                        target: Some(tymux_proto::v1::set_restart_policy_request::Target::PaneId(
+                            pane.id.clone(),
+                        )),
+                        policy: Some(policy),
+                        apply_to_existing_panes: false,
+                    })
+                    .await?
+                    .into_inner()
+                    .status
+                    .unwrap_or(status);
+            }
+            if reset_budget {
+                status = client
+                    .reset_restart_budget(ResetRestartBudgetRequest { pane_id: pane.id })
+                    .await?
+                    .into_inner();
+            }
+            print!("{}", format_status(&status));
         }
     }
 
@@ -794,6 +1061,7 @@ async fn attach(
         // and sending a real resume token is Epic 6.1's job. `None` here
         // behaves identically to a pre-feature client's request.
         resume_from_seq: None,
+        subscribe_lifecycle: false,
     })
     .await?;
 
@@ -951,6 +1219,7 @@ async fn attach(
                                 // Epic 1.1 / Task 1.1.1b: resume_from_seq only
                                 // has meaning on the first message; not used here.
                                 resume_from_seq: None,
+                                subscribe_lifecycle: false,
                             }).await?;
                         }
                         ReassembledOutput::Action(action) => match action {
@@ -1152,6 +1421,7 @@ async fn send_resize_and_repaint(
         // Epic 1.1 / Task 1.1.1b: resume_from_seq only has meaning on the
         // first message; not used here.
         resume_from_seq: None,
+        subscribe_lifecycle: false,
     })
     .await?;
 
@@ -1636,6 +1906,7 @@ mod tests {
         tx.send(AttachRequest {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -1677,6 +1948,7 @@ mod tests {
                 "missing-token-test-pane".to_string(),
             )),
             resume_from_seq: None,
+            subscribe_lifecycle: false,
         })
         .await
         .unwrap();
@@ -1690,6 +1962,141 @@ mod tests {
 
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    fn status_fixture() -> PaneStatus {
+        PaneStatus {
+            pane_id: "p1".into(),
+            state: PaneState::Backoff as i32,
+            policy: Some(RestartPolicy {
+                mode: RestartMode::OnFailure as i32,
+                max_restarts: Some(5),
+                window_ms: Some(60_000),
+                initial_delay_ms: Some(1_000),
+                multiplier: Some(2.0),
+                max_delay_ms: Some(30_000),
+                jitter: Some(0.2),
+                healthy_after_ms: Some(10_000),
+            }),
+            restart_count: 2,
+            restarts_in_window: 2,
+            consecutive_failures: 2,
+            last_exit_code: Some(3),
+            last_exit_at_unix_ms: Some(998_000),
+            next_restart_at_unix_ms: Some(1_002_500),
+            now_unix_ms: 1_000_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn format_status_should_show_state_countdown_policy_counters_and_last_exit() {
+        let text = format_status(&status_fixture());
+        assert!(
+            text.contains("state:     BACKOFF (restart in 2.5s)"),
+            "{text}"
+        );
+        assert!(text.contains("on-failure (max 5 restarts per 60.0s; backoff 1.0s x2 up to 30.0s, jitter 20%; healthy after 10.0s)"), "{text}");
+        assert!(
+            text.contains("2 total, 2 in window, 2 consecutive failures"),
+            "{text}"
+        );
+        assert!(text.contains("last exit: code 3, 2.0s ago"), "{text}");
+    }
+
+    #[test]
+    fn format_status_should_show_pid_and_uptime_for_a_running_pane_and_never_for_no_exit() {
+        let mut s = status_fixture();
+        s.state = PaneState::Live as i32;
+        s.next_restart_at_unix_ms = None;
+        s.last_exit_code = None;
+        s.last_exit_at_unix_ms = None;
+        s.pid = Some(4242);
+        s.uptime_ms = 61_500;
+        let text = format_status(&s);
+        assert!(text.contains("LIVE (pid 4242, up 61.5s)"), "{text}");
+        assert!(text.contains("last exit: never"), "{text}");
+    }
+
+    #[test]
+    fn policy_flags_should_overlay_only_the_flags_given() {
+        let current = status_fixture().policy.unwrap();
+        let flags = PolicyFlags {
+            mode: Some(RestartModeArg::Always),
+            max_restarts: Some(9),
+            ..PolicyFlags::default()
+        };
+        assert!(!flags.is_empty());
+        assert!(PolicyFlags::default().is_empty());
+        let merged = flags.apply_to(current);
+        assert_eq!(merged.mode, RestartMode::Always as i32);
+        assert_eq!(merged.max_restarts, Some(9));
+        assert_eq!(merged.window_ms, current.window_ms);
+        assert_eq!(merged.multiplier, current.multiplier);
+    }
+
+    #[test]
+    fn lifecycle_subcommands_should_parse_with_their_flags() {
+        match parse(&[
+            "restart",
+            "work:0.0",
+            "--reset-backoff",
+            "--grace-ms",
+            "250",
+        ])
+        .command
+        {
+            Command::Restart {
+                target,
+                reset_backoff,
+                grace_ms,
+            } => {
+                assert_eq!(target, "work:0.0");
+                assert!(reset_backoff);
+                assert_eq!(grace_ms, Some(250));
+            }
+            other => panic!("expected Restart, got {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["stop", "work"]).command,
+            Command::Stop { grace_ms: None, .. }
+        ));
+        assert!(matches!(
+            parse(&["start", "work"]).command,
+            Command::Start { .. }
+        ));
+        assert!(matches!(
+            parse(&["status", "work"]).command,
+            Command::Status { .. }
+        ));
+        match parse(&[
+            "policy",
+            "work",
+            "--mode",
+            "on-failure",
+            "--jitter",
+            "0.5",
+            "--reset-budget",
+        ])
+        .command
+        {
+            Command::Policy {
+                flags,
+                reset_budget,
+                ..
+            } => {
+                assert_eq!(flags.mode, Some(RestartModeArg::OnFailure));
+                assert_eq!(flags.jitter, Some(0.5));
+                assert!(reset_budget);
+            }
+            other => panic!("expected Policy, got {other:?}"),
+        }
+        match parse(&["new", "--restart", "unless-stopped"]).command {
+            Command::New { restart, .. } => {
+                assert_eq!(restart, Some(RestartModeArg::UnlessStopped));
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
     }
 
     fn parse(args: &[&str]) -> Cli {
@@ -1833,6 +2240,43 @@ mod tests {
                 &self,
                 _request: tonic::Request<tonic::Streaming<AttachRequest>>,
             ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn set_restart_policy(
+                &self,
+                _request: tonic::Request<SetRestartPolicyRequest>,
+            ) -> Result<tonic::Response<tymux_proto::v1::SetRestartPolicyResponse>, tonic::Status>
+            {
+                unreachable!("test never issues RPCs")
+            }
+            async fn get_pane_status(
+                &self,
+                _request: tonic::Request<GetPaneStatusRequest>,
+            ) -> Result<tonic::Response<PaneStatus>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn restart_pane(
+                &self,
+                _request: tonic::Request<RestartPaneRequest>,
+            ) -> Result<tonic::Response<PaneStatus>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn stop_pane(
+                &self,
+                _request: tonic::Request<StopPaneRequest>,
+            ) -> Result<tonic::Response<PaneStatus>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn start_pane(
+                &self,
+                _request: tonic::Request<StartPaneRequest>,
+            ) -> Result<tonic::Response<PaneStatus>, tonic::Status> {
+                unreachable!("test never issues RPCs")
+            }
+            async fn reset_restart_budget(
+                &self,
+                _request: tonic::Request<ResetRestartBudgetRequest>,
+            ) -> Result<tonic::Response<PaneStatus>, tonic::Status> {
                 unreachable!("test never issues RPCs")
             }
         }
@@ -2173,10 +2617,12 @@ mod tests {
                 name,
                 command,
                 detach,
+                restart,
             } => {
                 assert_eq!(name, "default");
                 assert_eq!(command, None);
                 assert!(!detach);
+                assert_eq!(restart, None);
             }
             other => panic!("expected Command::New, got a different variant: {other:?}"),
         }
@@ -2329,6 +2775,7 @@ mod tests {
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Live as i32,
             cwd: String::new(),
+            ..Default::default()
         }
     }
 
@@ -2442,6 +2889,7 @@ mod tests {
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Dead as i32,
             cwd: String::new(),
+            ..Default::default()
         };
         let err = check_attach_liveness(&pane, "myproject").unwrap_err();
         let msg = err.to_string();
@@ -2463,6 +2911,7 @@ mod tests {
             cols: 80,
             liveness: tymux_proto::v1::Liveness::Live as i32,
             cwd: String::new(),
+            ..Default::default()
         };
         assert!(check_attach_liveness(&pane, "myproject").is_ok());
     }
