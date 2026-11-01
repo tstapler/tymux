@@ -75,7 +75,8 @@ func main() {
 	uncap := flag.Bool("uncap-frames", false, "lift Chrome's 60 Hz frame cap (removes the vsync floor from paint latency)")
 	chromeArgs := flag.String("chrome-args", "", "extra space-separated Chrome flags")
 	out := flag.String("out", "", "write results JSON here (default: print the table only)")
-	diffOut := flag.String("benchdiff-out", "", "also write benchdiff canonical JSON here (for tstapler/benchdiff)")
+	diffOut := flag.String("benchdiff-out", "", "also write benchdiff canonical JSON here (all engines, for comparing commits)")
+	diffDir := flag.String("benchdiff-engines-dir", "", "also write one benchdiff JSON per engine into this directory (for comparing engines)")
 	flag.Parse()
 
 	chromeBin := *chrome
@@ -160,6 +161,19 @@ func main() {
 			fatalf("write %s: %v", *diffOut, err)
 		}
 		fmt.Fprintf(os.Stderr, "wrote %s\n", *diffOut)
+	}
+	if *diffDir != "" {
+		if err := os.MkdirAll(*diffDir, 0o755); err != nil {
+			fatalf("%v", err)
+		}
+		for engine, f := range res.benchdiffByEngine() {
+			data, _ := json.MarshalIndent(f, "", "  ")
+			path := *diffDir + "/" + engine + ".json"
+			if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+				fatalf("write %s: %v", path, err)
+			}
+			fmt.Fprintf(os.Stderr, "wrote %s\n", path)
+		}
 	}
 }
 

@@ -70,7 +70,24 @@ jobs:
           mkdir -p "$RUNNER_TEMP/head"
           scripts/termbench.sh --quick --chrome-args --no-sandbox \
             --out "$RUNNER_TEMP/termbench-full.json" \
-            --benchdiff-out "$RUNNER_TEMP/head/termbench.json"
+            --benchdiff-out "$RUNNER_TEMP/head/termbench.json" \
+            --benchdiff-engines-dir "$RUNNER_TEMP/engines"
+
+      # Same run, two engines: xterm.js is the base, so every row reads as
+      # "ghostty-web relative to xterm.js". Unlike the main comparison there is
+      # no noise filter and no row cap: the whole matrix is the point.
+      - name: compare ghostty-web with xterm.js
+        if: github.event_name == 'pull_request'
+        uses: tstapler/benchdiff@3921c948d6d9cbc538a62d3808d979c06cc13a94 # v0.1.0
+        with:
+          head: ${{ runner.temp }}/engines/ghostty.json
+          base: ${{ runner.temp }}/engines/xterm.json
+          format: benchdiff
+          title: "Terminal latency: ghostty-web vs xterm.js (this run; base = xterm.js, DOM renderer)"
+          tag: termbench
+          threshold: "5"
+          sort: name
+          fail-on-regression: "false"
 
       - name: restore baseline from main
         if: github.event_name == 'pull_request'
@@ -80,20 +97,23 @@ jobs:
           key: termbench-main-${{ github.sha }}
           restore-keys: termbench-main-
 
+      # Skipped until main has a cached run, so the first PRs don't get a
+      # head-only dump of every number. Changed rows only, worst first.
       - name: compare with main
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && hashFiles('base/termbench.json') != ''
         uses: tstapler/benchdiff@3921c948d6d9cbc538a62d3808d979c06cc13a94 # v0.1.0
         with:
           head: ${{ runner.temp }}/head/termbench.json
-          # Empty (head-only report) when main has no cached run yet.
-          base: ${{ hashFiles('base/termbench.json') != '' && 'base/termbench.json' || '' }}
+          base: base/termbench.json
           format: benchdiff
-          title: Terminal latency (xterm.js, ghostty-web)
-          tag: termbench
+          title: Terminal latency vs main (changed rows only)
+          tag: termbench-main
+          only-changed: "true"
+          sort: delta
+          max-rows: "30"
           # Wide on purpose: single quick run on a shared runner.
           threshold: "25"
           min-abs: "1"
-          max-rows: "40"
           fail-on-regression: "false"
 
       - name: stage baseline

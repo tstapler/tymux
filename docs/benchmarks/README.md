@@ -93,13 +93,19 @@ acks after the first animation frame following the terminal's parse. It needs
 Go, npm and Chrome/Chromium.
 
 On PRs that touch the benchmark, `tymuxd`, the proto or the Go client, the
-`Terminal benchmark` workflow runs a `--quick` pass and posts a sticky comment
-comparing it with the latest run on `main` (via
-[tstapler/benchdiff](https://github.com/tstapler/benchdiff); `--benchdiff-out`
-writes its input). It never fails the PR: one quick run on a shared runner, with
-a baseline that may have come from a different runner, is only a smoke signal.
-The comment flags changes over 25% and over 1 ms (or 1 MiB/s), and leaves out
-runs that lost WebGL contexts.
+`Terminal benchmark` workflow runs a `--quick` pass and posts two sticky
+comments via [tstapler/benchdiff](https://github.com/tstapler/benchdiff)
+(`--benchdiff-out` and `--benchdiff-engines-dir` write its input):
+
+- **ghostty-web vs xterm.js** on the same run, every scenario, with xterm.js
+  (DOM renderer) as the base, so each row reads as ghostty-web relative to it.
+- **vs `main`**: only rows that changed by more than 25% and 1 ms (or 1 MiB/s),
+  worst first, once `main` has a cached run.
+
+Both show `total` p50 and p95 and flood throughput; the full set is in the
+`--out` JSON. Neither fails the PR: one quick run on a shared runner, with a
+baseline that may have come from a different runner, is only a smoke signal.
+Runs that lost WebGL contexts are left out.
 
 Engines: `xterm` (DOM renderer), `xterm-webgl`, `ghostty` ([ghostty-web](https://github.com/coder/ghostty-web)).
 Versions are pinned in `bench/termbench/web/package.json`.
