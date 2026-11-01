@@ -90,7 +90,7 @@ those far more than a real regression moves a multiple. The published
 streamed from tymuxd over gRPC shows up in a terminal widget: the Go client
 attaches, relays chunks over a local WebSocket to headless Chrome, and the page
 acks after the first animation frame following the terminal's parse. It needs
-Go, npm and Chrome/Chromium.
+Rust (cargo builds tymuxd), Go, npm and Chrome/Chromium.
 
 On PRs that touch the benchmark, `tymuxd`, the proto or the Go client, the
 `Terminal benchmark` workflow runs a `--quick` pass and posts two sticky
@@ -116,7 +116,7 @@ Versions are pinned in `bench/termbench/web/package.json`.
 | echo | keystroke to painted echo in one pane, with 1 or 16 sessions mounted |
 | echo-load | the same while 3 other sessions flood |
 | flood | SGR-colored text from `yes`, 16 MiB split over 1 or 4 sessions |
-| tui | full 80×24 redraw at ~60 fps on the alternate screen, 1/4/16 sessions |
+| tui | full 80×24 redraw at up to ~60 fps on the alternate screen, 1/4/16 sessions |
 | fanout | one line per 10 ms per session, 1/4/16/64 sessions |
 
 Latency keys in the JSON: `total` is the whole path (echo: from sending the

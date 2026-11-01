@@ -20,6 +20,10 @@ on:
       - "proto/**"
       - "clients/go/**"
       - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "bench/go.mod"
+      - "bench/go.sum"
       - ".github/workflows/termbench.yml"
   push:
     branches: [main]
@@ -32,6 +36,10 @@ on:
       - "proto/**"
       - "clients/go/**"
       - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "bench/go.mod"
+      - "bench/go.sum"
       - ".github/workflows/termbench.yml"
   workflow_dispatch:
 

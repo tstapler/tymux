@@ -75,6 +75,10 @@ func (h *harness) onAck(acks []ack) {
 		}
 		p := h.panes[a.pane]
 		p.mu.Lock()
+		if int(a.seq) >= len(p.recs) {
+			p.mu.Unlock()
+			continue
+		}
 		r := &p.recs[a.seq]
 		r.ackAt, r.parse, r.paint, r.acked = a.at, a.parse, a.pnt, true
 		p.ackedN++
@@ -101,7 +105,7 @@ func (h *harness) attach(p *pane) error {
 		return fmt.Errorf("attach %s: %w", p.id, err)
 	}
 	go h.receive(p, ctx)
-	go h.forward(p)
+	go h.forward(p, ctx)
 	return nil
 }
 
@@ -114,10 +118,13 @@ func (h *harness) receive(p *pane, ctx context.Context) {
 	}()
 	for {
 		p.mu.Lock()
-		for p.queued > maxQueuedBytes {
+		for p.queued > maxQueuedBytes && ctx.Err() == nil {
 			p.cond.Wait()
 		}
 		p.mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
 
 		ev, err := p.stream.Receive()
 		recv := time.Now()
@@ -161,7 +168,7 @@ func (h *harness) receive(p *pane, ctx context.Context) {
 }
 
 // forward sends queued chunks to the page, holding at most cap(window) unacked.
-func (h *harness) forward(p *pane) {
+func (h *harness) forward(p *pane, ctx context.Context) {
 	for {
 		p.mu.Lock()
 		for p.sentN >= len(p.recs) && !p.readDone {
@@ -174,7 +181,11 @@ func (h *harness) forward(p *pane) {
 		i := p.sentN
 		p.mu.Unlock()
 
-		p.window <- struct{}{}
+		select {
+		case p.window <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		p.mu.Lock()
 		data := p.recs[i].data
 		p.recs[i].data = nil
@@ -218,6 +229,11 @@ func (h *harness) close() {
 		if p.cancel != nil {
 			p.cancel()
 		}
+		// Wake receive/forward parked on the cond so they see the cancel and exit.
+		p.mu.Lock()
+		p.readDone = true
+		p.cond.Broadcast()
+		p.mu.Unlock()
 	}
 }
 

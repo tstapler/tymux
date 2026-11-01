@@ -7,7 +7,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build --release -p tymuxd
 (cd bench/termbench/web && npm ci --no-audit --no-fund)
-bin="$(mktemp -d)/termbench"
+bin_dir="$(mktemp -d)"
+trap 'rm -rf "$bin_dir"' EXIT
+bin="$bin_dir/termbench"
 (cd bench && go build -o "$bin" ./termbench)
 "$bin" "$@"
-rm -rf "$(dirname "$bin")"

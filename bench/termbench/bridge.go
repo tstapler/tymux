@@ -36,9 +36,10 @@ type ready struct {
 // Bridge serves the harness page to headless Chrome and relays pty output to
 // it over a WebSocket; acks come back the same way.
 type Bridge struct {
-	ln     net.Listener
-	chrome *exec.Cmd
-	conn   *websocket.Conn
+	ln      net.Listener
+	chrome  *exec.Cmd
+	conn    *websocket.Conn
+	profile string
 
 	hello chan struct{}
 	ready chan ready
@@ -129,6 +130,7 @@ func (b *Bridge) Launch(chrome, window string, uncap bool, extra []string) error
 	if err != nil {
 		return err
 	}
+	b.profile = profile
 	args := []string{
 		"--headless=new", "--user-data-dir=" + profile, "--window-size=" + window,
 		"--no-first-run", "--no-default-browser-check", "--hide-scrollbars", "--mute-audio",
@@ -191,6 +193,9 @@ func (b *Bridge) Close() {
 	if b.chrome != nil && b.chrome.Process != nil {
 		_ = syscall.Kill(-b.chrome.Process.Pid, syscall.SIGKILL)
 		_ = b.chrome.Wait()
+	}
+	if b.profile != "" {
+		_ = os.RemoveAll(b.profile)
 	}
 	b.ln.Close()
 }

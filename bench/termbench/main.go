@@ -19,6 +19,8 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -108,42 +110,58 @@ func main() {
 		fatalf("%v", err)
 	}
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
 	res := Results{Env: collectEnv(chromeBin, *window, *inflight, *uncap, *webDir)}
+	var brMu sync.Mutex
 	var br *Bridge
+	setBridge := func(b *Bridge) {
+		brMu.Lock()
+		br = b
+		brMu.Unlock()
+	}
 	cleanup := func() {
-		if br != nil {
-			br.Close()
+		brMu.Lock()
+		b := br
+		br = nil
+		brMu.Unlock()
+		if b != nil {
+			b.Close()
 		}
 		d.Stop()
 	}
 	go func() { <-sig; cleanup(); os.Exit(130) }()
+	fail := func(format string, a ...any) {
+		cleanup()
+		fatalf(format, a...)
+	}
+	failed := 0
 
 	for _, engine := range strings.Split(*engines, ",") {
-		if br, err = newBridge(*webDir); err != nil {
-			cleanup()
-			fatalf("%v", err)
+		cur, err := newBridge(*webDir)
+		if err != nil {
+			fail("%v", err)
 		}
-		if err := br.Launch(chromeBin, *window, *uncap, strings.Fields(*chromeArgs)); err != nil {
-			cleanup()
-			fatalf("%s: %v", engine, err)
+		setBridge(cur)
+		if err := cur.Launch(chromeBin, *window, *uncap, strings.Fields(*chromeArgs)); err != nil {
+			fail("%s: %v", engine, err)
 		}
 		for _, sc := range sel {
 			for _, n := range sc.sessions {
 				fmt.Fprintf(os.Stderr, "== %s / %s / %d session(s)\n", engine, sc.name, n)
-				run, err := sc.run(d, br, engine, n, sz, *inflight)
+				run, err := sc.run(d, cur, engine, n, sz, *inflight)
 				if err != nil {
 					// Keep what the other cells measured; a failed cell is reported, not hidden.
 					fmt.Fprintf(os.Stderr, "   FAILED: %v\n", err)
+					failed++
 					continue
 				}
-				run.WebGLContextsLost = int(br.lost.Load())
+				run.WebGLContextsLost = int(cur.lost.Load())
 				res.Runs = append(res.Runs, run)
 			}
 		}
-		br.Close()
-		br = nil
+		setBridge(nil)
+		cur.Close()
 	}
 	d.Stop()
 
@@ -151,29 +169,33 @@ func main() {
 	if *out != "" {
 		data, _ := json.MarshalIndent(res, "", "  ")
 		if err := os.WriteFile(*out, append(data, '\n'), 0o644); err != nil {
-			fatalf("write %s: %v", *out, err)
+			fail("write %s: %v", *out, err)
 		}
 		fmt.Fprintf(os.Stderr, "wrote %s\n", *out)
 	}
 	if *diffOut != "" {
 		data, _ := json.MarshalIndent(res.benchdiff(), "", "  ")
 		if err := os.WriteFile(*diffOut, append(data, '\n'), 0o644); err != nil {
-			fatalf("write %s: %v", *diffOut, err)
+			fail("write %s: %v", *diffOut, err)
 		}
 		fmt.Fprintf(os.Stderr, "wrote %s\n", *diffOut)
 	}
 	if *diffDir != "" {
 		if err := os.MkdirAll(*diffDir, 0o755); err != nil {
-			fatalf("%v", err)
+			fail("%v", err)
 		}
 		for engine, f := range res.benchdiffByEngine() {
 			data, _ := json.MarshalIndent(f, "", "  ")
 			path := *diffDir + "/" + engine + ".json"
 			if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
-				fatalf("write %s: %v", path, err)
+				fail("write %s: %v", path, err)
 			}
 			fmt.Fprintf(os.Stderr, "wrote %s\n", path)
 		}
+	}
+	if failed > 0 {
+		fmt.Fprintf(os.Stderr, "%d cell(s) failed\n", failed)
+		os.Exit(1)
 	}
 }
 
