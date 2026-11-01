@@ -1,0 +1,10 @@
+{
+  "name": "termbench-web",
+  "private": true,
+  "description": "Browser terminals (xterm.js, ghostty-web) driven by the termbench Go harness.",
+  "dependencies": {
+    "@xterm/addon-webgl": "0.19.0",
+    "@xterm/xterm": "6.0.0",
+    "ghostty-web": "0.4.0"
+  }
+}
