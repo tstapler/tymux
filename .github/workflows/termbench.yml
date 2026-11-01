@@ -1,0 +1,109 @@
+name: Terminal benchmark
+
+# Runs the browser-terminal latency benchmark (xterm.js / ghostty-web in
+# headless Chrome, fed by tymuxd over gRPC) when something on that path
+# changes, and posts a sticky PR comment comparing it with the latest run on
+# main. Informational only: shared runners are too noisy to gate on, and the
+# baseline may come from a different runner. Publishable numbers still come
+# from `scripts/termbench.sh` on a quiet machine.
+#
+# Third-party actions are pinned to commit SHAs, as in ci.yml.
+
+on:
+  pull_request:
+    paths:
+      - "bench/termbench/**"
+      - "scripts/termbench.sh"
+      - "crates/tymuxd/**"
+      - "crates/tymux-core/**"
+      - "crates/tymux-proto/**"
+      - "proto/**"
+      - "clients/go/**"
+      - "Cargo.lock"
+      - ".github/workflows/termbench.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bench/termbench/**"
+      - "scripts/termbench.sh"
+      - "crates/tymuxd/**"
+      - "crates/tymux-core/**"
+      - "crates/tymux-proto/**"
+      - "proto/**"
+      - "clients/go/**"
+      - "Cargo.lock"
+      - ".github/workflows/termbench.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  termbench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write # sticky comment; read-only on fork PRs, where the report goes to the job summary instead
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, pinned 2026-08-26 -- rust-toolchain.toml's channel="stable" still controls the actual Rust version installed
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: bench/go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: termbench
+
+      - name: benchmark (quick sizes)
+        # google-chrome-stable is preinstalled on ubuntu-latest. --no-sandbox:
+        # the runner image restricts unprivileged user namespaces, which
+        # Chrome's sandbox needs; the page only loads files from this repo.
+        run: |
+          mkdir -p "$RUNNER_TEMP/head"
+          scripts/termbench.sh --quick --chrome-args --no-sandbox \
+            --out "$RUNNER_TEMP/termbench-full.json" \
+            --benchdiff-out "$RUNNER_TEMP/head/termbench.json"
+
+      - name: restore baseline from main
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: base
+          key: termbench-main-${{ github.sha }}
+          restore-keys: termbench-main-
+
+      - name: compare with main
+        if: github.event_name == 'pull_request'
+        uses: tstapler/benchdiff@3921c948d6d9cbc538a62d3808d979c06cc13a94 # v0.1.0
+        with:
+          head: ${{ runner.temp }}/head/termbench.json
+          # Empty (head-only report) when main has no cached run yet.
+          base: ${{ hashFiles('base/termbench.json') != '' && 'base/termbench.json' || '' }}
+          format: benchdiff
+          title: Terminal latency (xterm.js, ghostty-web)
+          tag: termbench
+          # Wide on purpose: single quick run on a shared runner.
+          threshold: "25"
+          min-abs: "1"
+          max-rows: "40"
+          fail-on-regression: "false"
+
+      - name: stage baseline
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p base
+          cp "$RUNNER_TEMP/head/termbench.json" base/termbench.json
+
+      - name: save baseline
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: base
+          key: termbench-main-${{ github.sha }}

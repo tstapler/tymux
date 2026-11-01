@@ -90,8 +90,16 @@ those far more than a real regression moves a multiple. The published
 streamed from tymuxd over gRPC shows up in a terminal widget: the Go client
 attaches, relays chunks over a local WebSocket to headless Chrome, and the page
 acks after the first animation frame following the terminal's parse. It needs
-Go, npm and Chrome/Chromium, and is not part of CI (the numbers depend on the
-GPU stack and on how busy the machine is).
+Go, npm and Chrome/Chromium.
+
+On PRs that touch the benchmark, `tymuxd`, the proto or the Go client, the
+`Terminal benchmark` workflow runs a `--quick` pass and posts a sticky comment
+comparing it with the latest run on `main` (via
+[tstapler/benchdiff](https://github.com/tstapler/benchdiff); `--benchdiff-out`
+writes its input). It never fails the PR: one quick run on a shared runner, with
+a baseline that may have come from a different runner, is only a smoke signal.
+The comment flags changes over 25% and over 1 ms (or 1 MiB/s), and leaves out
+runs that lost WebGL contexts.
 
 Engines: `xterm` (DOM renderer), `xterm-webgl`, `ghostty` ([ghostty-web](https://github.com/coder/ghostty-web)).
 Versions are pinned in `bench/termbench/web/package.json`.
