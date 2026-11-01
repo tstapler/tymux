@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,10 +8,15 @@ use anyhow::Result;
 use portable_pty::CommandBuilder;
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use tokio::sync::{broadcast, Notify};
+
+use crate::restart::LifecycleEvent;
 use uuid::Uuid;
 
 use crate::replay_buffer::{
     allocate_replay_budget, release_replay_budget, ReplayBuffer, ReplayOutcome,
+};
+use crate::terminal_query::{
+    ClientRegistry, Colors, LiveClient, PtyReplyWriter, QueryReplies, QueryResponder, QueryScanner,
 };
 
 /// Epic 5 Story 5.4: vt100's third `Parser::new` arg (how many
@@ -79,6 +84,17 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 pub use crate::launch::Launch;
 use crate::launch::PreparedLaunch;
 
+#[cfg(test)]
+type PushBumpHook = Box<dyn Fn(&Pane) + Send>;
+
+/// Called on the reader thread when the child has exited, after the exit code is recorded and
+/// before `is_exited()` turns true. Returns whether a restart is pending, so attached clients
+/// stay attached (see [`Pane::wait_final_exit`]).
+pub type ExitHook = Arc<dyn Fn(&Pane, Option<i32>) -> bool + Send + Sync>;
+
+/// Lifecycle events a slow subscriber may lag behind before it starts losing the oldest.
+const LIFECYCLE_CHANNEL_CAPACITY: usize = 64;
+
 /// A single pty-backed terminal. Owns the child process, the pty master
 /// (for resize + writing input), and a `vt100::Parser` that keeps a
 /// structured screen model in sync with everything the child prints.
@@ -94,12 +110,12 @@ pub struct Pane {
     pub command: String,
     pub launch: Launch,
     pub cwd: String,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Write end of the `stdin_stream` pipe; `None` once closed, or when the
     /// pane was not created with `stdin_stream`.
     stdin_writer: Mutex<Option<std::fs::File>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<QueryResponder>>>,
     /// Mirrors the `vt100::Parser` screen's current size, updated by
     /// [`Self::resize`] right after the screen itself is resized. Lets
     /// [`Self::size`] answer "what size is this pane right now" without
@@ -119,12 +135,12 @@ pub struct Pane {
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
     /// Epic 2.1: bounded, byte-budgeted log of recent output chunks,
-    /// populated in the reader thread's read loop strictly *after*
-    /// `parser`'s lock is dropped and *before* `output_tx.send` — a
-    /// standalone lock, never nested with `parser` (Pattern Decisions:
-    /// "Replay-buffer locking"), so a resuming reader's buffer-tail read
-    /// can never disagree with what a live subscriber has already
-    /// received.
+    /// populated in the reader thread's read loop inside `parser`'s lock,
+    /// before `output_seq` is bumped and before `output_tx.send`. Lock order
+    /// is parser -> replay only; nothing takes `replay` then `parser`. Having
+    /// the chunk in the buffer before its seq is visible means a resuming
+    /// reader that sees `output_seq == q` always finds chunk `q`. Chunks are
+    /// stored with terminal queries stripped.
     replay: Mutex<ReplayBuffer>,
     /// This pane's granted share of `GLOBAL_REPLAY_BUFFER_BUDGET_BYTES` —
     /// released back to the budget on `Drop`. Stored separately from
@@ -132,6 +148,13 @@ pub struct Pane {
     /// can read the granted amount back out without locking `replay`.
     replay_budget_bytes: usize,
     output_tx: broadcast::Sender<(u64, Vec<u8>)>,
+    /// Attached clients whose emulators answer terminal queries (see `terminal_query`).
+    clients: ClientRegistry,
+    /// Answers terminal queries for the process; re-armed on a new pty by `respawn`.
+    query_replies: Arc<QueryReplies>,
+    /// Test hook run between the replay push and the seq bump, with the replay lock held.
+    #[cfg(test)]
+    push_bump_hook: Mutex<Option<PushBumpHook>>,
     /// Monotonic count of pty-read chunks fed into `parser` so far (Task
     /// 1.3.1a / ADR-003 Amendment). Incremented in the reader thread in
     /// the same critical section as `parser.process(..)`, so a value read
@@ -141,6 +164,10 @@ pub struct Pane {
     /// already reflected in a given snapshot and must not be replayed.
     output_seq: AtomicU64,
     exited: Arc<AtomicBool>,
+    /// Test hook: makes `resize` take at least this long, standing in for the slow reallocation
+    /// huge sizes used to cause (the size clamp removed that).
+    #[cfg(test)]
+    pub(crate) resize_delay_ms: std::sync::atomic::AtomicU64,
     exit_notify: Notify,
     /// The child's numeric exit code, captured by the reader thread's
     /// `_child.wait()` call right after it observes EOF (Story 1.2.2).
@@ -149,8 +176,26 @@ pub struct Pane {
     /// caller that observes `is_exited() == true` is guaranteed to see the
     /// final `exit_code()` value too (write-then-flag, no separate race).
     exit_code: Mutex<Option<i32>>,
-    /// Captured at spawn so `kill` can signal without taking `_child`.
-    pid: Option<u32>,
+    /// Captured at spawn so `kill` can signal without taking `_child`; 0 = none. Replaced by
+    /// [`Self::respawn`].
+    pid: Arc<AtomicU32>,
+    /// Bumped by every respawn, so a delayed SIGKILL aimed at an old process never hits its
+    /// successor.
+    generation: Arc<AtomicU64>,
+    /// The last signal this daemon sent to the child (0 = none); reported as the exit signal.
+    last_signal: AtomicI32,
+    /// A restart is scheduled or in flight, so this pane's exit is not final.
+    restart_pending: AtomicBool,
+    /// The pane was closed: `respawn` must refuse.
+    retired: AtomicBool,
+    /// Serializes `respawn` against `retire`.
+    spawn_lock: Mutex<()>,
+    exit_hook: Mutex<Option<ExitHook>>,
+    /// Set by the reader thread once it has looked for the exit hook (see `set_exit_hook`).
+    exit_checked: AtomicBool,
+    lifecycle_tx: broadcast::Sender<LifecycleEvent>,
+    /// Pulsed on every change `wait_final_exit` cares about: exit, respawn, pending cleared.
+    state_notify: Notify,
     // Held only to keep the child alive; not otherwise touched.
     _child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     // Tracked so the reader thread's lifecycle is at least observable
@@ -184,12 +229,86 @@ impl std::fmt::Display for StdinError {
 
 impl std::error::Error for StdinError {}
 
+/// Largest pane size `Pane::resize` accepts; larger requests are clamped (the engine clamps
+/// viewport reports to the same bound so the size it reports is the size the pane runs at).
+pub const MAX_PANE_ROWS: u16 = 500;
+pub const MAX_PANE_COLS: u16 = 1000;
+
 pub struct PaneSnapshot {
     pub rows: u32,
     pub cols: u32,
     pub grid: Vec<Vec<CellSnapshot>>,
     pub cursor_row: u32,
+    /// Clamped to `cols - 1`; `cursor_pending_wrap` carries the parked-past-the-edge state.
     pub cursor_col: u32,
+    pub cursor_pending_wrap: bool,
+    /// OSC 8 targets as `(uri, id)`; `CellSnapshot::hyperlink` is a 1-based index into this.
+    pub hyperlinks: Vec<(String, String)>,
+    pub title: String,
+    pub modes: TerminalModes,
+    pub cursor_hidden: bool,
+    /// DECSCUSR 0-6.
+    pub cursor_style: u32,
+    /// The grid is the alternate screen.
+    pub alt_screen: bool,
+    /// DECSTBM 1-based; 0/0 = whole screen.
+    pub scroll_top: u32,
+    pub scroll_bottom: u32,
+    /// 0-based columns with a tab stop.
+    pub tab_stops: Vec<u32>,
+    pub charsets: Charsets,
+}
+
+/// Mirrors proto `TerminalModes`; mouse values use the proto's numbering.
+#[derive(Default)]
+pub struct TerminalModes {
+    pub app_cursor_keys: bool,
+    pub app_keypad: bool,
+    pub bracketed_paste: bool,
+    pub focus_events: bool,
+    /// 0 off, 1 X10, 2 normal, 3 button, 4 any.
+    pub mouse_mode: u32,
+    /// 0 default, 1 utf8, 2 sgr, 3 urxvt.
+    pub mouse_encoding: u32,
+    pub reverse_video: bool,
+    pub origin: bool,
+    pub no_autowrap: bool,
+    pub insert: bool,
+    pub newline: bool,
+}
+
+/// Mirrors proto `Charsets`: 0 ASCII, 1 DEC special graphics, 2 UK.
+#[derive(Default)]
+pub struct Charsets {
+    pub g: [u32; 4],
+    pub gl: u32,
+}
+
+fn terminal_modes(screen: &vt100::Screen) -> TerminalModes {
+    TerminalModes {
+        app_cursor_keys: screen.application_cursor(),
+        app_keypad: screen.application_keypad(),
+        bracketed_paste: screen.bracketed_paste(),
+        focus_events: screen.focus_events(),
+        mouse_mode: match screen.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => 0,
+            vt100::MouseProtocolMode::Press => 1,
+            vt100::MouseProtocolMode::PressRelease => 2,
+            vt100::MouseProtocolMode::ButtonMotion => 3,
+            vt100::MouseProtocolMode::AnyMotion => 4,
+        },
+        mouse_encoding: match screen.mouse_protocol_encoding() {
+            vt100::MouseProtocolEncoding::Default => 0,
+            vt100::MouseProtocolEncoding::Utf8 => 1,
+            vt100::MouseProtocolEncoding::Sgr => 2,
+            vt100::MouseProtocolEncoding::Urxvt => 3,
+        },
+        reverse_video: screen.reverse_video(),
+        origin: screen.origin_mode(),
+        no_autowrap: !screen.autowrap(),
+        insert: screen.insert_mode(),
+        newline: screen.newline_mode(),
+    }
 }
 
 pub struct CellSnapshot {
@@ -197,6 +316,11 @@ pub struct CellSnapshot {
     pub fg: u32,
     pub bg: u32,
     pub attrs: u32,
+    /// 0 single, 1 double, 2 curly, 3 dotted, 4 dashed; meaningful when the underline bit is set.
+    pub underline_style: u32,
+    /// Packed like `fg`; 0 = same as the text color.
+    pub underline_color: u32,
+    pub hyperlink: u32,
 }
 
 impl Pane {
@@ -254,61 +378,27 @@ impl Pane {
         rows: u16,
         cols: u16,
     ) -> Result<Arc<Self>> {
-        // Before openpty so a bad argument file or stderr path fails with no
-        // pty allocated.
-        let prepared = launch.prepare()?;
-        let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-
-        #[cfg(unix)]
-        let child: Box<dyn portable_pty::Child + Send + Sync> = {
-            let master_fd = pair
-                .master
-                .as_raw_fd()
-                .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
-            // TYMUXD_TOKEN is stripped inside spawn_on_pty: it's the daemon's
-            // own secret and must never reach a pane's environment
-            // (research/pitfalls.md §2, HIGH PRIORITY).
-            crate::spawn::spawn_on_pty(master_fd, command, launch, &prepared, cwd)?
-        };
-        #[cfg(not(unix))]
-        let child = {
-            if prepared.stderr.is_some() || prepared.stdin.is_some() {
-                anyhow::bail!("stderr_path and stdin_path are only supported on unix");
-            }
-            let mut cmd = CommandBuilder::new(command);
-            cmd.args(&prepared.args);
-            for (key, value) in &launch.env {
-                cmd.env(key, value);
-            }
-            if let Some(cwd) = cwd {
-                cmd.cwd(cwd);
-            }
-            cmd.env_remove("TYMUXD_TOKEN");
-            pair.slave.spawn_command(cmd)?
-        };
-        let pid = child.process_id();
-        drop(pair.slave);
-        // The pane must not hold the pipe's read end: only then does the
-        // write end see EPIPE once the child exits.
-        let PreparedLaunch {
-            stdin_writer,
-            stdin,
-            ..
-        } = prepared;
-        drop(stdin);
-
-        let writer = pair.master.take_writer()?;
-        let mut reader = pair.master.try_clone_reader()?;
+        let process = start_process(command, launch, cwd, rows, cols)?;
 
         let scrollback_lines = allocate_scrollback_budget();
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback_lines)));
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
+        let writer = Arc::new(Mutex::new(process.writer));
+        let replies = Arc::new(QueryReplies::new(
+            #[cfg(unix)]
+            Box::new(PtyReplyWriter::new(process.reply_fd)),
+            #[cfg(not(unix))]
+            Box::new(PtyReplyWriter {
+                writer: writer.clone(),
+            }),
+            Colors::from_env(),
+        ));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            scrollback_lines,
+            QueryResponder::new(replies.clone()),
+        )));
+        let (lifecycle_tx, _) = broadcast::channel(LIFECYCLE_CHANNEL_CAPACITY);
         let replay_budget_bytes = allocate_replay_budget();
 
         let effective_cwd = cwd.map(str::to_string).unwrap_or_else(|| {
@@ -321,9 +411,9 @@ impl Pane {
             command: command.to_string(),
             launch: launch.clone(),
             cwd: effective_cwd,
-            writer: Mutex::new(writer),
-            stdin_writer: Mutex::new(stdin_writer),
-            master: Mutex::new(pair.master),
+            writer,
+            stdin_writer: Mutex::new(process.stdin_writer),
+            master: Mutex::new(process.master),
             parser: parser.clone(),
             rows: AtomicU32::new(rows as u32),
             cols: AtomicU32::new(cols as u32),
@@ -331,20 +421,45 @@ impl Pane {
             replay: Mutex::new(ReplayBuffer::new(replay_budget_bytes)),
             replay_budget_bytes,
             output_tx: output_tx.clone(),
+            clients: ClientRegistry::default(),
+            query_replies: replies.clone(),
+            #[cfg(test)]
+            push_bump_hook: Mutex::new(None),
             output_seq: AtomicU64::new(0),
             exited: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            resize_delay_ms: std::sync::atomic::AtomicU64::new(0),
             exit_notify: Notify::new(),
             exit_code: Mutex::new(None),
-            pid,
-            _child: Mutex::new(child),
+            pid: Arc::new(AtomicU32::new(process.pid.unwrap_or(0))),
+            generation: Arc::new(AtomicU64::new(0)),
+            last_signal: AtomicI32::new(0),
+            restart_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            spawn_lock: Mutex::new(()),
+            exit_hook: Mutex::new(None),
+            exit_checked: AtomicBool::new(false),
+            lifecycle_tx,
+            state_notify: Notify::new(),
+            _child: Mutex::new(process.child),
             _reader_handle: Mutex::new(None),
         });
+        pane.start_reader(process.reader);
+        Ok(pane)
+    }
 
-        // portable_pty's reader is blocking std::io::Read, so it gets its
-        // own OS thread rather than a tokio task.
-        let pane_for_reader = pane.clone();
+    /// Starts the thread that feeds the child's output into the screen model, the replay buffer
+    /// and subscribers, and records the exit when the pty closes. portable_pty's reader is
+    /// blocking `std::io::Read`, so it gets an OS thread rather than a tokio task. One runs per
+    /// process generation; `respawn` starts the next only after the previous one has finished.
+    fn start_reader(self: &Arc<Self>, mut reader: Box<dyn Read + Send>) {
+        let parser = self.parser.clone();
+        let output_tx = self.output_tx.clone();
+        let replies = self.query_replies.clone();
+        let pane_for_reader = self.clone();
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; PTY_READ_BUF_SIZE];
+            let mut scanner = QueryScanner::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -355,24 +470,58 @@ impl Pane {
                         // never be observed out of sync by a concurrent
                         // `snapshot_at_offset_with_seq` reader (ADR-003
                         // Amendment).
-                        let seq = {
+                        //
+                        // Terminal queries: decided once per chunk, before parsing, whether a
+                        // registered client will see it live; if not the daemon answers (from
+                        // the parser callbacks) and clients get the chunk with queries
+                        // stripped. See `terminal_query`.
+                        //
+                        // Epic 2.1: the replay push and the seq bump happen under one `replay`
+                        // lock (order parser -> replay, never the reverse). `replay_since`
+                        // reads `output_seq` under that same lock, so it never returns a chunk
+                        // newer than its `tail_seq`, nor misses a chunk at or below it.
+                        let (seq, daemon_answered, scanned) = {
                             let mut parser = parser.lock().unwrap();
+                            let next = pane_for_reader.output_seq.load(Ordering::SeqCst) + 1;
+                            let daemon_answers = !pane_for_reader.clients.has_answerer(next);
+                            replies.set_daemon_answers(daemon_answers);
                             parser.process(&buf[..n]);
-                            pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst) + 1
+                            let scanned = scanner.feed(&buf[..n]);
+                            {
+                                let mut replay = pane_for_reader.replay.lock().unwrap();
+                                replay.push(next, scanned.stripped());
+                                #[cfg(test)]
+                                pane_for_reader.run_push_bump_hook();
+                                pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst);
+                            }
+                            (next, daemon_answers, scanned)
                         };
-                        // Epic 2.1: pushed into the replay buffer strictly
-                        // *before* the broadcast send below, and on a
-                        // standalone lock never nested with `parser`
-                        // (already dropped above) — see the `replay`
-                        // field's doc comment.
-                        pane_for_reader.replay.lock().unwrap().push(seq, &buf[..n]);
+                        let payload = if daemon_answered {
+                            scanned.stripped()
+                        } else {
+                            &scanned.raw
+                        };
                         // Fails only when nobody is currently attached (no
                         // receivers) — expected and benign (e.g. shell
                         // startup output before the first Attach), not an
-                        // error worth logging.
-                        let _ = output_tx.send((seq, buf[..n].to_vec()));
+                        // error worth logging. An empty payload (everything
+                        // held back as a possible partial query) is not sent.
+                        if !payload.is_empty() {
+                            let _ = output_tx.send((seq, payload.to_vec()));
+                        }
                     }
                 }
+            }
+            replies.close();
+            // A sequence still open at EOF was held back from every consumer; release it.
+            let rest = scanner.take_held();
+            if !rest.is_empty() {
+                let next = pane_for_reader.output_seq.load(Ordering::SeqCst) + 1;
+                let mut replay = pane_for_reader.replay.lock().unwrap();
+                replay.push(next, &rest);
+                pane_for_reader.output_seq.fetch_add(1, Ordering::SeqCst);
+                drop(replay);
+                let _ = output_tx.send((next, rest));
             }
             // Child exited (or the pty read failed, which for a live child
             // is effectively the same signal). Reap it and capture its
@@ -385,6 +534,21 @@ impl Pane {
                 Err(_) => None,
             };
             *pane_for_reader.exit_code.lock().unwrap() = code;
+            // Reaped: from here no signal may be aimed at this pid (it can be recycled), not even
+            // by a SIGKILL escalation already scheduled or a Stop that raced the hook below.
+            pane_for_reader.pid.store(0, Ordering::SeqCst);
+            // The supervisor decides here, before the exit becomes visible, whether a restart
+            // follows, so a client that sees `is_exited()` also sees `restart_pending()`.
+            let hook = {
+                let guard = pane_for_reader.exit_hook.lock().unwrap();
+                pane_for_reader.exit_checked.store(true, Ordering::SeqCst);
+                guard.clone()
+            };
+            // The hook sets `restart_pending` itself under the supervision lock; storing its
+            // return value here would overwrite a concurrent Stop or policy change.
+            if let Some(hook) = hook {
+                hook(&pane_for_reader, code);
+            }
             // Mark it so any current or future `wait_exit()` caller —
             // including one that started waiting after this point —
             // observes it. Stored after `exit_code` above, so any caller
@@ -392,10 +556,154 @@ impl Pane {
             // the final `exit_code()`.
             pane_for_reader.exited.store(true, Ordering::SeqCst);
             pane_for_reader.exit_notify.notify_waiters();
+            pane_for_reader.state_notify.notify_waiters();
         });
-        *pane._reader_handle.lock().unwrap() = Some(handle);
+        *self._reader_handle.lock().unwrap() = Some(handle);
+    }
 
-        Ok(pane)
+    /// Replaces the exited child with a fresh process on a new pty, keeping this pane's id,
+    /// screen, scrollback, replay buffer, size, subscribers and launch spec. Re-reads argument
+    /// files and re-opens the stdin file, as a revive does. Returns the new pid.
+    ///
+    /// Errors if the pane is still running or was closed (`retire`); on a spawn failure nothing
+    /// changes and the pane stays exited.
+    pub fn respawn(self: &Arc<Self>) -> Result<Option<u32>> {
+        self.respawn_with(&|_| Vec::new())
+    }
+
+    /// [`Self::respawn`], plus `banner(pid)` written into the output stream after the new child
+    /// has started but before anything it prints, so the stream shows the boundary in order.
+    pub fn respawn_with(
+        self: &Arc<Self>,
+        banner: &dyn Fn(Option<u32>) -> Vec<u8>,
+    ) -> Result<Option<u32>> {
+        let _guard = self.spawn_lock.lock().unwrap();
+        anyhow::ensure!(!self.retired.load(Ordering::SeqCst), "pane was closed");
+        anyhow::ensure!(self.is_exited(), "pane process is still running");
+        let (rows, cols) = self.size();
+        let process = start_process(
+            &self.command,
+            &self.launch,
+            Some(&self.cwd),
+            rows as u16,
+            cols as u16,
+        )?;
+        // `exited` is the old reader's last write, so it is on its way out and the join is
+        // immediate; doing it here (not in `Drop`) keeps at most one reader thread per pane.
+        if let Some(old) = self._reader_handle.lock().unwrap().take() {
+            let _ = old.join();
+        }
+        *self.writer.lock().unwrap() = process.writer;
+        // A fresh reply writer for the new pty, so the old fd closes and a closed outbox reopens.
+        #[cfg(unix)]
+        self.query_replies
+            .rearm(Box::new(PtyReplyWriter::new(process.reply_fd)));
+        #[cfg(not(unix))]
+        self.query_replies.rearm(Box::new(PtyReplyWriter {
+            writer: self.writer.clone(),
+        }));
+        *self.master.lock().unwrap() = process.master;
+        *self.stdin_writer.lock().unwrap() = process.stdin_writer;
+        *self._child.lock().unwrap() = process.child;
+        let pid = process.pid;
+        self.pid.store(pid.unwrap_or(0), Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.last_signal.store(0, Ordering::SeqCst);
+        *self.exit_code.lock().unwrap() = None;
+        self.exit_checked.store(false, Ordering::SeqCst);
+        // `exited` first: `restart_pending` stays set until the process is running, so a client
+        // never sees "exited and nothing pending" in between. The supervisor clears it after.
+        self.exited.store(false, Ordering::SeqCst);
+        // No reader thread exists yet, so this cannot interleave with the child's output.
+        let banner = banner(pid);
+        if !banner.is_empty() {
+            self.inject_output(&banner);
+        }
+        self.start_reader(process.reader);
+        self.state_notify.notify_waiters();
+        Ok(pid)
+    }
+
+    /// Refuses all future `respawn`s. Called when the pane is closed or its session killed;
+    /// serialized with `respawn` so a restart that is mid-flight finishes first and the caller
+    /// then kills what it started.
+    pub fn retire(&self) {
+        let _guard = self.spawn_lock.lock().unwrap();
+        self.retired.store(true, Ordering::SeqCst);
+        self.restart_pending.store(false, Ordering::SeqCst);
+        self.state_notify.notify_waiters();
+    }
+
+    /// Installs the exit hook. Returns true if the child already exited without seeing it, in
+    /// which case the caller must account for that exit itself.
+    pub fn set_exit_hook(&self, hook: ExitHook) -> bool {
+        let mut guard = self.exit_hook.lock().unwrap();
+        *guard = Some(hook);
+        self.exit_checked.load(Ordering::SeqCst)
+    }
+
+    pub fn restart_pending(&self) -> bool {
+        self.restart_pending.load(Ordering::SeqCst)
+    }
+
+    /// How many times the process has been replaced (0 for the original).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Resolves on the next exit, respawn or pending-restart change. Create it before checking
+    /// the condition being waited on, then await it, so no change is missed.
+    pub fn state_changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.state_notify.notified()
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+
+    /// The running child's pid, if any.
+    pub fn pid(&self) -> Option<u32> {
+        Some(self.pid.load(Ordering::SeqCst)).filter(|p| *p != 0)
+    }
+
+    pub fn set_restart_pending(&self, pending: bool) {
+        let was = self.restart_pending.swap(pending, Ordering::SeqCst);
+        if was != pending {
+            self.state_notify.notify_waiters();
+        }
+    }
+
+    /// The last signal this daemon sent the child, if any.
+    pub fn signal_sent(&self) -> Option<i32> {
+        Some(self.last_signal.load(Ordering::SeqCst)).filter(|s| *s != 0)
+    }
+
+    pub fn subscribe_lifecycle(&self) -> broadcast::Receiver<LifecycleEvent> {
+        self.lifecycle_tx.subscribe()
+    }
+
+    pub fn emit_lifecycle(&self, event: LifecycleEvent) {
+        // No receivers just means nobody is watching.
+        let _ = self.lifecycle_tx.send(event);
+    }
+
+    /// Writes `data` into the output stream as if the child had printed it: it lands in the
+    /// screen, the scrollback, the replay buffer and every subscriber. Used for the marker the
+    /// supervisor leaves where a process died and its successor starts. Call only while no
+    /// reader thread is running (between a child's exit and its respawn).
+    pub fn inject_output(&self, data: &[u8]) {
+        // Same ordering as the reader thread: parser, then replay, with the replay push and the
+        // sequence bump under one replay lock so `replay_since` never sees one without the other.
+        let seq = {
+            let mut parser = self.parser.lock().unwrap();
+            let next = self.output_seq.load(Ordering::SeqCst) + 1;
+            parser.process(data);
+            let mut replay = self.replay.lock().unwrap();
+            replay.push(next, data);
+            self.output_seq.fetch_add(1, Ordering::SeqCst);
+            next
+        };
+        let _ = self.output_tx.send((seq, data.to_vec()));
     }
 
     pub fn is_exited(&self) -> bool {
@@ -435,27 +743,64 @@ impl Pane {
     /// `KillSession` (and the engine's `panes` lock) for ~50ms per pane.
     #[cfg(unix)]
     fn kill_unix(&self) -> Result<()> {
-        let Some(pid) = self.pid else {
+        self.signal_then_kill(libc::SIGHUP, KILL_GRACE)
+    }
+
+    /// Asks the child to stop: SIGTERM now, SIGKILL after `grace` if it is still alive. Like
+    /// [`Self::kill`] it returns at once; await [`Self::wait_exit`] to see the process die.
+    pub fn terminate(&self, grace: Duration) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.signal_then_kill(libc::SIGTERM, grace)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = grace;
+            self._child.lock().unwrap().kill()?;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn signal_then_kill(&self, signal: i32, grace: Duration) -> Result<()> {
+        let pid = self.pid.load(Ordering::SeqCst);
+        if pid == 0 {
             return Ok(());
-        };
+        }
+        self.last_signal.store(signal, Ordering::SeqCst);
         // SAFETY: plain signal to a pid we spawned and have not yet reaped
         // (the reader thread reaps only after pty EOF).
-        if unsafe { libc::kill(pid as i32, libc::SIGHUP) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        if unsafe { libc::kill(pid as i32, signal) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // Already dead and reaped: the exit is on its way to being recorded.
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(err.into());
         }
         if self.is_exited() {
             return Ok(());
         }
         let exited = self.exited.clone();
+        let generation = self.generation.clone();
+        let live_pid = self.pid.clone();
+        let this_generation = generation.load(Ordering::SeqCst);
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + KILL_GRACE;
+            let deadline = std::time::Instant::now() + grace;
             while std::time::Instant::now() < deadline {
-                if exited.load(Ordering::SeqCst) {
+                if exited.load(Ordering::SeqCst)
+                    || generation.load(Ordering::SeqCst) != this_generation
+                {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            if !exited.load(Ordering::SeqCst) {
+            // A respawn clears `exited`, so the generation check is what keeps this from
+            // killing the successor process.
+            if !exited.load(Ordering::SeqCst)
+                && generation.load(Ordering::SeqCst) == this_generation
+                && live_pid.load(Ordering::SeqCst) == pid
+            {
                 // SAFETY: as above; `exited` is set right after the reap.
                 unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             }
@@ -474,6 +819,23 @@ impl Pane {
             }
             let notified = self.exit_notify.notified();
             if self.is_exited() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Like [`Self::wait_exit`], but keeps waiting while a restart is pending: it resolves only
+    /// when the pane has exited and nothing will bring it back (no restart scheduled, or the
+    /// pane was stopped or closed meanwhile). For a pane with no restart policy this is
+    /// identical to `wait_exit`.
+    pub async fn wait_final_exit(&self) {
+        loop {
+            if self.is_exited() && !self.restart_pending() {
+                return;
+            }
+            let notified = self.state_notify.notified();
+            if self.is_exited() && !self.restart_pending() {
                 return;
             }
             notified.await;
@@ -509,6 +871,18 @@ impl Pane {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        // Every row of scrollback and screen costs cols x ~44 bytes, so an absurd client size
+        // would pin gigabytes; clamp instead of trusting the wire value.
+        let (rows, cols) = (rows.min(MAX_PANE_ROWS), cols.min(MAX_PANE_COLS));
+        // A client re-sending its size must not reset the scroll region or pending wrap under a
+        // running full-screen program, and there is nothing to tell the child.
+        if self.size() == (u32::from(rows), u32::from(cols)) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        std::thread::sleep(std::time::Duration::from_millis(
+            self.resize_delay_ms.load(Ordering::SeqCst),
+        ));
         self.master.lock().unwrap().resize(PtySize {
             rows,
             cols,
@@ -536,8 +910,22 @@ impl Pane {
     /// sequence number (from [`Self::snapshot_with_seq`]) tell which
     /// already-subscribed chunks predate that snapshot and must not be
     /// replayed on top of it (ADR-003 Amendment).
+    /// Registers an attached client as the answerer of terminal queries. Until
+    /// [`LiveClient::go_live_after`] is called the daemon keeps answering; call it with the seq
+    /// the client's priming snapshot/replay covers. Hold the handle for the life of the attach.
+    pub fn register_live_client(&self) -> LiveClient {
+        self.clients.register()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<(u64, Vec<u8>)> {
         self.output_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    fn run_push_bump_hook(&self) {
+        if let Some(hook) = self.push_bump_hook.lock().unwrap().as_ref() {
+            hook(self);
+        }
     }
 
     /// Epic 2.1 Story 2.1.2: returns the output chunks produced since
@@ -591,33 +979,7 @@ impl Pane {
     fn snapshot_at_offset_with_seq(&self, offset: usize) -> (PaneSnapshot, u64) {
         let mut parser = self.parser.lock().unwrap();
         parser.screen_mut().set_scrollback(offset);
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-
-        let mut grid = Vec::with_capacity(rows as usize);
-        for row in 0..rows {
-            let mut cells = Vec::with_capacity(cols as usize);
-            for col in 0..cols {
-                let (text, fg, bg, attrs) = match screen.cell(row, col) {
-                    Some(cell) => (
-                        cell.contents().to_string(),
-                        pack_color(cell.fgcolor()),
-                        pack_color(cell.bgcolor()),
-                        pack_attrs(cell),
-                    ),
-                    None => (String::new(), 0, 0, 0),
-                };
-                cells.push(CellSnapshot {
-                    text,
-                    fg,
-                    bg,
-                    attrs,
-                });
-            }
-            grid.push(cells);
-        }
-
-        let (cursor_row, cursor_col) = screen.cursor_position();
+        let snapshot = snapshot_from_screen(parser.screen());
         // Reset the scroll position back to live — this method is a
         // point-in-time query, not a persistent view change; leaving the
         // parser scrolled would corrupt normal (offset-0) reads from any
@@ -628,16 +990,7 @@ impl Pane {
         // `process(..)` (Task 1.3.1a) — so this value and the grid just
         // built above can never disagree about which bytes are reflected.
         let seq = self.output_seq.load(Ordering::SeqCst);
-        (
-            PaneSnapshot {
-                rows: rows as u32,
-                cols: cols as u32,
-                grid,
-                cursor_row: cursor_row as u32,
-                cursor_col: cursor_col as u32,
-            },
-            seq,
-        )
+        (snapshot, seq)
     }
 
     /// Forward-only, next-match search through scrollback for `pattern`
@@ -694,6 +1047,188 @@ impl Drop for Pane {
     }
 }
 
+/// A child process on a fresh pty, before it is attached to a [`Pane`].
+struct StartedProcess {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    pid: Option<u32>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    reader: Box<dyn Read + Send>,
+    stdin_writer: Option<std::fs::File>,
+    /// A duplicate of the pty master for the terminal-query reply writer.
+    #[cfg(unix)]
+    reply_fd: std::os::fd::OwnedFd,
+}
+
+/// Opens a pty of the given size and starts `command` on it. Shared by the first spawn and by
+/// [`Pane::respawn`], so a restart launches exactly what the original did.
+fn start_process(
+    command: &str,
+    launch: &Launch,
+    cwd: Option<&str>,
+    rows: u16,
+    cols: u16,
+) -> Result<StartedProcess> {
+    // Before openpty so a bad argument file or stderr path fails with no
+    // pty allocated.
+    let prepared = launch.prepare()?;
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    #[cfg(unix)]
+    let child: Box<dyn portable_pty::Child + Send + Sync> = {
+        let master_fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
+        // TYMUXD_TOKEN is stripped inside spawn_on_pty: it's the daemon's
+        // own secret and must never reach a pane's environment
+        // (research/pitfalls.md §2, HIGH PRIORITY).
+        crate::spawn::spawn_on_pty(master_fd, command, launch, &prepared, cwd)?
+    };
+    #[cfg(not(unix))]
+    let child = {
+        if prepared.stderr.is_some() || prepared.stdin.is_some() {
+            anyhow::bail!("stderr_path and stdin_path are only supported on unix");
+        }
+        let mut cmd = CommandBuilder::new(command);
+        cmd.args(&prepared.args);
+        for (key, value) in &launch.env {
+            cmd.env(key, value);
+        }
+        if let Some(cwd) = cwd {
+            cmd.cwd(cwd);
+        }
+        cmd.env_remove("TYMUXD_TOKEN");
+        pair.slave.spawn_command(cmd)?
+    };
+    let pid = child.process_id();
+    drop(pair.slave);
+    // The pane must not hold the pipe's read end: only then does the
+    // write end see EPIPE once the child exits.
+    let PreparedLaunch {
+        stdin_writer,
+        stdin,
+        ..
+    } = prepared;
+    drop(stdin);
+
+    let writer = pair.master.take_writer()?;
+    let reader = pair.master.try_clone_reader()?;
+    #[cfg(unix)]
+    let reply_fd = {
+        use std::os::fd::{BorrowedFd, RawFd};
+        let raw: RawFd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow::anyhow!("pty master has no raw fd"))?;
+        // SAFETY: the master (and so `raw`) outlives this call; the duplicate is independent.
+        unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?
+    };
+    Ok(StartedProcess {
+        child,
+        pid,
+        master: pair.master,
+        writer,
+        reader,
+        stdin_writer,
+        #[cfg(unix)]
+        reply_fd,
+    })
+}
+
+/// Everything a snapshot holds that is computed from the emulator's screen alone (the caller
+/// owns locking and the output sequence). Pure, so it can be tested by feeding bytes to a
+/// `vt100::Parser` with no pty or shell involved.
+fn snapshot_from_screen(screen: &vt100::Screen) -> PaneSnapshot {
+    let (rows, cols) = screen.size();
+
+    let mut grid = Vec::with_capacity(rows as usize);
+    // screen-wide link index -> 1-based index into the snapshot's own table
+    let mut hyperlinks: Vec<(String, String)> = Vec::new();
+    let mut link_index = std::collections::HashMap::new();
+    for row in 0..rows {
+        let mut cells = Vec::with_capacity(cols as usize);
+        for col in 0..cols {
+            let snap = match screen.cell(row, col) {
+                Some(cell) => {
+                    let hyperlink = match cell.hyperlink() {
+                        0 => 0,
+                        screen_idx => *link_index.entry(screen_idx).or_insert_with(|| match screen
+                            .hyperlink(screen_idx)
+                        {
+                            Some((uri, id)) => {
+                                hyperlinks.push((uri.to_string(), id.to_string()));
+                                hyperlinks.len() as u32
+                            }
+                            None => 0,
+                        }),
+                    };
+                    CellSnapshot {
+                        text: cell.contents().to_string(),
+                        fg: pack_color(cell.fgcolor()),
+                        bg: pack_color(cell.bgcolor()),
+                        attrs: pack_attrs(cell),
+                        underline_style: pack_underline_style(cell.underline_style()),
+                        underline_color: pack_color(cell.ulcolor()),
+                        hyperlink,
+                    }
+                }
+                None => CellSnapshot {
+                    text: String::new(),
+                    fg: 0,
+                    bg: 0,
+                    attrs: 0,
+                    underline_style: 0,
+                    underline_color: 0,
+                    hyperlink: 0,
+                },
+            };
+            cells.push(snap);
+        }
+        grid.push(cells);
+    }
+
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let cursor_pending_wrap = screen.cursor_pending_wrap();
+    let cursor_col = cursor_col.min(cols.saturating_sub(1));
+    let title = screen.title().to_string();
+    let modes = terminal_modes(screen);
+    let cursor_hidden = screen.hide_cursor();
+    let cursor_style = u32::from(screen.cursor_style());
+    let alt_screen = screen.alternate_screen();
+    let (scroll_top, scroll_bottom) = screen.scroll_region();
+    let tab_stops = screen.tab_stops().into_iter().map(u32::from).collect();
+    let (g, gl) = screen.charsets();
+    let charsets = Charsets {
+        g: g.map(u32::from),
+        gl: u32::from(gl),
+    };
+    PaneSnapshot {
+        rows: u32::from(rows),
+        cols: u32::from(cols),
+        grid,
+        cursor_row: u32::from(cursor_row),
+        cursor_col: u32::from(cursor_col),
+        cursor_pending_wrap,
+        hyperlinks,
+        title,
+        modes,
+        cursor_hidden,
+        cursor_style,
+        alt_screen,
+        scroll_top: u32::from(scroll_top),
+        scroll_bottom: u32::from(scroll_bottom),
+        tab_stops,
+        charsets,
+    }
+}
+
 /// Packs a vt100 color into one u32: top byte tags the variant so
 /// `Default`/`Idx`/`Rgb` round-trip without a separate enum crossing the
 /// gRPC boundary. 0x00 = default, 0x01 = indexed (low byte = index),
@@ -714,6 +1249,21 @@ const ATTR_BOLD: u32 = 1;
 const ATTR_UNDERLINE: u32 = 2;
 const ATTR_REVERSE: u32 = 4;
 const ATTR_ITALIC: u32 = 8;
+const ATTR_FAINT: u32 = 16;
+const ATTR_STRIKE: u32 = 32;
+const ATTR_BLINK: u32 = 64;
+const ATTR_CONCEAL: u32 = 128;
+const ATTR_OVERLINE: u32 = 256;
+
+fn pack_underline_style(style: vt100::UnderlineStyle) -> u32 {
+    match style {
+        vt100::UnderlineStyle::Single => 0,
+        vt100::UnderlineStyle::Double => 1,
+        vt100::UnderlineStyle::Curly => 2,
+        vt100::UnderlineStyle::Dotted => 3,
+        vt100::UnderlineStyle::Dashed => 4,
+    }
+}
 
 fn pack_attrs(cell: &vt100::Cell) -> u32 {
     let mut attrs = 0;
@@ -729,6 +1279,21 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
     if cell.italic() {
         attrs |= ATTR_ITALIC;
     }
+    if cell.dim() {
+        attrs |= ATTR_FAINT;
+    }
+    if cell.strikethrough() {
+        attrs |= ATTR_STRIKE;
+    }
+    if cell.blink() {
+        attrs |= ATTR_BLINK;
+    }
+    if cell.conceal() {
+        attrs |= ATTR_CONCEAL;
+    }
+    if cell.overline() {
+        attrs |= ATTR_OVERLINE;
+    }
     attrs
 }
 
@@ -738,9 +1303,537 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn terminal_modes_maps_vt100_state_onto_the_proto_numbering() {
+        let mut parser = vt100::Parser::new(5, 20, 0);
+        parser.process(b"\x1b=\x1b[?1h\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1015h\x1b[?5h\x1b[?6h\x1b[?7l\x1b[4h\x1b[20h");
+        let m = terminal_modes(parser.screen());
+        assert!(m.app_cursor_keys && m.app_keypad && m.bracketed_paste && m.focus_events);
+        assert!(m.reverse_video && m.origin && m.no_autowrap && m.insert && m.newline);
+        assert_eq!((m.mouse_mode, m.mouse_encoding), (4, 3));
+        parser.process(b"\x1b[?1003l\x1b[?1015l\x1b[?1000h\x1b[?1006h");
+        let m = terminal_modes(parser.screen());
+        assert_eq!((m.mouse_mode, m.mouse_encoding), (2, 2));
+    }
+
+    /// Feeds `bytes` to a fresh emulator and snapshots it: no pty, shell or timing involved.
+    fn snapshot_of(rows: u16, cols: u16, bytes: &[u8]) -> PaneSnapshot {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(bytes);
+        snapshot_from_screen(parser.screen())
+    }
+
+    #[test]
+    fn snapshot_should_carry_title_cursor_scroll_region_tab_stops_and_charsets() {
+        let snap = snapshot_of(
+            10,
+            40,
+            b"\x1b]2;my title\x07\x1b[5 q\x1b[?25l\x1b[3;7r\x1b[1;4H\x1bH\x1b)0\x0edone",
+        );
+        assert_eq!(snap.title, "my title");
+        assert_eq!(snap.charsets.gl, 1);
+        assert_eq!(snap.cursor_style, 5);
+        assert!(snap.cursor_hidden);
+        assert_eq!((snap.scroll_top, snap.scroll_bottom), (3, 7));
+        assert!(snap.tab_stops.contains(&3));
+        assert_eq!(snap.charsets.g[1], 1);
+        assert!(!snap.alt_screen);
+    }
+
+    #[test]
+    fn snapshot_should_clamp_cursor_col_and_flag_a_pending_wrap() {
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(snap.cursor_col, 39, "cursor_col must stay inside the grid");
+        assert!(snap.cursor_col < snap.cols);
+        assert!(snap.cursor_pending_wrap);
+
+        // any cursor movement clears the pending wrap
+        for mv in [&b"\x1b[C"[..], b"\x1b[D", b"\x1b[1;1H", b"\r"] {
+            let mut p = vt100::Parser::new(10, 40, 0);
+            p.process("x".repeat(40).as_bytes());
+            p.process(mv);
+            let snap = snapshot_from_screen(p.screen());
+            assert!(!snap.cursor_pending_wrap, "{mv:?}");
+            assert!(snap.cursor_col < snap.cols, "{mv:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_should_clamp_the_cursor_after_a_resize_and_across_the_alternate_screen() {
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        parser.screen_mut().set_size(10, 20);
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(snap.cols, 20);
+        assert!(snap.cursor_col < snap.cols);
+        assert!(!snap.cursor_pending_wrap);
+
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process("x".repeat(40).as_bytes());
+        parser.process(b"\x1b[?1049h");
+        let snap = snapshot_from_screen(parser.screen());
+        assert!(snap.alt_screen);
+        assert_eq!(snap.cursor_col, 39, "the carried cursor is still clamped");
+    }
+
+    #[test]
+    fn snapshot_should_reflow_wrapped_lines_when_the_pane_is_resized() {
+        let mut parser = vt100::Parser::new(5, 20, 100);
+        parser.process(b"0123456789abcdefghijKLMNOPQRST\r\nnext\r\n");
+        parser.screen_mut().set_size(5, 10);
+        let text = |snap: &PaneSnapshot, row: usize| -> String {
+            snap.grid[row]
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<String>()
+        };
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(text(&snap, 0).trim_end(), "0123456789");
+        assert_eq!(text(&snap, 1).trim_end(), "abcdefghij");
+        assert_eq!(text(&snap, 2).trim_end(), "KLMNOPQRST");
+        assert_eq!(text(&snap, 3).trim_end(), "next");
+
+        parser.screen_mut().set_size(5, 30);
+        let snap = snapshot_from_screen(parser.screen());
+        assert_eq!(text(&snap, 0).trim_end(), "0123456789abcdefghijKLMNOPQRST");
+        assert_eq!(text(&snap, 1).trim_end(), "next");
+    }
+
+    #[test]
+    fn pack_attrs_should_set_faint_bit_when_cell_is_dim() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[2mdim\x1b[0m plain \x1b[1mbold\x1b[0m");
+        let screen = parser.screen();
+
+        assert_eq!(pack_attrs(screen.cell(0, 0).unwrap()), ATTR_FAINT);
+        assert_eq!(pack_attrs(screen.cell(0, 4).unwrap()), 0);
+        assert_eq!(pack_attrs(screen.cell(0, 10).unwrap()), ATTR_BOLD);
+    }
+
+    #[test]
+    fn pack_attrs_should_set_every_new_flag_bit() {
+        // ECMA-48 SGR 9 / 5 / 8 / 53; bit values are the wire contract in tymux.proto
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[9ma\x1b[0;5mb\x1b[0;8mc\x1b[0;53md\x1b[0;1;2me");
+        let screen = parser.screen();
+
+        assert_eq!(pack_attrs(screen.cell(0, 0).unwrap()), ATTR_STRIKE);
+        assert_eq!(pack_attrs(screen.cell(0, 1).unwrap()), ATTR_BLINK);
+        assert_eq!(pack_attrs(screen.cell(0, 2).unwrap()), ATTR_CONCEAL);
+        assert_eq!(pack_attrs(screen.cell(0, 3).unwrap()), ATTR_OVERLINE);
+        assert_eq!(
+            pack_attrs(screen.cell(0, 4).unwrap()),
+            ATTR_BOLD | ATTR_FAINT
+        );
+    }
+
+    #[test]
+    fn pack_underline_style_should_match_proto_numbering() {
+        use vt100::UnderlineStyle::*;
+        let packed: Vec<u32> = [Single, Double, Curly, Dotted, Dashed]
+            .into_iter()
+            .map(pack_underline_style)
+            .collect();
+        assert_eq!(packed, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn snapshot_should_carry_underline_style_color_and_deduped_hyperlinks() {
+        let snap = snapshot_of(
+            24,
+            80,
+            b"\x1b[4:3;58:2::9:8:7mUL\x1b[0m \x1b]8;;https://a.test\x1b\\LI\x1b]8;;\x1b\\ \x1b]8;;https://a.test\x1b\\NK\x1b]8;;\x1b\\ DONE\r\n",
+        );
+
+        let cells: Vec<&CellSnapshot> = snap
+            .grid
+            .iter()
+            .flatten()
+            .filter(|c| c.text == "U" || c.text == "L" || c.text == "N")
+            .collect();
+        let ul = cells
+            .iter()
+            .find(|c| c.text == "U" && c.attrs & 2 != 0)
+            .expect("underlined U cell");
+        assert_eq!(ul.attrs & 2, 2, "underline bit");
+        assert_eq!(ul.underline_style, 2, "curly");
+        assert_eq!(ul.underline_color, 0x0200_0000 | (9 << 16) | (8 << 8) | 7);
+        assert_eq!(
+            snap.hyperlinks,
+            vec![("https://a.test".to_string(), String::new())]
+        );
+        let linked: Vec<u32> = snap
+            .grid
+            .iter()
+            .flatten()
+            .filter(|c| (c.text == "L" || c.text == "N") && c.hyperlink != 0)
+            .map(|c| c.hyperlink)
+            .collect();
+        assert_eq!(linked, vec![1, 1], "both links dedupe to table entry 1");
+    }
+
+    #[test]
     fn is_exited_should_return_false_when_process_still_running() {
         let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
         assert!(!pane.is_exited());
+    }
+
+    fn screen_rows(pane: &Pane) -> Vec<String> {
+        pane.snapshot()
+            .grid
+            .iter()
+            .map(|row| row.iter().map(|c| c.text.as_str()).collect::<String>())
+            .collect()
+    }
+
+    fn wait_for_row(pane: &Pane, want: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(row) = screen_rows(pane).into_iter().find(|r| want(r.trim_end())) {
+                return row.trim_end().to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "row never appeared: {:?}",
+                screen_rows(pane)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Puts the tty in raw no-echo mode (so the script itself never echoes onto the screen),
+    /// clears the screen, prints `abc\r\n  xy`, sends `query`, reads up to `reply_len` reply bytes (1s cap via VTIME)
+    /// and returns the `GOT:<od output>:END` row.
+    fn run_query_script(pane: &Pane, query: &str, reply_len: usize) -> String {
+        pane.write_input(b"stty raw -echo min 0 time 10; echo READY\n")
+            .unwrap();
+        // bash/dash prefix the line with a prompt; sh on macOS does not
+        wait_for_row(pane, |r| r.trim_start_matches("$ ") == "READY");
+        let script = format!(
+            "printf '\\033[2J\\033[Habc\\r\\n  xy'; printf '{query}'; \
+             r=$(dd bs=1 count={reply_len} 2>/dev/null | od -An -c | tr -s ' '); echo \"GOT:$r:END\"\n"
+        );
+        pane.write_input(script.as_bytes()).unwrap();
+        wait_for_row(pane, |r| r.contains("GOT:") && r.ends_with(":END"))
+    }
+
+    #[test]
+    fn terminal_query_should_be_answered_by_the_daemon_when_no_client_is_attached() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        // CPR after "abc\r\n  xy": real cursor is row 2, col 5 => ESC [ 2 ; 5 R
+        let text = run_query_script(&pane, "\\033[6n", 6);
+        // od's column padding differs between platforms; compare without whitespace
+        assert!(
+            text.split_whitespace()
+                .collect::<String>()
+                .contains("GOT:033[2;5R:END"),
+            "expected the cursor-position reply, got: {text}"
+        );
+    }
+
+    #[test]
+    fn terminal_query_should_not_be_answered_by_the_daemon_when_a_client_is_attached() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let _rx = pane.subscribe();
+        let client = pane.register_live_client();
+        client.go_live_after(0);
+        // The marker is printed after the query, so once it is on screen the query was parsed:
+        // an event, not a timeout.
+        pane.write_input(b"printf '\\033[6n\\033[c'; echo MA\"\"RK\n")
+            .unwrap();
+        wait_for_row(&pane, |r| r.ends_with("MARK") && !r.contains("echo"));
+        assert_eq!(pane.query_replies.accepted(), 0, "daemon must stay silent");
+    }
+
+    #[test]
+    fn terminal_query_should_be_counted_as_answered_when_no_client_is_attached() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        pane.write_input(b"printf '\\033[6n\\033[c'; echo MA\"\"RK\n")
+            .unwrap();
+        // the tty may echo a reply just before the marker on the same row
+        wait_for_row(&pane, |r| r.ends_with("MARK") && !r.contains("echo"));
+        assert_eq!(pane.query_replies.accepted(), 2);
+    }
+
+    fn squash(text: &str) -> String {
+        text.split_whitespace().collect()
+    }
+
+    #[test]
+    fn terminal_query_should_be_answered_when_a_client_subscribed_but_is_not_live_yet() {
+        // An attach subscribes before it has its snapshot threshold: nobody shows it these chunks.
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let _rx = pane.subscribe();
+        let _unfinished_attach = pane.register_live_client();
+        let text = run_query_script(&pane, "\\033[6n", 6);
+        assert!(squash(&text).contains("GOT:033[2;5R"), "{text}");
+    }
+
+    #[test]
+    fn terminal_query_should_be_answered_when_the_only_client_is_lagged() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let _rx = pane.subscribe();
+        let client = pane.register_live_client();
+        client.go_live_after(0);
+        client.set_lagged(true);
+        let text = run_query_script(&pane, "\\033[6n", 6);
+        assert!(squash(&text).contains("GOT:033[2;5R"), "{text}");
+    }
+
+    /// Everything a subscriber receives while `pane` runs `script`, until `marker` shows up.
+    fn collect_broadcast(
+        pane: &Pane,
+        rx: &mut broadcast::Receiver<(u64, Vec<u8>)>,
+        marker: &str,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut bytes = Vec::new();
+        while !String::from_utf8_lossy(&bytes).contains(marker) {
+            assert!(
+                Instant::now() < deadline,
+                "no {marker}: {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+            while let Ok((_, chunk)) = rx.try_recv() {
+                bytes.extend_from_slice(&chunk);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = pane;
+        bytes
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn broadcast_should_carry_the_query_only_when_a_client_answers_it() {
+        // answered by the client: raw
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let mut rx = pane.subscribe();
+        let client = pane.register_live_client();
+        client.go_live_after(0);
+        pane.write_input(b"printf 'q\\033[6nZ'; echo DO\"\"NE1\n")
+            .unwrap();
+        let bytes = collect_broadcast(&pane, &mut rx, "DONE1\r");
+        assert!(
+            contains_bytes(&bytes, b"q\x1b[6nZ"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        // answered by the daemon: stripped for every subscriber, even a registered-but-lagged one
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let mut rx = pane.subscribe();
+        let client = pane.register_live_client();
+        client.go_live_after(0);
+        client.set_lagged(true);
+        pane.write_input(b"printf 'q\\033[6nZ'; echo DO\"\"NE2\n")
+            .unwrap();
+        let bytes = collect_broadcast(&pane, &mut rx, "DONE2\r");
+        assert!(
+            !contains_bytes(&bytes, b"\x1b[6n"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            contains_bytes(&bytes, b"qZ"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// A restarted process gets its own terminal-query replies: the reply writer is re-armed on
+    /// the new pty, and a fresh scanner runs in the new reader thread.
+    #[cfg(unix)]
+    #[test]
+    fn a_respawned_pane_should_answer_terminal_queries_on_its_new_pty() {
+        let launch = Launch {
+            args: vec![
+                "-c".into(),
+                "stty raw -echo; printf '\\033[c'; dd bs=1 count=4 2>/dev/null | od -An -c; exit 0"
+                    .into(),
+            ],
+            ..Launch::default()
+        };
+        let pane = Pane::spawn_launch("/bin/sh", &launch, None, None, 24, 200).unwrap();
+        assert!(wait_for_grid_text(&pane, "033"), "first run was answered");
+        wait_for_exit(&pane);
+        let first = pane.query_replies.accepted();
+        assert_eq!(first, 1);
+
+        pane.respawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while pane.query_replies.accepted() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the new process was never answered"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        wait_for_exit(&pane);
+        let text: String = pane
+            .snapshot()
+            .grid
+            .iter()
+            .flatten()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(
+            text.matches("033").count(),
+            2,
+            "the reply reached the second process too: {text}"
+        );
+    }
+
+    #[test]
+    fn a_child_that_never_reads_stdin_and_floods_queries_should_not_stall_output() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        // `yes` is an external process writing queries as fast as the pty drains; it never reads
+        // stdin, so every reply it provokes piles up unread.
+        pane.write_input(b"yes \"$(printf '\\033[c\\033[6nx')\"\n")
+            .unwrap();
+        let wait_until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_until("the flood to be answered", &|| {
+            pane.query_replies.accepted() > 0
+        });
+        let before = pane.snapshot_with_seq().1;
+        // the reader keeps draining output even though replies sit unread in the child's pty
+        wait_until("output to keep flowing", &|| {
+            pane.snapshot_with_seq().1 > before + 50
+        });
+        pane.kill().unwrap();
+    }
+
+    #[test]
+    fn replay_buffer_should_not_contain_queries_so_a_resuming_client_cannot_answer_them_twice() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        pane.write_input(b"printf 'before\\033[6nafter'; echo\n")
+            .unwrap();
+        wait_for_row(&pane, |r| {
+            r.contains("before") && r.contains("after") && !r.contains("printf")
+        });
+        let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
+            panic!("expected the whole history to be retained");
+        };
+        let bytes: Vec<u8> = chunks.into_iter().flat_map(|(_, b)| b).collect();
+        assert!(
+            !bytes.windows(4).any(|w| w == b"\x1b[6n"),
+            "replay must not carry the query: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        // the tty echoes the daemon's reply between the two words, so only check both survive
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("before") && text.contains("after"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn replay_buffer_should_not_contain_a_query_split_across_reads() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        // let the startup output land in chunk 1, which a resume can never replay
+        pane.write_input(b"echo RE\"\"ADY\n").unwrap();
+        wait_for_row(&pane, |r| r.trim_start_matches("$ ") == "READY");
+        pane.write_input(b"printf 'a\\033['; i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '6nb'; echo SPLIT\"\"DONE\n")
+            .unwrap();
+        // the tty may echo the daemon's reply between the marker and the text
+        wait_for_row(&pane, |r| r.starts_with("ab") && r.contains("SPLITDONE"));
+        let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
+            panic!("expected the whole history to be retained");
+        };
+        let bytes: Vec<u8> = chunks.into_iter().flat_map(|(_, b)| b).collect();
+        let text = String::from_utf8_lossy(&bytes);
+        // "a" and "b" adjacent proves both the ESC[ prefix and the 6n tail are gone
+        assert!(!contains_bytes(&bytes, b"\x1b[6n"), "{text:?}");
+        assert!(text.contains("\r\nab"), "{text:?}");
+    }
+
+    #[test]
+    fn a_sequence_open_at_pty_eof_should_still_reach_subscribers_and_replay() {
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let mut rx = pane.subscribe();
+        pane.write_input(b"echo RE\"\"ADY\n").unwrap();
+        wait_for_row(&pane, |r| r.ends_with("READY") && !r.contains("echo"));
+        // ESC [ 6 is a query prefix the scanner holds back; EOF must release it
+        // exec: nothing else may follow the open sequence, or it would complete and not be held
+        pane.write_input(b"exec printf 'x\\033[6'\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pane.is_exited() {
+            assert!(Instant::now() < deadline, "child never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut live = Vec::new();
+        while let Ok((_, chunk)) = rx.try_recv() {
+            live.extend_from_slice(&chunk);
+        }
+        assert!(
+            contains_bytes(&live, b"x\x1b[6"),
+            "subscriber: {:?}",
+            String::from_utf8_lossy(&live)
+        );
+        let ReplayOutcome::InWindow { chunks, .. } = pane.replay_since(1) else {
+            panic!("expected the history to be retained");
+        };
+        let replayed: Vec<u8> = chunks.into_iter().flat_map(|(_, b)| b).collect();
+        assert!(
+            contains_bytes(&replayed, b"x\x1b[6"),
+            "replay: {:?}",
+            String::from_utf8_lossy(&replayed)
+        );
+    }
+
+    #[test]
+    fn user_input_should_not_wait_behind_a_flood_of_unread_replies() {
+        let pane = Arc::new(Pane::spawn("/bin/sh", 24, 80).unwrap());
+        pane.write_input(b"yes \"$(printf '\\033[c')\"\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while pane.query_replies.accepted() == 0 {
+            assert!(Instant::now() < deadline, "flood never answered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let p = pane.clone();
+        std::thread::spawn(move || {
+            p.write_input(b"\x03").unwrap();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Ctrl-C write blocked behind reply writes");
+        pane.kill().unwrap();
+    }
+
+    #[test]
+    fn replay_push_and_seq_bump_should_happen_under_the_replay_lock() {
+        // If the lock were not held between push and bump, `replay_since` could return a chunk
+        // newer than its tail_seq (re-sent live: double render and double query).
+        let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+        let held_every_time = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicU64::new(0));
+        let (flag, n) = (held_every_time.clone(), calls.clone());
+        *pane.push_bump_hook.lock().unwrap() = Some(Box::new(move |p: &Pane| {
+            n.fetch_add(1, Ordering::SeqCst);
+            if p.replay.try_lock().is_ok() {
+                flag.store(false, Ordering::SeqCst);
+            }
+        }));
+        pane.write_input(b"echo HO\"\"OK\n").unwrap();
+        wait_for_row(&pane, |r| r.ends_with("HOOK") && !r.contains("echo"));
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        assert!(
+            held_every_time.load(Ordering::SeqCst),
+            "replay lock not held across push+bump"
+        );
     }
 
     #[test]
@@ -1502,7 +2595,7 @@ mod tests {
         // above).
         pane.write_input(b"env; echo DONE-MARKER | rev\n").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut text = String::new();
         let mut completed = false;
         while Instant::now() < deadline {
@@ -1534,6 +2627,55 @@ mod tests {
         assert!(
             text.contains("TYMUX_TEST_CONTROL_VAR=visible"),
             "spawned pane's environment must still inherit other variables"
+        );
+    }
+
+    /// A restart spawns through the same path, but is a separate call site worth pinning: the
+    /// respawned process must not inherit the daemon's token either.
+    #[test]
+    fn respawn_should_not_leak_tymuxd_token_into_pane_environment() {
+        let pane = Pane::spawn("/bin/sh", 300, 200).unwrap();
+        pane.write_input(b"exit\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pane.is_exited() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.is_exited(), "the first shell did not exit");
+
+        std::env::set_var("TYMUXD_TOKEN", "respawn-leaked-secret");
+        std::env::set_var("TYMUX_TEST_RESPAWN_VAR", "visible");
+        let respawned = pane.respawn_with(&|_| Vec::new());
+        let mut text = String::new();
+        let mut completed = false;
+        if respawned.is_ok() {
+            pane.write_input(b"env; echo DONE-MARKER | rev\n").unwrap();
+            while Instant::now() < deadline {
+                text = pane
+                    .snapshot()
+                    .grid
+                    .iter()
+                    .flatten()
+                    .map(|c| c.text.as_str())
+                    .collect();
+                if text.contains("REKRAM-ENOD") {
+                    completed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        std::env::remove_var("TYMUXD_TOKEN");
+        std::env::remove_var("TYMUX_TEST_RESPAWN_VAR");
+
+        respawned.unwrap();
+        assert!(completed, "the respawned shell's output did not complete");
+        assert!(
+            !text.contains("TYMUXD_TOKEN") && !text.contains("respawn-leaked-secret"),
+            "a respawned pane's environment must not contain TYMUXD_TOKEN"
+        );
+        assert!(
+            text.contains("TYMUX_TEST_RESPAWN_VAR=visible"),
+            "a respawned pane must still inherit other variables"
         );
     }
 }

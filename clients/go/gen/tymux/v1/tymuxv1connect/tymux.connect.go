@@ -68,6 +68,22 @@ const (
 	TymuxServiceAttachProcedure = "/tymux.v1.TymuxService/Attach"
 	// TymuxServiceWriteStdinProcedure is the fully-qualified name of the TymuxService's WriteStdin RPC.
 	TymuxServiceWriteStdinProcedure = "/tymux.v1.TymuxService/WriteStdin"
+	// TymuxServiceSetRestartPolicyProcedure is the fully-qualified name of the TymuxService's
+	// SetRestartPolicy RPC.
+	TymuxServiceSetRestartPolicyProcedure = "/tymux.v1.TymuxService/SetRestartPolicy"
+	// TymuxServiceGetPaneStatusProcedure is the fully-qualified name of the TymuxService's
+	// GetPaneStatus RPC.
+	TymuxServiceGetPaneStatusProcedure = "/tymux.v1.TymuxService/GetPaneStatus"
+	// TymuxServiceRestartPaneProcedure is the fully-qualified name of the TymuxService's RestartPane
+	// RPC.
+	TymuxServiceRestartPaneProcedure = "/tymux.v1.TymuxService/RestartPane"
+	// TymuxServiceStopPaneProcedure is the fully-qualified name of the TymuxService's StopPane RPC.
+	TymuxServiceStopPaneProcedure = "/tymux.v1.TymuxService/StopPane"
+	// TymuxServiceStartPaneProcedure is the fully-qualified name of the TymuxService's StartPane RPC.
+	TymuxServiceStartPaneProcedure = "/tymux.v1.TymuxService/StartPane"
+	// TymuxServiceResetRestartBudgetProcedure is the fully-qualified name of the TymuxService's
+	// ResetRestartBudget RPC.
+	TymuxServiceResetRestartBudgetProcedure = "/tymux.v1.TymuxService/ResetRestartBudget"
 )
 
 // TymuxServiceClient is a client for the tymux.v1.TymuxService service.
@@ -87,7 +103,14 @@ type TymuxServiceClient interface {
 	// command re-run in its persisted cwd. Never triggered automatically on
 	// daemon start (ADR-002); only an explicit call reaches this. A no-op
 	// (ReviveSessionResponse.already_live=true) if the session is already
-	// live — never a duplicate spawn.
+	// live — never a duplicate spawn. A pane whose child exited inside this daemon (not
+	// restored from disk) is also respawned in place, same pane id and screen (ADR-0007);
+	// before that, such a session was reported already_live and nothing was respawned.
+	// A pane the operator stopped (STOPPED, StopPane) or that ran out of restarts (FAILED)
+	// is never revived by this call: it stays as it is while the session's other panes are
+	// revived, and pane_count counts only the panes started. If every pane is STOPPED or
+	// FAILED the call is FAILED_PRECONDITION. Use
+	// StartPane (STOPPED or FAILED) or RestartPane (resets the budget) for those.
 	ReviveSession(context.Context, *connect.Request[v1.ReviveSessionRequest]) (*connect.Response[v1.ReviveSessionResponse], error)
 	// One-shot structured read of a pane's current screen — the AI-friendly
 	// alternative to `tmux capture-pane` (which returns raw text you'd have
@@ -178,6 +201,29 @@ type TymuxServiceClient interface {
 	// stdin is already closed, or the process closed its stdin / exited
 	// (broken pipe). Advertised as capability "create_session.stdin_stream".
 	WriteStdin(context.Context) *connect.ClientStreamForClient[v1.WriteStdinRequest, v1.WriteStdinResponse]
+	// Sets the restart policy of one pane, or (session_id) the default for panes created later
+	// in that session. Takes effect at the pane's next exit; a pending backoff the new policy
+	// would not have scheduled is cancelled. INVALID_ARGUMENT for a nonsensical policy.
+	SetRestartPolicy(context.Context, *connect.Request[v1.SetRestartPolicyRequest]) (*connect.Response[v1.SetRestartPolicyResponse], error)
+	// The pane's lifecycle state, policy, counters and timestamps.
+	GetPaneStatus(context.Context, *connect.Request[v1.GetPaneStatusRequest]) (*connect.Response[v1.PaneStatus], error)
+	// Replaces the pane's process now: a running one gets SIGTERM (SIGKILL after grace) and is
+	// respawned once it exits; a dead one (any state, including STOPPED and FAILED) is respawned
+	// immediately. Not charged to the restart budget and not delayed. With reset_backoff the
+	// backoff delay and window budget start over. Returns once the new process is running (or
+	// failed to start); a failed start counts against the budget like any failed run.
+	RestartPane(context.Context, *connect.Request[v1.RestartPaneRequest]) (*connect.Response[v1.PaneStatus], error)
+	// SIGTERM, then SIGKILL after the grace period, and parks the pane in STOPPED: it will not
+	// restart until StartPane, whatever its policy. Returns once the process is gone (or the
+	// grace period plus a short margin has passed). Cancels a pending backoff.
+	StopPane(context.Context, *connect.Request[v1.StopPaneRequest]) (*connect.Response[v1.PaneStatus], error)
+	// Starts a pane that is STOPPED, EXITED, FAILED or in BACKOFF, with a fresh restart budget.
+	// FAILED_PRECONDITION if its process is running. Also respawns a single pane restored from
+	// disk after a daemon restart.
+	StartPane(context.Context, *connect.Request[v1.StartPaneRequest]) (*connect.Response[v1.PaneStatus], error)
+	// Clears the backoff delay and the restart budget. A FAILED pane becomes EXITED; nothing is
+	// started (use StartPane).
+	ResetRestartBudget(context.Context, *connect.Request[v1.ResetRestartBudgetRequest]) (*connect.Response[v1.PaneStatus], error)
 }
 
 // NewTymuxServiceClient constructs a client for the tymux.v1.TymuxService service. By default, it
@@ -269,24 +315,66 @@ func NewTymuxServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 			connect.WithSchema(tymuxServiceMethods.ByName("WriteStdin")),
 			connect.WithClientOptions(opts...),
 		),
+		setRestartPolicy: connect.NewClient[v1.SetRestartPolicyRequest, v1.SetRestartPolicyResponse](
+			httpClient,
+			baseURL+TymuxServiceSetRestartPolicyProcedure,
+			connect.WithSchema(tymuxServiceMethods.ByName("SetRestartPolicy")),
+			connect.WithClientOptions(opts...),
+		),
+		getPaneStatus: connect.NewClient[v1.GetPaneStatusRequest, v1.PaneStatus](
+			httpClient,
+			baseURL+TymuxServiceGetPaneStatusProcedure,
+			connect.WithSchema(tymuxServiceMethods.ByName("GetPaneStatus")),
+			connect.WithClientOptions(opts...),
+		),
+		restartPane: connect.NewClient[v1.RestartPaneRequest, v1.PaneStatus](
+			httpClient,
+			baseURL+TymuxServiceRestartPaneProcedure,
+			connect.WithSchema(tymuxServiceMethods.ByName("RestartPane")),
+			connect.WithClientOptions(opts...),
+		),
+		stopPane: connect.NewClient[v1.StopPaneRequest, v1.PaneStatus](
+			httpClient,
+			baseURL+TymuxServiceStopPaneProcedure,
+			connect.WithSchema(tymuxServiceMethods.ByName("StopPane")),
+			connect.WithClientOptions(opts...),
+		),
+		startPane: connect.NewClient[v1.StartPaneRequest, v1.PaneStatus](
+			httpClient,
+			baseURL+TymuxServiceStartPaneProcedure,
+			connect.WithSchema(tymuxServiceMethods.ByName("StartPane")),
+			connect.WithClientOptions(opts...),
+		),
+		resetRestartBudget: connect.NewClient[v1.ResetRestartBudgetRequest, v1.PaneStatus](
+			httpClient,
+			baseURL+TymuxServiceResetRestartBudgetProcedure,
+			connect.WithSchema(tymuxServiceMethods.ByName("ResetRestartBudget")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
 // tymuxServiceClient implements TymuxServiceClient.
 type tymuxServiceClient struct {
-	getServerInfo    *connect.Client[v1.GetServerInfoRequest, v1.ServerInfo]
-	createSession    *connect.Client[v1.CreateSessionRequest, v1.Session]
-	listSessions     *connect.Client[v1.ListSessionsRequest, v1.ListSessionsResponse]
-	killSession      *connect.Client[v1.KillSessionRequest, v1.KillSessionResponse]
-	reviveSession    *connect.Client[v1.ReviveSessionRequest, v1.ReviveSessionResponse]
-	capturePane      *connect.Client[v1.CapturePaneRequest, v1.PaneSnapshot]
-	searchScrollback *connect.Client[v1.SearchScrollbackRequest, v1.SearchScrollbackResponse]
-	splitPane        *connect.Client[v1.SplitPaneRequest, v1.Session]
-	closePane        *connect.Client[v1.ClosePaneRequest, v1.ClosePaneResponse]
-	createWindow     *connect.Client[v1.CreateWindowRequest, v1.Session]
-	watchWindow      *connect.Client[v1.WatchWindowRequest, v1.WindowLayoutEvent]
-	attach           *connect.Client[v1.AttachRequest, v1.AttachEvent]
-	writeStdin       *connect.Client[v1.WriteStdinRequest, v1.WriteStdinResponse]
+	getServerInfo      *connect.Client[v1.GetServerInfoRequest, v1.ServerInfo]
+	createSession      *connect.Client[v1.CreateSessionRequest, v1.Session]
+	listSessions       *connect.Client[v1.ListSessionsRequest, v1.ListSessionsResponse]
+	killSession        *connect.Client[v1.KillSessionRequest, v1.KillSessionResponse]
+	reviveSession      *connect.Client[v1.ReviveSessionRequest, v1.ReviveSessionResponse]
+	capturePane        *connect.Client[v1.CapturePaneRequest, v1.PaneSnapshot]
+	searchScrollback   *connect.Client[v1.SearchScrollbackRequest, v1.SearchScrollbackResponse]
+	splitPane          *connect.Client[v1.SplitPaneRequest, v1.Session]
+	closePane          *connect.Client[v1.ClosePaneRequest, v1.ClosePaneResponse]
+	createWindow       *connect.Client[v1.CreateWindowRequest, v1.Session]
+	watchWindow        *connect.Client[v1.WatchWindowRequest, v1.WindowLayoutEvent]
+	attach             *connect.Client[v1.AttachRequest, v1.AttachEvent]
+	writeStdin         *connect.Client[v1.WriteStdinRequest, v1.WriteStdinResponse]
+	setRestartPolicy   *connect.Client[v1.SetRestartPolicyRequest, v1.SetRestartPolicyResponse]
+	getPaneStatus      *connect.Client[v1.GetPaneStatusRequest, v1.PaneStatus]
+	restartPane        *connect.Client[v1.RestartPaneRequest, v1.PaneStatus]
+	stopPane           *connect.Client[v1.StopPaneRequest, v1.PaneStatus]
+	startPane          *connect.Client[v1.StartPaneRequest, v1.PaneStatus]
+	resetRestartBudget *connect.Client[v1.ResetRestartBudgetRequest, v1.PaneStatus]
 }
 
 // GetServerInfo calls tymux.v1.TymuxService.GetServerInfo.
@@ -354,6 +442,36 @@ func (c *tymuxServiceClient) WriteStdin(ctx context.Context) *connect.ClientStre
 	return c.writeStdin.CallClientStream(ctx)
 }
 
+// SetRestartPolicy calls tymux.v1.TymuxService.SetRestartPolicy.
+func (c *tymuxServiceClient) SetRestartPolicy(ctx context.Context, req *connect.Request[v1.SetRestartPolicyRequest]) (*connect.Response[v1.SetRestartPolicyResponse], error) {
+	return c.setRestartPolicy.CallUnary(ctx, req)
+}
+
+// GetPaneStatus calls tymux.v1.TymuxService.GetPaneStatus.
+func (c *tymuxServiceClient) GetPaneStatus(ctx context.Context, req *connect.Request[v1.GetPaneStatusRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return c.getPaneStatus.CallUnary(ctx, req)
+}
+
+// RestartPane calls tymux.v1.TymuxService.RestartPane.
+func (c *tymuxServiceClient) RestartPane(ctx context.Context, req *connect.Request[v1.RestartPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return c.restartPane.CallUnary(ctx, req)
+}
+
+// StopPane calls tymux.v1.TymuxService.StopPane.
+func (c *tymuxServiceClient) StopPane(ctx context.Context, req *connect.Request[v1.StopPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return c.stopPane.CallUnary(ctx, req)
+}
+
+// StartPane calls tymux.v1.TymuxService.StartPane.
+func (c *tymuxServiceClient) StartPane(ctx context.Context, req *connect.Request[v1.StartPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return c.startPane.CallUnary(ctx, req)
+}
+
+// ResetRestartBudget calls tymux.v1.TymuxService.ResetRestartBudget.
+func (c *tymuxServiceClient) ResetRestartBudget(ctx context.Context, req *connect.Request[v1.ResetRestartBudgetRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return c.resetRestartBudget.CallUnary(ctx, req)
+}
+
 // TymuxServiceHandler is an implementation of the tymux.v1.TymuxService service.
 type TymuxServiceHandler interface {
 	// Reports the daemon's build version, wire-protocol revision, and optional
@@ -371,7 +489,14 @@ type TymuxServiceHandler interface {
 	// command re-run in its persisted cwd. Never triggered automatically on
 	// daemon start (ADR-002); only an explicit call reaches this. A no-op
 	// (ReviveSessionResponse.already_live=true) if the session is already
-	// live — never a duplicate spawn.
+	// live — never a duplicate spawn. A pane whose child exited inside this daemon (not
+	// restored from disk) is also respawned in place, same pane id and screen (ADR-0007);
+	// before that, such a session was reported already_live and nothing was respawned.
+	// A pane the operator stopped (STOPPED, StopPane) or that ran out of restarts (FAILED)
+	// is never revived by this call: it stays as it is while the session's other panes are
+	// revived, and pane_count counts only the panes started. If every pane is STOPPED or
+	// FAILED the call is FAILED_PRECONDITION. Use
+	// StartPane (STOPPED or FAILED) or RestartPane (resets the budget) for those.
 	ReviveSession(context.Context, *connect.Request[v1.ReviveSessionRequest]) (*connect.Response[v1.ReviveSessionResponse], error)
 	// One-shot structured read of a pane's current screen — the AI-friendly
 	// alternative to `tmux capture-pane` (which returns raw text you'd have
@@ -462,6 +587,29 @@ type TymuxServiceHandler interface {
 	// stdin is already closed, or the process closed its stdin / exited
 	// (broken pipe). Advertised as capability "create_session.stdin_stream".
 	WriteStdin(context.Context, *connect.ClientStream[v1.WriteStdinRequest]) (*connect.Response[v1.WriteStdinResponse], error)
+	// Sets the restart policy of one pane, or (session_id) the default for panes created later
+	// in that session. Takes effect at the pane's next exit; a pending backoff the new policy
+	// would not have scheduled is cancelled. INVALID_ARGUMENT for a nonsensical policy.
+	SetRestartPolicy(context.Context, *connect.Request[v1.SetRestartPolicyRequest]) (*connect.Response[v1.SetRestartPolicyResponse], error)
+	// The pane's lifecycle state, policy, counters and timestamps.
+	GetPaneStatus(context.Context, *connect.Request[v1.GetPaneStatusRequest]) (*connect.Response[v1.PaneStatus], error)
+	// Replaces the pane's process now: a running one gets SIGTERM (SIGKILL after grace) and is
+	// respawned once it exits; a dead one (any state, including STOPPED and FAILED) is respawned
+	// immediately. Not charged to the restart budget and not delayed. With reset_backoff the
+	// backoff delay and window budget start over. Returns once the new process is running (or
+	// failed to start); a failed start counts against the budget like any failed run.
+	RestartPane(context.Context, *connect.Request[v1.RestartPaneRequest]) (*connect.Response[v1.PaneStatus], error)
+	// SIGTERM, then SIGKILL after the grace period, and parks the pane in STOPPED: it will not
+	// restart until StartPane, whatever its policy. Returns once the process is gone (or the
+	// grace period plus a short margin has passed). Cancels a pending backoff.
+	StopPane(context.Context, *connect.Request[v1.StopPaneRequest]) (*connect.Response[v1.PaneStatus], error)
+	// Starts a pane that is STOPPED, EXITED, FAILED or in BACKOFF, with a fresh restart budget.
+	// FAILED_PRECONDITION if its process is running. Also respawns a single pane restored from
+	// disk after a daemon restart.
+	StartPane(context.Context, *connect.Request[v1.StartPaneRequest]) (*connect.Response[v1.PaneStatus], error)
+	// Clears the backoff delay and the restart budget. A FAILED pane becomes EXITED; nothing is
+	// started (use StartPane).
+	ResetRestartBudget(context.Context, *connect.Request[v1.ResetRestartBudgetRequest]) (*connect.Response[v1.PaneStatus], error)
 }
 
 // NewTymuxServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -549,6 +697,42 @@ func NewTymuxServiceHandler(svc TymuxServiceHandler, opts ...connect.HandlerOpti
 		connect.WithSchema(tymuxServiceMethods.ByName("WriteStdin")),
 		connect.WithHandlerOptions(opts...),
 	)
+	tymuxServiceSetRestartPolicyHandler := connect.NewUnaryHandler(
+		TymuxServiceSetRestartPolicyProcedure,
+		svc.SetRestartPolicy,
+		connect.WithSchema(tymuxServiceMethods.ByName("SetRestartPolicy")),
+		connect.WithHandlerOptions(opts...),
+	)
+	tymuxServiceGetPaneStatusHandler := connect.NewUnaryHandler(
+		TymuxServiceGetPaneStatusProcedure,
+		svc.GetPaneStatus,
+		connect.WithSchema(tymuxServiceMethods.ByName("GetPaneStatus")),
+		connect.WithHandlerOptions(opts...),
+	)
+	tymuxServiceRestartPaneHandler := connect.NewUnaryHandler(
+		TymuxServiceRestartPaneProcedure,
+		svc.RestartPane,
+		connect.WithSchema(tymuxServiceMethods.ByName("RestartPane")),
+		connect.WithHandlerOptions(opts...),
+	)
+	tymuxServiceStopPaneHandler := connect.NewUnaryHandler(
+		TymuxServiceStopPaneProcedure,
+		svc.StopPane,
+		connect.WithSchema(tymuxServiceMethods.ByName("StopPane")),
+		connect.WithHandlerOptions(opts...),
+	)
+	tymuxServiceStartPaneHandler := connect.NewUnaryHandler(
+		TymuxServiceStartPaneProcedure,
+		svc.StartPane,
+		connect.WithSchema(tymuxServiceMethods.ByName("StartPane")),
+		connect.WithHandlerOptions(opts...),
+	)
+	tymuxServiceResetRestartBudgetHandler := connect.NewUnaryHandler(
+		TymuxServiceResetRestartBudgetProcedure,
+		svc.ResetRestartBudget,
+		connect.WithSchema(tymuxServiceMethods.ByName("ResetRestartBudget")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/tymux.v1.TymuxService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case TymuxServiceGetServerInfoProcedure:
@@ -577,6 +761,18 @@ func NewTymuxServiceHandler(svc TymuxServiceHandler, opts ...connect.HandlerOpti
 			tymuxServiceAttachHandler.ServeHTTP(w, r)
 		case TymuxServiceWriteStdinProcedure:
 			tymuxServiceWriteStdinHandler.ServeHTTP(w, r)
+		case TymuxServiceSetRestartPolicyProcedure:
+			tymuxServiceSetRestartPolicyHandler.ServeHTTP(w, r)
+		case TymuxServiceGetPaneStatusProcedure:
+			tymuxServiceGetPaneStatusHandler.ServeHTTP(w, r)
+		case TymuxServiceRestartPaneProcedure:
+			tymuxServiceRestartPaneHandler.ServeHTTP(w, r)
+		case TymuxServiceStopPaneProcedure:
+			tymuxServiceStopPaneHandler.ServeHTTP(w, r)
+		case TymuxServiceStartPaneProcedure:
+			tymuxServiceStartPaneHandler.ServeHTTP(w, r)
+		case TymuxServiceResetRestartBudgetProcedure:
+			tymuxServiceResetRestartBudgetHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -636,4 +832,28 @@ func (UnimplementedTymuxServiceHandler) Attach(context.Context, *connect.BidiStr
 
 func (UnimplementedTymuxServiceHandler) WriteStdin(context.Context, *connect.ClientStream[v1.WriteStdinRequest]) (*connect.Response[v1.WriteStdinResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.WriteStdin is not implemented"))
+}
+
+func (UnimplementedTymuxServiceHandler) SetRestartPolicy(context.Context, *connect.Request[v1.SetRestartPolicyRequest]) (*connect.Response[v1.SetRestartPolicyResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.SetRestartPolicy is not implemented"))
+}
+
+func (UnimplementedTymuxServiceHandler) GetPaneStatus(context.Context, *connect.Request[v1.GetPaneStatusRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.GetPaneStatus is not implemented"))
+}
+
+func (UnimplementedTymuxServiceHandler) RestartPane(context.Context, *connect.Request[v1.RestartPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.RestartPane is not implemented"))
+}
+
+func (UnimplementedTymuxServiceHandler) StopPane(context.Context, *connect.Request[v1.StopPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.StopPane is not implemented"))
+}
+
+func (UnimplementedTymuxServiceHandler) StartPane(context.Context, *connect.Request[v1.StartPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.StartPane is not implemented"))
+}
+
+func (UnimplementedTymuxServiceHandler) ResetRestartBudget(context.Context, *connect.Request[v1.ResetRestartBudgetRequest]) (*connect.Response[v1.PaneStatus], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("tymux.v1.TymuxService.ResetRestartBudget is not implemented"))
 }

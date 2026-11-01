@@ -21,6 +21,7 @@ const (
 	FileArgs       = "create_session.file_args"       // CreateSessionRequest.arg_specs
 	StdinFile      = "create_session.stdin_file"      // CreateSessionRequest.stdin_path
 	StdinStream    = "create_session.stdin_stream"    // CreateSessionRequest.stdin_stream, WriteStdin RPC
+	PaneLifecycle  = "pane.lifecycle"                 // restart_policy, GetPaneStatus, RestartPane, StopPane, StartPane, ResetRestartBudget, AttachRequest.subscribe_lifecycle
 )
 
 // Set is the capabilities a daemon advertises.

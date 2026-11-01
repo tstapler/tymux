@@ -9,8 +9,13 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use tokio_stream::wrappers::ReceiverStream;
 use tymux_proto::v1::layout::Node;
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
+use tymux_proto::v1::{
+    attach_event, attach_request, AttachRequest, GetPaneStatusRequest, LifecycleEventKind,
+    PaneState, RestartMode, RestartPolicy, SetRestartPolicyRequest, StartPaneRequest,
+};
 use tymux_proto::v1::{
     CreateSessionRequest, ListSessionsRequest, Liveness, Orientation, SplitPaneRequest,
     WriteStdinRequest,
@@ -551,6 +556,140 @@ async fn write_stdin_should_feed_a_stream_pane_and_need_refeeding_after_revive()
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+
+    std::fs::remove_dir_all(&sessions_dir).ok();
+}
+
+/// ADR-0007: policy and counters are in the session record. After a daemon restart a pane that
+/// was waiting out a backoff is EXITED (the timer is dropped, nothing revives on its own), its
+/// policy and counters are intact, and StartPane brings it back under the same policy.
+#[tokio::test]
+async fn restart_policy_and_counters_should_survive_a_daemon_restart_and_backoff_comes_back_exited()
+{
+    let addr = "127.0.0.1:17424";
+    let sessions_dir =
+        std::env::temp_dir().join(format!("tymuxd-restart-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let policy = RestartPolicy {
+        mode: RestartMode::Always as i32,
+        max_restarts: Some(4),
+        window_ms: Some(120_000),
+        initial_delay_ms: Some(3_600_000),
+        multiplier: Some(2.0),
+        max_delay_ms: Some(7_200_000),
+        jitter: Some(0.0),
+        healthy_after_ms: Some(10_000),
+    };
+
+    let (session_id, pane_id) = {
+        let _daemon = spawn_daemon(addr, &sessions_dir);
+        let mut client = wait_for_daemon(addr).await;
+        let session = client
+            .create_session(CreateSessionRequest {
+                name: "supervised".to_string(),
+                command: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "read go; exit 5".to_string()],
+                restart_policy: Some(policy),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = first_pane_id(&session);
+
+        // Wait for the exit through the lifecycle stream, not a timer.
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
+            resume_from_seq: None,
+            subscribe_lifecycle: true,
+        })
+        .await
+        .unwrap();
+        let mut events = client
+            .attach(ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::Input(b"go\n".to_vec())),
+            resume_from_seq: None,
+            subscribe_lifecycle: false,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.message().await.unwrap() {
+                if let Some(attach_event::Payload::Lifecycle(e)) = event.payload {
+                    if e.kind == LifecycleEventKind::RestartScheduled as i32 {
+                        return;
+                    }
+                }
+            }
+            panic!("stream closed before the restart was scheduled");
+        })
+        .await
+        .expect("restart scheduled within 10s");
+
+        // The supervisor persists in the background; a policy write persists synchronously and
+        // so also captures the exit just recorded.
+        client
+            .set_restart_policy(SetRestartPolicyRequest {
+                target: Some(tymux_proto::v1::set_restart_policy_request::Target::PaneId(
+                    pane_id.clone(),
+                )),
+                policy: Some(policy),
+                apply_to_existing_panes: false,
+            })
+            .await
+            .unwrap();
+        let status = client
+            .get_pane_status(GetPaneStatusRequest {
+                pane_id: pane_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.state, PaneState::Backoff as i32);
+        (session.id, pane_id)
+    };
+
+    let _daemon = spawn_daemon(addr, &sessions_dir);
+    let mut client = wait_for_daemon(addr).await;
+    let status = client
+        .get_pane_status(GetPaneStatusRequest {
+            pane_id: pane_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        status.state,
+        PaneState::Exited as i32,
+        "a pending backoff is dropped across a daemon restart, not resumed"
+    );
+    assert_eq!(status.next_restart_at_unix_ms, None);
+    assert_eq!(status.policy.unwrap(), policy);
+    assert_eq!(status.last_exit_code, Some(5));
+    assert_eq!(status.consecutive_failures, 1);
+    assert_eq!(status.pid, None);
+    let listed = client
+        .list_sessions(ListSessionsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.sessions[0].id, session_id);
+
+    let started = client
+        .start_pane(StartPaneRequest {
+            pane_id: pane_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(started.state, PaneState::Live as i32);
+    assert_eq!(started.pane_id, pane_id, "same pane id after the restart");
+    assert_eq!(started.policy.unwrap().mode, RestartMode::Always as i32);
 
     std::fs::remove_dir_all(&sessions_dir).ok();
 }

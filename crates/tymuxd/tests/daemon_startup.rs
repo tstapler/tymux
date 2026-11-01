@@ -93,6 +93,7 @@ fn leaf(command: &str) -> PersistedLayoutNode {
             cols: 80,
             exit_code: None,
             launch: Default::default(),
+            restart: None,
         },
     }
 }
@@ -110,6 +111,7 @@ fn valid_record(name: &str) -> PersistedSessionRecord {
             layout: leaf("/bin/sh"),
         }],
         active_window_id: window_id,
+        default_restart_policy: None,
     }
 }
 
@@ -136,6 +138,7 @@ fn structurally_invalid_record(name: &str) -> PersistedSessionRecord {
             },
         }],
         active_window_id: window_id,
+        default_restart_policy: None,
     }
 }
 

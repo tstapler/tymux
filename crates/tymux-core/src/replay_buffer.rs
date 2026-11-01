@@ -139,7 +139,8 @@ impl ReplayBuffer {
             let chunks = self
                 .entries
                 .iter()
-                .filter(|(seq, _)| *seq > resume_from_seq)
+                // `latest_seq` is the bound: a chunk past it would be re-sent live as well
+                .filter(|(seq, _)| *seq > resume_from_seq && *seq <= latest_seq)
                 .cloned()
                 .collect();
             ReplayOutcome::InWindow {
@@ -157,6 +158,19 @@ impl ReplayBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_since_should_not_return_a_chunk_newer_than_latest_seq() {
+        let mut buf = ReplayBuffer::new(100);
+        buf.push(1, b"a");
+        buf.push(2, b"b");
+        buf.push(3, b"c"); // pushed, but the pane has not published seq 3 yet
+        let ReplayOutcome::InWindow { chunks, tail_seq } = buf.replay_since(1, 2) else {
+            panic!("expected in-window");
+        };
+        assert_eq!(tail_seq, 2);
+        assert_eq!(chunks.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [2]);
+    }
 
     /// Story 2.1.1 AC1 / Task 2.1.1c — eviction under budget pressure: a
     /// buffer already holding 90 bytes against a 100-byte budget must

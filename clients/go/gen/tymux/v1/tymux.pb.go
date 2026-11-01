@@ -125,6 +125,199 @@ func (Orientation) EnumDescriptor() ([]byte, []int) {
 	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{1}
 }
 
+// Where a pane is in its life.
+type PaneState int32
+
+const (
+	PaneState_PANE_STATE_UNSPECIFIED PaneState = 0
+	// The process is running.
+	PaneState_PANE_STATE_LIVE PaneState = 1
+	// The process exited and the policy says not to restart it. Also the state of a pane
+	// restored from disk after a daemon restart (it is never started automatically, ADR-002).
+	PaneState_PANE_STATE_EXITED PaneState = 2
+	// Waiting out a backoff delay; PaneStatus.next_restart_at_unix_ms says until when.
+	PaneState_PANE_STATE_BACKOFF PaneState = 3
+	// A restart was requested and the old process has not died yet, or the new one is starting.
+	PaneState_PANE_STATE_RESTARTING PaneState = 4
+	// The restart budget is exhausted: no automatic restart until an operator acts
+	// (StartPane, RestartPane, or ResetRestartBudget).
+	PaneState_PANE_STATE_FAILED PaneState = 5
+	// Stopped with StopPane; will not restart until StartPane.
+	PaneState_PANE_STATE_STOPPED PaneState = 6
+)
+
+// Enum value maps for PaneState.
+var (
+	PaneState_name = map[int32]string{
+		0: "PANE_STATE_UNSPECIFIED",
+		1: "PANE_STATE_LIVE",
+		2: "PANE_STATE_EXITED",
+		3: "PANE_STATE_BACKOFF",
+		4: "PANE_STATE_RESTARTING",
+		5: "PANE_STATE_FAILED",
+		6: "PANE_STATE_STOPPED",
+	}
+	PaneState_value = map[string]int32{
+		"PANE_STATE_UNSPECIFIED": 0,
+		"PANE_STATE_LIVE":        1,
+		"PANE_STATE_EXITED":      2,
+		"PANE_STATE_BACKOFF":     3,
+		"PANE_STATE_RESTARTING":  4,
+		"PANE_STATE_FAILED":      5,
+		"PANE_STATE_STOPPED":     6,
+	}
+)
+
+func (x PaneState) Enum() *PaneState {
+	p := new(PaneState)
+	*p = x
+	return p
+}
+
+func (x PaneState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PaneState) Descriptor() protoreflect.EnumDescriptor {
+	return file_tymux_v1_tymux_proto_enumTypes[2].Descriptor()
+}
+
+func (PaneState) Type() protoreflect.EnumType {
+	return &file_tymux_v1_tymux_proto_enumTypes[2]
+}
+
+func (x PaneState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PaneState.Descriptor instead.
+func (PaneState) EnumDescriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{2}
+}
+
+type RestartMode int32
+
+const (
+	RestartMode_RESTART_MODE_UNSPECIFIED RestartMode = 0
+	// Never restart (the default for a pane with no policy).
+	RestartMode_RESTART_MODE_NEVER RestartMode = 1
+	// Restart after a non-zero exit, or an exit whose code is unknown.
+	RestartMode_RESTART_MODE_ON_FAILURE RestartMode = 2
+	// Restart after every exit, including code 0.
+	RestartMode_RESTART_MODE_ALWAYS RestartMode = 3
+	// Same behavior as ALWAYS: StopPane parks a pane in STOPPED in every mode, so nothing else
+	// differs. Provided for callers that expect Docker's name.
+	RestartMode_RESTART_MODE_UNLESS_STOPPED RestartMode = 4
+)
+
+// Enum value maps for RestartMode.
+var (
+	RestartMode_name = map[int32]string{
+		0: "RESTART_MODE_UNSPECIFIED",
+		1: "RESTART_MODE_NEVER",
+		2: "RESTART_MODE_ON_FAILURE",
+		3: "RESTART_MODE_ALWAYS",
+		4: "RESTART_MODE_UNLESS_STOPPED",
+	}
+	RestartMode_value = map[string]int32{
+		"RESTART_MODE_UNSPECIFIED":    0,
+		"RESTART_MODE_NEVER":          1,
+		"RESTART_MODE_ON_FAILURE":     2,
+		"RESTART_MODE_ALWAYS":         3,
+		"RESTART_MODE_UNLESS_STOPPED": 4,
+	}
+)
+
+func (x RestartMode) Enum() *RestartMode {
+	p := new(RestartMode)
+	*p = x
+	return p
+}
+
+func (x RestartMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RestartMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_tymux_v1_tymux_proto_enumTypes[3].Descriptor()
+}
+
+func (RestartMode) Type() protoreflect.EnumType {
+	return &file_tymux_v1_tymux_proto_enumTypes[3]
+}
+
+func (x RestartMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RestartMode.Descriptor instead.
+func (RestartMode) EnumDescriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{3}
+}
+
+type LifecycleEventKind int32
+
+const (
+	LifecycleEventKind_LIFECYCLE_EVENT_KIND_UNSPECIFIED LifecycleEventKind = 0
+	// The process exited. Always sent, whatever happens next.
+	LifecycleEventKind_LIFECYCLE_EVENT_KIND_EXITED LifecycleEventKind = 1
+	// A restart was scheduled after delay_ms (at next_restart_at_unix_ms).
+	LifecycleEventKind_LIFECYCLE_EVENT_KIND_RESTART_SCHEDULED LifecycleEventKind = 2
+	// The process was restarted; pid is the new one.
+	LifecycleEventKind_LIFECYCLE_EVENT_KIND_RESTARTED LifecycleEventKind = 3
+	// The restart budget ran out; the pane is FAILED.
+	LifecycleEventKind_LIFECYCLE_EVENT_KIND_FAILED LifecycleEventKind = 4
+	// An operator stop took effect; the pane is STOPPED.
+	LifecycleEventKind_LIFECYCLE_EVENT_KIND_STOPPED LifecycleEventKind = 5
+)
+
+// Enum value maps for LifecycleEventKind.
+var (
+	LifecycleEventKind_name = map[int32]string{
+		0: "LIFECYCLE_EVENT_KIND_UNSPECIFIED",
+		1: "LIFECYCLE_EVENT_KIND_EXITED",
+		2: "LIFECYCLE_EVENT_KIND_RESTART_SCHEDULED",
+		3: "LIFECYCLE_EVENT_KIND_RESTARTED",
+		4: "LIFECYCLE_EVENT_KIND_FAILED",
+		5: "LIFECYCLE_EVENT_KIND_STOPPED",
+	}
+	LifecycleEventKind_value = map[string]int32{
+		"LIFECYCLE_EVENT_KIND_UNSPECIFIED":       0,
+		"LIFECYCLE_EVENT_KIND_EXITED":            1,
+		"LIFECYCLE_EVENT_KIND_RESTART_SCHEDULED": 2,
+		"LIFECYCLE_EVENT_KIND_RESTARTED":         3,
+		"LIFECYCLE_EVENT_KIND_FAILED":            4,
+		"LIFECYCLE_EVENT_KIND_STOPPED":           5,
+	}
+)
+
+func (x LifecycleEventKind) Enum() *LifecycleEventKind {
+	p := new(LifecycleEventKind)
+	*p = x
+	return p
+}
+
+func (x LifecycleEventKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LifecycleEventKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_tymux_v1_tymux_proto_enumTypes[4].Descriptor()
+}
+
+func (LifecycleEventKind) Type() protoreflect.EnumType {
+	return &file_tymux_v1_tymux_proto_enumTypes[4]
+}
+
+func (x LifecycleEventKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LifecycleEventKind.Descriptor instead.
+func (LifecycleEventKind) EnumDescriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{4}
+}
+
 type Session struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -455,7 +648,10 @@ type Pane struct {
 	Liveness Liveness               `protobuf:"varint,4,opt,name=liveness,proto3,enum=tymux.v1.Liveness" json:"liveness,omitempty"`
 	// The pane's working directory at spawn time (Epic 1.5) — either the
 	// daemon's own cwd, or whatever CreateSessionRequest.cwd requested.
-	Cwd           string `protobuf:"bytes,5,opt,name=cwd,proto3" json:"cwd,omitempty"`
+	Cwd string `protobuf:"bytes,5,opt,name=cwd,proto3" json:"cwd,omitempty"`
+	// Lifecycle state (ADR-0007). `liveness` stays LIVE only while a process is running; DEAD
+	// covers every other state, which `state` tells apart.
+	State         PaneState `protobuf:"varint,6,opt,name=state,proto3,enum=tymux.v1.PaneState" json:"state,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -525,6 +721,13 @@ func (x *Pane) GetCwd() string {
 	return ""
 }
 
+func (x *Pane) GetState() PaneState {
+	if x != nil {
+		return x.State
+	}
+	return PaneState_PANE_STATE_UNSPECIFIED
+}
+
 type CreateSessionRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Name    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -574,7 +777,13 @@ type CreateSessionRequest struct {
 	// on revive the pipe is recreated empty and open, and the client must
 	// stream its input again (the bytes are never stored). Advertised as
 	// capability "create_session.stdin_stream"; ADR-0006.
-	StdinStream   bool `protobuf:"varint,9,opt,name=stdin_stream,json=stdinStream,proto3" json:"stdin_stream,omitempty"`
+	StdinStream bool `protobuf:"varint,9,opt,name=stdin_stream,json=stdinStream,proto3" json:"stdin_stream,omitempty"`
+	// Restart policy for the first pane, and the default for panes later added to the session.
+	// Absent means NEVER (the pane is never restarted automatically); this holds only when the
+	// message itself is absent: a present RestartPolicy with mode UNSPECIFIED is INVALID_ARGUMENT.
+	// Persisted. Advertised as
+	// capability "pane.lifecycle"; ADR-0007.
+	RestartPolicy *RestartPolicy `protobuf:"bytes,10,opt,name=restart_policy,json=restartPolicy,proto3" json:"restart_policy,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -670,6 +879,13 @@ func (x *CreateSessionRequest) GetStdinStream() bool {
 		return x.StdinStream
 	}
 	return false
+}
+
+func (x *CreateSessionRequest) GetRestartPolicy() *RestartPolicy {
+	if x != nil {
+		return x.RestartPolicy
+	}
+	return nil
 }
 
 // One argv entry.
@@ -1546,15 +1762,41 @@ func (x *SearchScrollbackResponse) GetLine() string {
 	return ""
 }
 
+// CapturePane and SearchScrollback on a pane whose child has exited (but whose pane the daemon
+// still holds) serve its last screen, with liveness = DEAD on the snapshot, rather than an error,
+// so a client can still show the final output. Attach, input and resize still need a running
+// pane. A pane the daemon holds no screen for (reloaded from disk after a restart) is
+// FAILED_PRECONDITION for all of them.
 type PaneSnapshot struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	PaneId        string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
-	Rows          uint32                 `protobuf:"varint,2,opt,name=rows,proto3" json:"rows,omitempty"`
-	Cols          uint32                 `protobuf:"varint,3,opt,name=cols,proto3" json:"cols,omitempty"`
-	Grid          []*Row                 `protobuf:"bytes,4,rep,name=grid,proto3" json:"grid,omitempty"`
-	CursorRow     uint32                 `protobuf:"varint,5,opt,name=cursor_row,json=cursorRow,proto3" json:"cursor_row,omitempty"`
-	CursorCol     uint32                 `protobuf:"varint,6,opt,name=cursor_col,json=cursorCol,proto3" json:"cursor_col,omitempty"`
-	Liveness      Liveness               `protobuf:"varint,7,opt,name=liveness,proto3,enum=tymux.v1.Liveness" json:"liveness,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	PaneId    string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	Rows      uint32                 `protobuf:"varint,2,opt,name=rows,proto3" json:"rows,omitempty"`
+	Cols      uint32                 `protobuf:"varint,3,opt,name=cols,proto3" json:"cols,omitempty"`
+	Grid      []*Row                 `protobuf:"bytes,4,rep,name=grid,proto3" json:"grid,omitempty"`
+	CursorRow uint32                 `protobuf:"varint,5,opt,name=cursor_row,json=cursorRow,proto3" json:"cursor_row,omitempty"`
+	CursorCol uint32                 `protobuf:"varint,6,opt,name=cursor_col,json=cursorCol,proto3" json:"cursor_col,omitempty"`
+	Liveness  Liveness               `protobuf:"varint,7,opt,name=liveness,proto3,enum=tymux.v1.Liveness" json:"liveness,omitempty"`
+	// OSC 8 hyperlink targets; Cell.hyperlink is a 1-based index into this table (0 = none).
+	Hyperlinks []*Hyperlink `protobuf:"bytes,8,rep,name=hyperlinks,proto3" json:"hyperlinks,omitempty"`
+	// Terminal state a redraw must restore so input keeps working after a (re)attach.
+	Title        string         `protobuf:"bytes,9,opt,name=title,proto3" json:"title,omitempty"` // OSC 0/2 window title
+	Modes        *TerminalModes `protobuf:"bytes,10,opt,name=modes,proto3" json:"modes,omitempty"`
+	CursorHidden bool           `protobuf:"varint,11,opt,name=cursor_hidden,json=cursorHidden,proto3" json:"cursor_hidden,omitempty"` // DECTCEM (?25l)
+	CursorStyle  uint32         `protobuf:"varint,12,opt,name=cursor_style,json=cursorStyle,proto3" json:"cursor_style,omitempty"`    // DECSCUSR 0-6
+	AltScreen    bool           `protobuf:"varint,13,opt,name=alt_screen,json=altScreen,proto3" json:"alt_screen,omitempty"`          // grid is the alternate screen (?1049/?1047/?47)
+	ScrollTop    uint32         `protobuf:"varint,14,opt,name=scroll_top,json=scrollTop,proto3" json:"scroll_top,omitempty"`          // DECSTBM, 1-based; 0 with scroll_bottom 0 = whole screen
+	ScrollBottom uint32         `protobuf:"varint,15,opt,name=scroll_bottom,json=scrollBottom,proto3" json:"scroll_bottom,omitempty"`
+	TabStops     []uint32       `protobuf:"varint,16,rep,packed,name=tab_stops,json=tabStops,proto3" json:"tab_stops,omitempty"` // 0-based columns with a tab stop (HTS/TBC)
+	Charsets     *Charsets      `protobuf:"bytes,17,opt,name=charsets,proto3" json:"charsets,omitempty"`
+	// The cursor sits past the last column (cursor_col is clamped to cols-1); the next printed
+	// character wraps to the next row, or overwrites the last column when DECAWM is off.
+	CursorPendingWrap bool `protobuf:"varint,18,opt,name=cursor_pending_wrap,json=cursorPendingWrap,proto3" json:"cursor_pending_wrap,omitempty"`
+	// Lifecycle state of the pane (ADR-0007). While the pane is in BACKOFF this snapshot is its
+	// last screen with liveness DEAD and state BACKOFF.
+	State PaneState `protobuf:"varint,20,opt,name=state,proto3,enum=tymux.v1.PaneState" json:"state,omitempty"`
+	// Set only when liveness is DEAD: the exited child's exit code, if it was captured. A child
+	// killed by a signal reports 1, not 128+signal (portable-pty 0.8.1 collapses signal deaths).
+	ExitCode      *int32 `protobuf:"varint,19,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1638,6 +1880,350 @@ func (x *PaneSnapshot) GetLiveness() Liveness {
 	return Liveness_LIVENESS_UNSPECIFIED
 }
 
+func (x *PaneSnapshot) GetHyperlinks() []*Hyperlink {
+	if x != nil {
+		return x.Hyperlinks
+	}
+	return nil
+}
+
+func (x *PaneSnapshot) GetTitle() string {
+	if x != nil {
+		return x.Title
+	}
+	return ""
+}
+
+func (x *PaneSnapshot) GetModes() *TerminalModes {
+	if x != nil {
+		return x.Modes
+	}
+	return nil
+}
+
+func (x *PaneSnapshot) GetCursorHidden() bool {
+	if x != nil {
+		return x.CursorHidden
+	}
+	return false
+}
+
+func (x *PaneSnapshot) GetCursorStyle() uint32 {
+	if x != nil {
+		return x.CursorStyle
+	}
+	return 0
+}
+
+func (x *PaneSnapshot) GetAltScreen() bool {
+	if x != nil {
+		return x.AltScreen
+	}
+	return false
+}
+
+func (x *PaneSnapshot) GetScrollTop() uint32 {
+	if x != nil {
+		return x.ScrollTop
+	}
+	return 0
+}
+
+func (x *PaneSnapshot) GetScrollBottom() uint32 {
+	if x != nil {
+		return x.ScrollBottom
+	}
+	return 0
+}
+
+func (x *PaneSnapshot) GetTabStops() []uint32 {
+	if x != nil {
+		return x.TabStops
+	}
+	return nil
+}
+
+func (x *PaneSnapshot) GetCharsets() *Charsets {
+	if x != nil {
+		return x.Charsets
+	}
+	return nil
+}
+
+func (x *PaneSnapshot) GetCursorPendingWrap() bool {
+	if x != nil {
+		return x.CursorPendingWrap
+	}
+	return false
+}
+
+func (x *PaneSnapshot) GetState() PaneState {
+	if x != nil {
+		return x.State
+	}
+	return PaneState_PANE_STATE_UNSPECIFIED
+}
+
+func (x *PaneSnapshot) GetExitCode() int32 {
+	if x != nil && x.ExitCode != nil {
+		return *x.ExitCode
+	}
+	return 0
+}
+
+type TerminalModes struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	AppCursorKeys  bool                   `protobuf:"varint,1,opt,name=app_cursor_keys,json=appCursorKeys,proto3" json:"app_cursor_keys,omitempty"`  // DECCKM ?1
+	AppKeypad      bool                   `protobuf:"varint,2,opt,name=app_keypad,json=appKeypad,proto3" json:"app_keypad,omitempty"`                // DECKPAM / DECKPNM
+	BracketedPaste bool                   `protobuf:"varint,3,opt,name=bracketed_paste,json=bracketedPaste,proto3" json:"bracketed_paste,omitempty"` // ?2004
+	FocusEvents    bool                   `protobuf:"varint,4,opt,name=focus_events,json=focusEvents,proto3" json:"focus_events,omitempty"`          // ?1004
+	MouseMode      uint32                 `protobuf:"varint,5,opt,name=mouse_mode,json=mouseMode,proto3" json:"mouse_mode,omitempty"`                // 0 off, 1 X10 (?9), 2 normal (?1000), 3 button (?1002), 4 any (?1003)
+	MouseEncoding  uint32                 `protobuf:"varint,6,opt,name=mouse_encoding,json=mouseEncoding,proto3" json:"mouse_encoding,omitempty"`    // 0 default, 1 utf8 (?1005), 2 sgr (?1006), 3 urxvt (?1015)
+	ReverseVideo   bool                   `protobuf:"varint,7,opt,name=reverse_video,json=reverseVideo,proto3" json:"reverse_video,omitempty"`       // DECSCNM ?5
+	Origin         bool                   `protobuf:"varint,8,opt,name=origin,proto3" json:"origin,omitempty"`                                       // DECOM ?6
+	NoAutowrap     bool                   `protobuf:"varint,9,opt,name=no_autowrap,json=noAutowrap,proto3" json:"no_autowrap,omitempty"`             // DECAWM ?7 reset
+	Insert         bool                   `protobuf:"varint,10,opt,name=insert,proto3" json:"insert,omitempty"`                                      // IRM 4
+	Newline        bool                   `protobuf:"varint,11,opt,name=newline,proto3" json:"newline,omitempty"`                                    // LNM 20
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *TerminalModes) Reset() {
+	*x = TerminalModes{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TerminalModes) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TerminalModes) ProtoMessage() {}
+
+func (x *TerminalModes) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TerminalModes.ProtoReflect.Descriptor instead.
+func (*TerminalModes) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *TerminalModes) GetAppCursorKeys() bool {
+	if x != nil {
+		return x.AppCursorKeys
+	}
+	return false
+}
+
+func (x *TerminalModes) GetAppKeypad() bool {
+	if x != nil {
+		return x.AppKeypad
+	}
+	return false
+}
+
+func (x *TerminalModes) GetBracketedPaste() bool {
+	if x != nil {
+		return x.BracketedPaste
+	}
+	return false
+}
+
+func (x *TerminalModes) GetFocusEvents() bool {
+	if x != nil {
+		return x.FocusEvents
+	}
+	return false
+}
+
+func (x *TerminalModes) GetMouseMode() uint32 {
+	if x != nil {
+		return x.MouseMode
+	}
+	return 0
+}
+
+func (x *TerminalModes) GetMouseEncoding() uint32 {
+	if x != nil {
+		return x.MouseEncoding
+	}
+	return 0
+}
+
+func (x *TerminalModes) GetReverseVideo() bool {
+	if x != nil {
+		return x.ReverseVideo
+	}
+	return false
+}
+
+func (x *TerminalModes) GetOrigin() bool {
+	if x != nil {
+		return x.Origin
+	}
+	return false
+}
+
+func (x *TerminalModes) GetNoAutowrap() bool {
+	if x != nil {
+		return x.NoAutowrap
+	}
+	return false
+}
+
+func (x *TerminalModes) GetInsert() bool {
+	if x != nil {
+		return x.Insert
+	}
+	return false
+}
+
+func (x *TerminalModes) GetNewline() bool {
+	if x != nil {
+		return x.Newline
+	}
+	return false
+}
+
+// SCS designations: 0 = ASCII (B), 1 = DEC special graphics (0), 2 = UK (A).
+type Charsets struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	G0            uint32                 `protobuf:"varint,1,opt,name=g0,proto3" json:"g0,omitempty"`
+	G1            uint32                 `protobuf:"varint,2,opt,name=g1,proto3" json:"g1,omitempty"`
+	G2            uint32                 `protobuf:"varint,3,opt,name=g2,proto3" json:"g2,omitempty"`
+	G3            uint32                 `protobuf:"varint,4,opt,name=g3,proto3" json:"g3,omitempty"`
+	Gl            uint32                 `protobuf:"varint,5,opt,name=gl,proto3" json:"gl,omitempty"` // active GL set, 0-3 (SO/SI/LS2/LS3)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Charsets) Reset() {
+	*x = Charsets{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Charsets) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Charsets) ProtoMessage() {}
+
+func (x *Charsets) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Charsets.ProtoReflect.Descriptor instead.
+func (*Charsets) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *Charsets) GetG0() uint32 {
+	if x != nil {
+		return x.G0
+	}
+	return 0
+}
+
+func (x *Charsets) GetG1() uint32 {
+	if x != nil {
+		return x.G1
+	}
+	return 0
+}
+
+func (x *Charsets) GetG2() uint32 {
+	if x != nil {
+		return x.G2
+	}
+	return 0
+}
+
+func (x *Charsets) GetG3() uint32 {
+	if x != nil {
+		return x.G3
+	}
+	return 0
+}
+
+func (x *Charsets) GetGl() uint32 {
+	if x != nil {
+		return x.Gl
+	}
+	return 0
+}
+
+type Hyperlink struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Uri           string                 `protobuf:"bytes,1,opt,name=uri,proto3" json:"uri,omitempty"`
+	Id            string                 `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"` // OSC 8 `id=` parameter; empty when the program gave none
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Hyperlink) Reset() {
+	*x = Hyperlink{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Hyperlink) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Hyperlink) ProtoMessage() {}
+
+func (x *Hyperlink) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Hyperlink.ProtoReflect.Descriptor instead.
+func (*Hyperlink) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *Hyperlink) GetUri() string {
+	if x != nil {
+		return x.Uri
+	}
+	return ""
+}
+
+func (x *Hyperlink) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
 type Row struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Cells         []*Cell                `protobuf:"bytes,1,rep,name=cells,proto3" json:"cells,omitempty"`
@@ -1647,7 +2233,7 @@ type Row struct {
 
 func (x *Row) Reset() {
 	*x = Row{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[24]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1659,7 +2245,7 @@ func (x *Row) String() string {
 func (*Row) ProtoMessage() {}
 
 func (x *Row) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[24]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1672,7 +2258,7 @@ func (x *Row) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Row.ProtoReflect.Descriptor instead.
 func (*Row) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{24}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *Row) GetCells() []*Cell {
@@ -1683,18 +2269,25 @@ func (x *Row) GetCells() []*Cell {
 }
 
 type Cell struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Text          string                 `protobuf:"bytes,1,opt,name=text,proto3" json:"text,omitempty"` // one grapheme cluster
-	Fg            uint32                 `protobuf:"varint,2,opt,name=fg,proto3" json:"fg,omitempty"`
-	Bg            uint32                 `protobuf:"varint,3,opt,name=bg,proto3" json:"bg,omitempty"`
-	Attrs         uint32                 `protobuf:"varint,4,opt,name=attrs,proto3" json:"attrs,omitempty"` // bitflags: 1=bold, 2=underline, 4=reverse, 8=italic
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Text  string                 `protobuf:"bytes,1,opt,name=text,proto3" json:"text,omitempty"` // one grapheme cluster
+	Fg    uint32                 `protobuf:"varint,2,opt,name=fg,proto3" json:"fg,omitempty"`
+	Bg    uint32                 `protobuf:"varint,3,opt,name=bg,proto3" json:"bg,omitempty"`
+	// bitflags: 1=bold, 2=underline, 4=reverse, 8=italic, 16=faint, 32=strikethrough,
+	// 64=blink, 128=conceal, 256=overline. Bold and faint are independent (SGR 1/2, both cleared by 22).
+	Attrs uint32 `protobuf:"varint,4,opt,name=attrs,proto3" json:"attrs,omitempty"`
+	// Meaningful only when the underline bit is set: 0=single, 1=double, 2=curly, 3=dotted, 4=dashed.
+	UnderlineStyle uint32 `protobuf:"varint,5,opt,name=underline_style,json=underlineStyle,proto3" json:"underline_style,omitempty"`
+	// Underline color (SGR 58), packed like fg/bg; 0 = same as the text color.
+	UnderlineColor uint32 `protobuf:"varint,6,opt,name=underline_color,json=underlineColor,proto3" json:"underline_color,omitempty"`
+	Hyperlink      uint32 `protobuf:"varint,7,opt,name=hyperlink,proto3" json:"hyperlink,omitempty"` // 1-based index into PaneSnapshot.hyperlinks; 0 = none
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Cell) Reset() {
 	*x = Cell{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[25]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1706,7 +2299,7 @@ func (x *Cell) String() string {
 func (*Cell) ProtoMessage() {}
 
 func (x *Cell) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[25]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1719,7 +2312,7 @@ func (x *Cell) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Cell.ProtoReflect.Descriptor instead.
 func (*Cell) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{25}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *Cell) GetText() string {
@@ -1750,6 +2343,27 @@ func (x *Cell) GetAttrs() uint32 {
 	return 0
 }
 
+func (x *Cell) GetUnderlineStyle() uint32 {
+	if x != nil {
+		return x.UnderlineStyle
+	}
+	return 0
+}
+
+func (x *Cell) GetUnderlineColor() uint32 {
+	if x != nil {
+		return x.UnderlineColor
+	}
+	return 0
+}
+
+func (x *Cell) GetHyperlink() uint32 {
+	if x != nil {
+		return x.Hyperlink
+	}
+	return 0
+}
+
 type AttachRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Payload:
@@ -1767,13 +2381,17 @@ type AttachRequest struct {
 	// PaneSnapshot. See the Attach RPC's doc comment above for the full
 	// reconnect contract.
 	ResumeFromSeq *uint64 `protobuf:"varint,4,opt,name=resume_from_seq,json=resumeFromSeq,proto3,oneof" json:"resume_from_seq,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// First message only: also stream LifecycleEvents (ADR-0007). Absent/false behaves as before
+	// for a pane with no restart policy; a client that does not set it never receives a
+	// `lifecycle` event, but still stays attached across restarts.
+	SubscribeLifecycle bool `protobuf:"varint,5,opt,name=subscribe_lifecycle,json=subscribeLifecycle,proto3" json:"subscribe_lifecycle,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *AttachRequest) Reset() {
 	*x = AttachRequest{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[26]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1785,7 +2403,7 @@ func (x *AttachRequest) String() string {
 func (*AttachRequest) ProtoMessage() {}
 
 func (x *AttachRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[26]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1798,7 +2416,7 @@ func (x *AttachRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachRequest.ProtoReflect.Descriptor instead.
 func (*AttachRequest) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{26}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *AttachRequest) GetPayload() isAttachRequest_Payload {
@@ -1842,6 +2460,13 @@ func (x *AttachRequest) GetResumeFromSeq() uint64 {
 	return 0
 }
 
+func (x *AttachRequest) GetSubscribeLifecycle() bool {
+	if x != nil {
+		return x.SubscribeLifecycle
+	}
+	return false
+}
+
 type isAttachRequest_Payload interface {
 	isAttachRequest_Payload()
 }
@@ -1878,7 +2503,7 @@ type WriteStdinRequest struct {
 
 func (x *WriteStdinRequest) Reset() {
 	*x = WriteStdinRequest{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[27]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1890,7 +2515,7 @@ func (x *WriteStdinRequest) String() string {
 func (*WriteStdinRequest) ProtoMessage() {}
 
 func (x *WriteStdinRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[27]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1903,7 +2528,7 @@ func (x *WriteStdinRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteStdinRequest.ProtoReflect.Descriptor instead.
 func (*WriteStdinRequest) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{27}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *WriteStdinRequest) GetPayload() isWriteStdinRequest_Payload {
@@ -1972,7 +2597,7 @@ type WriteStdinResponse struct {
 
 func (x *WriteStdinResponse) Reset() {
 	*x = WriteStdinResponse{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[28]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1984,7 +2609,7 @@ func (x *WriteStdinResponse) String() string {
 func (*WriteStdinResponse) ProtoMessage() {}
 
 func (x *WriteStdinResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[28]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1997,7 +2622,7 @@ func (x *WriteStdinResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteStdinResponse.ProtoReflect.Descriptor instead.
 func (*WriteStdinResponse) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{28}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *WriteStdinResponse) GetBytesWritten() uint64 {
@@ -2017,7 +2642,7 @@ type Resize struct {
 
 func (x *Resize) Reset() {
 	*x = Resize{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[29]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2029,7 +2654,7 @@ func (x *Resize) String() string {
 func (*Resize) ProtoMessage() {}
 
 func (x *Resize) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[29]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2042,7 +2667,7 @@ func (x *Resize) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Resize.ProtoReflect.Descriptor instead.
 func (*Resize) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{29}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *Resize) GetRows() uint32 {
@@ -2072,7 +2697,7 @@ type ExitStatus struct {
 
 func (x *ExitStatus) Reset() {
 	*x = ExitStatus{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[30]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2084,7 +2709,7 @@ func (x *ExitStatus) String() string {
 func (*ExitStatus) ProtoMessage() {}
 
 func (x *ExitStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[30]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2097,7 +2722,7 @@ func (x *ExitStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExitStatus.ProtoReflect.Descriptor instead.
 func (*ExitStatus) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{30}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ExitStatus) GetCode() int32 {
@@ -2122,7 +2747,7 @@ type OutputChunk struct {
 
 func (x *OutputChunk) Reset() {
 	*x = OutputChunk{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[31]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2134,7 +2759,7 @@ func (x *OutputChunk) String() string {
 func (*OutputChunk) ProtoMessage() {}
 
 func (x *OutputChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[31]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2147,7 +2772,7 @@ func (x *OutputChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OutputChunk.ProtoReflect.Descriptor instead.
 func (*OutputChunk) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{31}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *OutputChunk) GetSeq() uint64 {
@@ -2179,7 +2804,7 @@ type GapExceeded struct {
 
 func (x *GapExceeded) Reset() {
 	*x = GapExceeded{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[32]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2191,7 +2816,7 @@ func (x *GapExceeded) String() string {
 func (*GapExceeded) ProtoMessage() {}
 
 func (x *GapExceeded) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[32]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2204,7 +2829,7 @@ func (x *GapExceeded) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GapExceeded.ProtoReflect.Descriptor instead.
 func (*GapExceeded) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{32}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *GapExceeded) GetOldestAvailableSeq() uint64 {
@@ -2226,7 +2851,7 @@ type Heartbeat struct {
 
 func (x *Heartbeat) Reset() {
 	*x = Heartbeat{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[33]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2238,7 +2863,7 @@ func (x *Heartbeat) String() string {
 func (*Heartbeat) ProtoMessage() {}
 
 func (x *Heartbeat) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[33]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2251,7 +2876,7 @@ func (x *Heartbeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Heartbeat.ProtoReflect.Descriptor instead.
 func (*Heartbeat) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{33}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{36}
 }
 
 type AttachEvent struct {
@@ -2265,6 +2890,7 @@ type AttachEvent struct {
 	//	*AttachEvent_GapExceeded
 	//	*AttachEvent_Heartbeat
 	//	*AttachEvent_OutputChunk
+	//	*AttachEvent_Lifecycle
 	Payload       isAttachEvent_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2272,7 +2898,7 @@ type AttachEvent struct {
 
 func (x *AttachEvent) Reset() {
 	*x = AttachEvent{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[34]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2284,7 +2910,7 @@ func (x *AttachEvent) String() string {
 func (*AttachEvent) ProtoMessage() {}
 
 func (x *AttachEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[34]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2297,7 +2923,7 @@ func (x *AttachEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachEvent.ProtoReflect.Descriptor instead.
 func (*AttachEvent) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{34}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *AttachEvent) GetPayload() isAttachEvent_Payload {
@@ -2370,6 +2996,15 @@ func (x *AttachEvent) GetOutputChunk() *OutputChunk {
 	return nil
 }
 
+func (x *AttachEvent) GetLifecycle() *LifecycleEvent {
+	if x != nil {
+		if x, ok := x.Payload.(*AttachEvent_Lifecycle); ok {
+			return x.Lifecycle
+		}
+	}
+	return nil
+}
+
 type isAttachEvent_Payload interface {
 	isAttachEvent_Payload()
 }
@@ -2421,6 +3056,14 @@ type AttachEvent_OutputChunk struct {
 	OutputChunk *OutputChunk `protobuf:"bytes,7,opt,name=output_chunk,json=outputChunk,proto3,oneof"`
 }
 
+type AttachEvent_Lifecycle struct {
+	// ADR-0007: the pane's lifecycle changed (exited, restart scheduled, restarted, failed,
+	// stopped). Sent only to clients that set AttachRequest.subscribe_lifecycle. While a restart
+	// is pending the stream stays open and no `exited` event is sent; `exited` follows the final
+	// lifecycle event once the pane will not restart.
+	Lifecycle *LifecycleEvent `protobuf:"bytes,8,opt,name=lifecycle,proto3,oneof"`
+}
+
 func (*AttachEvent_Output) isAttachEvent_Payload() {}
 
 func (*AttachEvent_Snapshot) isAttachEvent_Payload() {}
@@ -2435,6 +3078,8 @@ func (*AttachEvent_Heartbeat) isAttachEvent_Payload() {}
 
 func (*AttachEvent_OutputChunk) isAttachEvent_Payload() {}
 
+func (*AttachEvent_Lifecycle) isAttachEvent_Payload() {}
+
 type GetServerInfoRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The caller's own protocol revision, for the daemon's logs; the daemon does
@@ -2446,7 +3091,7 @@ type GetServerInfoRequest struct {
 
 func (x *GetServerInfoRequest) Reset() {
 	*x = GetServerInfoRequest{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[35]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2458,7 +3103,7 @@ func (x *GetServerInfoRequest) String() string {
 func (*GetServerInfoRequest) ProtoMessage() {}
 
 func (x *GetServerInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[35]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2471,7 +3116,7 @@ func (x *GetServerInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetServerInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetServerInfoRequest) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{35}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *GetServerInfoRequest) GetClientProtocolVersion() uint32 {
@@ -2504,7 +3149,7 @@ type ServerInfo struct {
 
 func (x *ServerInfo) Reset() {
 	*x = ServerInfo{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[36]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2516,7 +3161,7 @@ func (x *ServerInfo) String() string {
 func (*ServerInfo) ProtoMessage() {}
 
 func (x *ServerInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[36]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2529,7 +3174,7 @@ func (x *ServerInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerInfo.ProtoReflect.Descriptor instead.
 func (*ServerInfo) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{36}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *ServerInfo) GetVersion() string {
@@ -2574,6 +3219,782 @@ func (x *ServerInfo) GetStartedAtUnix() int64 {
 	return 0
 }
 
+// When and how often the daemon restarts a pane's process. Unset optional fields take the
+// default shown; GetPaneStatus returns the policy with every field resolved.
+type RestartPolicy struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Mode  RestartMode            `protobuf:"varint,1,opt,name=mode,proto3,enum=tymux.v1.RestartMode" json:"mode,omitempty"`
+	// Automatic restarts allowed within window_ms; the next failure after that makes the pane
+	// FAILED. 0 means the first failure is already terminal. Default 5.
+	MaxRestarts *uint32 `protobuf:"varint,2,opt,name=max_restarts,json=maxRestarts,proto3,oneof" json:"max_restarts,omitempty"`
+	// Sliding window the budget is counted over. 0 = no window: the budget is lifetime, until
+	// ResetRestartBudget or StartPane. Default 60000.
+	WindowMs *uint64 `protobuf:"varint,3,opt,name=window_ms,json=windowMs,proto3,oneof" json:"window_ms,omitempty"`
+	// Delay before the first restart. Default 1000.
+	InitialDelayMs *uint64 `protobuf:"varint,4,opt,name=initial_delay_ms,json=initialDelayMs,proto3,oneof" json:"initial_delay_ms,omitempty"`
+	// Each consecutive failure multiplies the delay by this (>= 1). Default 2.0.
+	Multiplier *float64 `protobuf:"fixed64,5,opt,name=multiplier,proto3,oneof" json:"multiplier,omitempty"`
+	// Cap on the delay (>= initial_delay_ms). Default 30000.
+	MaxDelayMs *uint64 `protobuf:"varint,6,opt,name=max_delay_ms,json=maxDelayMs,proto3,oneof" json:"max_delay_ms,omitempty"`
+	// Fraction of the delay randomized either way, in [0, 1]; the result never exceeds
+	// max_delay_ms. Default 0.2.
+	Jitter *float64 `protobuf:"fixed64,7,opt,name=jitter,proto3,oneof" json:"jitter,omitempty"`
+	// A run at least this long counts as healthy and resets the delay to initial_delay_ms.
+	// Default 10000.
+	HealthyAfterMs *uint64 `protobuf:"varint,8,opt,name=healthy_after_ms,json=healthyAfterMs,proto3,oneof" json:"healthy_after_ms,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *RestartPolicy) Reset() {
+	*x = RestartPolicy{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestartPolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestartPolicy) ProtoMessage() {}
+
+func (x *RestartPolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestartPolicy.ProtoReflect.Descriptor instead.
+func (*RestartPolicy) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *RestartPolicy) GetMode() RestartMode {
+	if x != nil {
+		return x.Mode
+	}
+	return RestartMode_RESTART_MODE_UNSPECIFIED
+}
+
+func (x *RestartPolicy) GetMaxRestarts() uint32 {
+	if x != nil && x.MaxRestarts != nil {
+		return *x.MaxRestarts
+	}
+	return 0
+}
+
+func (x *RestartPolicy) GetWindowMs() uint64 {
+	if x != nil && x.WindowMs != nil {
+		return *x.WindowMs
+	}
+	return 0
+}
+
+func (x *RestartPolicy) GetInitialDelayMs() uint64 {
+	if x != nil && x.InitialDelayMs != nil {
+		return *x.InitialDelayMs
+	}
+	return 0
+}
+
+func (x *RestartPolicy) GetMultiplier() float64 {
+	if x != nil && x.Multiplier != nil {
+		return *x.Multiplier
+	}
+	return 0
+}
+
+func (x *RestartPolicy) GetMaxDelayMs() uint64 {
+	if x != nil && x.MaxDelayMs != nil {
+		return *x.MaxDelayMs
+	}
+	return 0
+}
+
+func (x *RestartPolicy) GetJitter() float64 {
+	if x != nil && x.Jitter != nil {
+		return *x.Jitter
+	}
+	return 0
+}
+
+func (x *RestartPolicy) GetHealthyAfterMs() uint64 {
+	if x != nil && x.HealthyAfterMs != nil {
+		return *x.HealthyAfterMs
+	}
+	return 0
+}
+
+type PaneStatus struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	PaneId string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	State  PaneState              `protobuf:"varint,2,opt,name=state,proto3,enum=tymux.v1.PaneState" json:"state,omitempty"`
+	// The effective policy, every field resolved.
+	Policy *RestartPolicy `protobuf:"bytes,3,opt,name=policy,proto3" json:"policy,omitempty"`
+	// Restarts since the pane was created, automatic and manual (lifetime, not windowed).
+	RestartCount uint32 `protobuf:"varint,4,opt,name=restart_count,json=restartCount,proto3" json:"restart_count,omitempty"`
+	// Automatic restarts still counted against the budget (inside the window).
+	RestartsInWindow uint32 `protobuf:"varint,5,opt,name=restarts_in_window,json=restartsInWindow,proto3" json:"restarts_in_window,omitempty"`
+	// Failed runs in a row since the last healthy one; sets the next backoff delay.
+	ConsecutiveFailures uint32 `protobuf:"varint,6,opt,name=consecutive_failures,json=consecutiveFailures,proto3" json:"consecutive_failures,omitempty"`
+	// Absent until the process has exited once.
+	LastExitCode *int32 `protobuf:"varint,7,opt,name=last_exit_code,json=lastExitCode,proto3,oneof" json:"last_exit_code,omitempty"`
+	// Set only when the daemon itself delivered the terminating signal (StopPane, RestartPane):
+	// portable-pty reports any signal death as code 1, so a signal the process took on its own
+	// is not distinguishable.
+	LastExitSignal   *int32 `protobuf:"varint,8,opt,name=last_exit_signal,json=lastExitSignal,proto3,oneof" json:"last_exit_signal,omitempty"`
+	LastExitAtUnixMs *int64 `protobuf:"varint,9,opt,name=last_exit_at_unix_ms,json=lastExitAtUnixMs,proto3,oneof" json:"last_exit_at_unix_ms,omitempty"`
+	// Set in BACKOFF and while a restart is due.
+	NextRestartAtUnixMs *int64 `protobuf:"varint,10,opt,name=next_restart_at_unix_ms,json=nextRestartAtUnixMs,proto3,oneof" json:"next_restart_at_unix_ms,omitempty"`
+	// Set while a process is running.
+	StartedAtUnixMs *int64 `protobuf:"varint,11,opt,name=started_at_unix_ms,json=startedAtUnixMs,proto3,oneof" json:"started_at_unix_ms,omitempty"`
+	// Milliseconds the running process has been up; 0 when not running.
+	UptimeMs uint64 `protobuf:"varint,12,opt,name=uptime_ms,json=uptimeMs,proto3" json:"uptime_ms,omitempty"`
+	// Set while a process is running.
+	Pid *uint32 `protobuf:"varint,13,opt,name=pid,proto3,oneof" json:"pid,omitempty"`
+	// The daemon's clock when this was read, so a client can show a countdown to
+	// next_restart_at without trusting its own clock.
+	NowUnixMs     int64 `protobuf:"varint,14,opt,name=now_unix_ms,json=nowUnixMs,proto3" json:"now_unix_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PaneStatus) Reset() {
+	*x = PaneStatus{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PaneStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PaneStatus) ProtoMessage() {}
+
+func (x *PaneStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PaneStatus.ProtoReflect.Descriptor instead.
+func (*PaneStatus) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *PaneStatus) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+func (x *PaneStatus) GetState() PaneState {
+	if x != nil {
+		return x.State
+	}
+	return PaneState_PANE_STATE_UNSPECIFIED
+}
+
+func (x *PaneStatus) GetPolicy() *RestartPolicy {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+func (x *PaneStatus) GetRestartCount() uint32 {
+	if x != nil {
+		return x.RestartCount
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetRestartsInWindow() uint32 {
+	if x != nil {
+		return x.RestartsInWindow
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetConsecutiveFailures() uint32 {
+	if x != nil {
+		return x.ConsecutiveFailures
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetLastExitCode() int32 {
+	if x != nil && x.LastExitCode != nil {
+		return *x.LastExitCode
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetLastExitSignal() int32 {
+	if x != nil && x.LastExitSignal != nil {
+		return *x.LastExitSignal
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetLastExitAtUnixMs() int64 {
+	if x != nil && x.LastExitAtUnixMs != nil {
+		return *x.LastExitAtUnixMs
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetNextRestartAtUnixMs() int64 {
+	if x != nil && x.NextRestartAtUnixMs != nil {
+		return *x.NextRestartAtUnixMs
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetStartedAtUnixMs() int64 {
+	if x != nil && x.StartedAtUnixMs != nil {
+		return *x.StartedAtUnixMs
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetUptimeMs() uint64 {
+	if x != nil {
+		return x.UptimeMs
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetPid() uint32 {
+	if x != nil && x.Pid != nil {
+		return *x.Pid
+	}
+	return 0
+}
+
+func (x *PaneStatus) GetNowUnixMs() int64 {
+	if x != nil {
+		return x.NowUnixMs
+	}
+	return 0
+}
+
+type SetRestartPolicyRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Target:
+	//
+	//	*SetRestartPolicyRequest_PaneId
+	//	*SetRestartPolicyRequest_SessionId
+	Target isSetRestartPolicyRequest_Target `protobuf_oneof:"target"`
+	Policy *RestartPolicy                   `protobuf:"bytes,3,opt,name=policy,proto3" json:"policy,omitempty"`
+	// With session_id: also apply the policy to the session's existing panes.
+	ApplyToExistingPanes bool `protobuf:"varint,4,opt,name=apply_to_existing_panes,json=applyToExistingPanes,proto3" json:"apply_to_existing_panes,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *SetRestartPolicyRequest) Reset() {
+	*x = SetRestartPolicyRequest{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetRestartPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetRestartPolicyRequest) ProtoMessage() {}
+
+func (x *SetRestartPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetRestartPolicyRequest.ProtoReflect.Descriptor instead.
+func (*SetRestartPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *SetRestartPolicyRequest) GetTarget() isSetRestartPolicyRequest_Target {
+	if x != nil {
+		return x.Target
+	}
+	return nil
+}
+
+func (x *SetRestartPolicyRequest) GetPaneId() string {
+	if x != nil {
+		if x, ok := x.Target.(*SetRestartPolicyRequest_PaneId); ok {
+			return x.PaneId
+		}
+	}
+	return ""
+}
+
+func (x *SetRestartPolicyRequest) GetSessionId() string {
+	if x != nil {
+		if x, ok := x.Target.(*SetRestartPolicyRequest_SessionId); ok {
+			return x.SessionId
+		}
+	}
+	return ""
+}
+
+func (x *SetRestartPolicyRequest) GetPolicy() *RestartPolicy {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+func (x *SetRestartPolicyRequest) GetApplyToExistingPanes() bool {
+	if x != nil {
+		return x.ApplyToExistingPanes
+	}
+	return false
+}
+
+type isSetRestartPolicyRequest_Target interface {
+	isSetRestartPolicyRequest_Target()
+}
+
+type SetRestartPolicyRequest_PaneId struct {
+	PaneId string `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3,oneof"`
+}
+
+type SetRestartPolicyRequest_SessionId struct {
+	// Sets the default for panes created later in this session.
+	SessionId string `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3,oneof"`
+}
+
+func (*SetRestartPolicyRequest_PaneId) isSetRestartPolicyRequest_Target() {}
+
+func (*SetRestartPolicyRequest_SessionId) isSetRestartPolicyRequest_Target() {}
+
+type SetRestartPolicyResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The pane's status; unset when the target was a session.
+	Status        *PaneStatus `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetRestartPolicyResponse) Reset() {
+	*x = SetRestartPolicyResponse{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetRestartPolicyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetRestartPolicyResponse) ProtoMessage() {}
+
+func (x *SetRestartPolicyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetRestartPolicyResponse.ProtoReflect.Descriptor instead.
+func (*SetRestartPolicyResponse) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{43}
+}
+
+func (x *SetRestartPolicyResponse) GetStatus() *PaneStatus {
+	if x != nil {
+		return x.Status
+	}
+	return nil
+}
+
+type GetPaneStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PaneId        string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetPaneStatusRequest) Reset() {
+	*x = GetPaneStatusRequest{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetPaneStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetPaneStatusRequest) ProtoMessage() {}
+
+func (x *GetPaneStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetPaneStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetPaneStatusRequest) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *GetPaneStatusRequest) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+type RestartPaneRequest struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	PaneId string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	// Also clear the backoff delay and the window budget.
+	ResetBackoff bool `protobuf:"varint,2,opt,name=reset_backoff,json=resetBackoff,proto3" json:"reset_backoff,omitempty"`
+	// How long a running process gets after SIGTERM before SIGKILL. Default 5000.
+	GraceMs       *uint64 `protobuf:"varint,3,opt,name=grace_ms,json=graceMs,proto3,oneof" json:"grace_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestartPaneRequest) Reset() {
+	*x = RestartPaneRequest{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestartPaneRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestartPaneRequest) ProtoMessage() {}
+
+func (x *RestartPaneRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestartPaneRequest.ProtoReflect.Descriptor instead.
+func (*RestartPaneRequest) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{45}
+}
+
+func (x *RestartPaneRequest) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+func (x *RestartPaneRequest) GetResetBackoff() bool {
+	if x != nil {
+		return x.ResetBackoff
+	}
+	return false
+}
+
+func (x *RestartPaneRequest) GetGraceMs() uint64 {
+	if x != nil && x.GraceMs != nil {
+		return *x.GraceMs
+	}
+	return 0
+}
+
+type StopPaneRequest struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	PaneId string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	// How long the process gets after SIGTERM before SIGKILL. Default 5000.
+	GraceMs       *uint64 `protobuf:"varint,2,opt,name=grace_ms,json=graceMs,proto3,oneof" json:"grace_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StopPaneRequest) Reset() {
+	*x = StopPaneRequest{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[46]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StopPaneRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StopPaneRequest) ProtoMessage() {}
+
+func (x *StopPaneRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[46]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StopPaneRequest.ProtoReflect.Descriptor instead.
+func (*StopPaneRequest) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{46}
+}
+
+func (x *StopPaneRequest) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+func (x *StopPaneRequest) GetGraceMs() uint64 {
+	if x != nil && x.GraceMs != nil {
+		return *x.GraceMs
+	}
+	return 0
+}
+
+type StartPaneRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PaneId        string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartPaneRequest) Reset() {
+	*x = StartPaneRequest{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartPaneRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartPaneRequest) ProtoMessage() {}
+
+func (x *StartPaneRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartPaneRequest.ProtoReflect.Descriptor instead.
+func (*StartPaneRequest) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *StartPaneRequest) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+type ResetRestartBudgetRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PaneId        string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResetRestartBudgetRequest) Reset() {
+	*x = ResetRestartBudgetRequest{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[48]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResetRestartBudgetRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResetRestartBudgetRequest) ProtoMessage() {}
+
+func (x *ResetRestartBudgetRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[48]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResetRestartBudgetRequest.ProtoReflect.Descriptor instead.
+func (*ResetRestartBudgetRequest) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{48}
+}
+
+func (x *ResetRestartBudgetRequest) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+type LifecycleEvent struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Kind  LifecycleEventKind     `protobuf:"varint,1,opt,name=kind,proto3,enum=tymux.v1.LifecycleEventKind" json:"kind,omitempty"`
+	// The pane's state after this event.
+	State               PaneState `protobuf:"varint,2,opt,name=state,proto3,enum=tymux.v1.PaneState" json:"state,omitempty"`
+	ExitCode            *int32    `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
+	ExitSignal          *int32    `protobuf:"varint,4,opt,name=exit_signal,json=exitSignal,proto3,oneof" json:"exit_signal,omitempty"`
+	DelayMs             *uint64   `protobuf:"varint,5,opt,name=delay_ms,json=delayMs,proto3,oneof" json:"delay_ms,omitempty"`
+	NextRestartAtUnixMs *int64    `protobuf:"varint,6,opt,name=next_restart_at_unix_ms,json=nextRestartAtUnixMs,proto3,oneof" json:"next_restart_at_unix_ms,omitempty"`
+	Pid                 *uint32   `protobuf:"varint,7,opt,name=pid,proto3,oneof" json:"pid,omitempty"`
+	RestartCount        uint32    `protobuf:"varint,8,opt,name=restart_count,json=restartCount,proto3" json:"restart_count,omitempty"`
+	AtUnixMs            int64     `protobuf:"varint,9,opt,name=at_unix_ms,json=atUnixMs,proto3" json:"at_unix_ms,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *LifecycleEvent) Reset() {
+	*x = LifecycleEvent{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[49]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LifecycleEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LifecycleEvent) ProtoMessage() {}
+
+func (x *LifecycleEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[49]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LifecycleEvent.ProtoReflect.Descriptor instead.
+func (*LifecycleEvent) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{49}
+}
+
+func (x *LifecycleEvent) GetKind() LifecycleEventKind {
+	if x != nil {
+		return x.Kind
+	}
+	return LifecycleEventKind_LIFECYCLE_EVENT_KIND_UNSPECIFIED
+}
+
+func (x *LifecycleEvent) GetState() PaneState {
+	if x != nil {
+		return x.State
+	}
+	return PaneState_PANE_STATE_UNSPECIFIED
+}
+
+func (x *LifecycleEvent) GetExitCode() int32 {
+	if x != nil && x.ExitCode != nil {
+		return *x.ExitCode
+	}
+	return 0
+}
+
+func (x *LifecycleEvent) GetExitSignal() int32 {
+	if x != nil && x.ExitSignal != nil {
+		return *x.ExitSignal
+	}
+	return 0
+}
+
+func (x *LifecycleEvent) GetDelayMs() uint64 {
+	if x != nil && x.DelayMs != nil {
+		return *x.DelayMs
+	}
+	return 0
+}
+
+func (x *LifecycleEvent) GetNextRestartAtUnixMs() int64 {
+	if x != nil && x.NextRestartAtUnixMs != nil {
+		return *x.NextRestartAtUnixMs
+	}
+	return 0
+}
+
+func (x *LifecycleEvent) GetPid() uint32 {
+	if x != nil && x.Pid != nil {
+		return *x.Pid
+	}
+	return 0
+}
+
+func (x *LifecycleEvent) GetRestartCount() uint32 {
+	if x != nil {
+		return x.RestartCount
+	}
+	return 0
+}
+
+func (x *LifecycleEvent) GetAtUnixMs() int64 {
+	if x != nil {
+		return x.AtUnixMs
+	}
+	return 0
+}
+
 var File_tymux_v1_tymux_proto protoreflect.FileDescriptor
 
 const file_tymux_v1_tymux_proto_rawDesc = "" +
@@ -2597,13 +4018,14 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\bchildren\x18\x02 \x03(\v2\x15.tymux.v1.LayoutChildR\bchildren\"M\n" +
 	"\vLayoutChild\x12(\n" +
 	"\x06layout\x18\x01 \x01(\v2\x10.tymux.v1.LayoutR\x06layout\x12\x14\n" +
-	"\x05ratio\x18\x02 \x01(\x02R\x05ratio\"\x80\x01\n" +
+	"\x05ratio\x18\x02 \x01(\x02R\x05ratio\"\xab\x01\n" +
 	"\x04Pane\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04rows\x18\x02 \x01(\rR\x04rows\x12\x12\n" +
 	"\x04cols\x18\x03 \x01(\rR\x04cols\x12.\n" +
 	"\bliveness\x18\x04 \x01(\x0e2\x12.tymux.v1.LivenessR\bliveness\x12\x10\n" +
-	"\x03cwd\x18\x05 \x01(\tR\x03cwd\"\xf0\x02\n" +
+	"\x03cwd\x18\x05 \x01(\tR\x03cwd\x12)\n" +
+	"\x05state\x18\x06 \x01(\x0e2\x13.tymux.v1.PaneStateR\x05state\"\xb0\x03\n" +
 	"\x14CreateSessionRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x10\n" +
@@ -2615,7 +4037,9 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\targ_specs\x18\a \x03(\v2\x11.tymux.v1.ArgSpecR\bargSpecs\x12\x1d\n" +
 	"\n" +
 	"stdin_path\x18\b \x01(\tR\tstdinPath\x12!\n" +
-	"\fstdin_stream\x18\t \x01(\bR\vstdinStream\x1a6\n" +
+	"\fstdin_stream\x18\t \x01(\bR\vstdinStream\x12>\n" +
+	"\x0erestart_policy\x18\n" +
+	" \x01(\v2\x17.tymux.v1.RestartPolicyR\rrestartPolicy\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"_\n" +
@@ -2669,7 +4093,7 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x18SearchScrollbackResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\rR\x06offset\x12\x12\n" +
-	"\x04line\x18\x03 \x01(\tR\x04line\"\xe0\x01\n" +
+	"\x04line\x18\x03 \x01(\tR\x04line\"\xdd\x05\n" +
 	"\fPaneSnapshot\x12\x17\n" +
 	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12\x12\n" +
 	"\x04rows\x18\x02 \x01(\rR\x04rows\x12\x12\n" +
@@ -2679,19 +4103,68 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"cursor_row\x18\x05 \x01(\rR\tcursorRow\x12\x1d\n" +
 	"\n" +
 	"cursor_col\x18\x06 \x01(\rR\tcursorCol\x12.\n" +
-	"\bliveness\x18\a \x01(\x0e2\x12.tymux.v1.LivenessR\bliveness\"+\n" +
+	"\bliveness\x18\a \x01(\x0e2\x12.tymux.v1.LivenessR\bliveness\x123\n" +
+	"\n" +
+	"hyperlinks\x18\b \x03(\v2\x13.tymux.v1.HyperlinkR\n" +
+	"hyperlinks\x12\x14\n" +
+	"\x05title\x18\t \x01(\tR\x05title\x12-\n" +
+	"\x05modes\x18\n" +
+	" \x01(\v2\x17.tymux.v1.TerminalModesR\x05modes\x12#\n" +
+	"\rcursor_hidden\x18\v \x01(\bR\fcursorHidden\x12!\n" +
+	"\fcursor_style\x18\f \x01(\rR\vcursorStyle\x12\x1d\n" +
+	"\n" +
+	"alt_screen\x18\r \x01(\bR\taltScreen\x12\x1d\n" +
+	"\n" +
+	"scroll_top\x18\x0e \x01(\rR\tscrollTop\x12#\n" +
+	"\rscroll_bottom\x18\x0f \x01(\rR\fscrollBottom\x12\x1b\n" +
+	"\ttab_stops\x18\x10 \x03(\rR\btabStops\x12.\n" +
+	"\bcharsets\x18\x11 \x01(\v2\x12.tymux.v1.CharsetsR\bcharsets\x12.\n" +
+	"\x13cursor_pending_wrap\x18\x12 \x01(\bR\x11cursorPendingWrap\x12)\n" +
+	"\x05state\x18\x14 \x01(\x0e2\x13.tymux.v1.PaneStateR\x05state\x12 \n" +
+	"\texit_code\x18\x13 \x01(\x05H\x00R\bexitCode\x88\x01\x01B\f\n" +
+	"\n" +
+	"_exit_code\"\xf8\x02\n" +
+	"\rTerminalModes\x12&\n" +
+	"\x0fapp_cursor_keys\x18\x01 \x01(\bR\rappCursorKeys\x12\x1d\n" +
+	"\n" +
+	"app_keypad\x18\x02 \x01(\bR\tappKeypad\x12'\n" +
+	"\x0fbracketed_paste\x18\x03 \x01(\bR\x0ebracketedPaste\x12!\n" +
+	"\ffocus_events\x18\x04 \x01(\bR\vfocusEvents\x12\x1d\n" +
+	"\n" +
+	"mouse_mode\x18\x05 \x01(\rR\tmouseMode\x12%\n" +
+	"\x0emouse_encoding\x18\x06 \x01(\rR\rmouseEncoding\x12#\n" +
+	"\rreverse_video\x18\a \x01(\bR\freverseVideo\x12\x16\n" +
+	"\x06origin\x18\b \x01(\bR\x06origin\x12\x1f\n" +
+	"\vno_autowrap\x18\t \x01(\bR\n" +
+	"noAutowrap\x12\x16\n" +
+	"\x06insert\x18\n" +
+	" \x01(\bR\x06insert\x12\x18\n" +
+	"\anewline\x18\v \x01(\bR\anewline\"Z\n" +
+	"\bCharsets\x12\x0e\n" +
+	"\x02g0\x18\x01 \x01(\rR\x02g0\x12\x0e\n" +
+	"\x02g1\x18\x02 \x01(\rR\x02g1\x12\x0e\n" +
+	"\x02g2\x18\x03 \x01(\rR\x02g2\x12\x0e\n" +
+	"\x02g3\x18\x04 \x01(\rR\x02g3\x12\x0e\n" +
+	"\x02gl\x18\x05 \x01(\rR\x02gl\"-\n" +
+	"\tHyperlink\x12\x10\n" +
+	"\x03uri\x18\x01 \x01(\tR\x03uri\x12\x0e\n" +
+	"\x02id\x18\x02 \x01(\tR\x02id\"+\n" +
 	"\x03Row\x12$\n" +
-	"\x05cells\x18\x01 \x03(\v2\x0e.tymux.v1.CellR\x05cells\"P\n" +
+	"\x05cells\x18\x01 \x03(\v2\x0e.tymux.v1.CellR\x05cells\"\xc0\x01\n" +
 	"\x04Cell\x12\x12\n" +
 	"\x04text\x18\x01 \x01(\tR\x04text\x12\x0e\n" +
 	"\x02fg\x18\x02 \x01(\rR\x02fg\x12\x0e\n" +
 	"\x02bg\x18\x03 \x01(\rR\x02bg\x12\x14\n" +
-	"\x05attrs\x18\x04 \x01(\rR\x05attrs\"\xba\x01\n" +
+	"\x05attrs\x18\x04 \x01(\rR\x05attrs\x12'\n" +
+	"\x0funderline_style\x18\x05 \x01(\rR\x0eunderlineStyle\x12'\n" +
+	"\x0funderline_color\x18\x06 \x01(\rR\x0eunderlineColor\x12\x1c\n" +
+	"\thyperlink\x18\a \x01(\rR\thyperlink\"\xeb\x01\n" +
 	"\rAttachRequest\x12\x19\n" +
 	"\apane_id\x18\x01 \x01(\tH\x00R\x06paneId\x12\x16\n" +
 	"\x05input\x18\x02 \x01(\fH\x00R\x05input\x12*\n" +
 	"\x06resize\x18\x03 \x01(\v2\x10.tymux.v1.ResizeH\x00R\x06resize\x12+\n" +
-	"\x0fresume_from_seq\x18\x04 \x01(\x04H\x01R\rresumeFromSeq\x88\x01\x01B\t\n" +
+	"\x0fresume_from_seq\x18\x04 \x01(\x04H\x01R\rresumeFromSeq\x88\x01\x01\x12/\n" +
+	"\x13subscribe_lifecycle\x18\x05 \x01(\bR\x12subscribeLifecycleB\t\n" +
 	"\apayloadB\x12\n" +
 	"\x10_resume_from_seq\"g\n" +
 	"\x11WriteStdinRequest\x12\x19\n" +
@@ -2713,7 +4186,7 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x04data\x18\x02 \x01(\fR\x04data\"?\n" +
 	"\vGapExceeded\x120\n" +
 	"\x14oldest_available_seq\x18\x01 \x01(\x04R\x12oldestAvailableSeq\"\v\n" +
-	"\tHeartbeat\"\xe6\x02\n" +
+	"\tHeartbeat\"\xa0\x03\n" +
 	"\vAttachEvent\x12\x18\n" +
 	"\x06output\x18\x01 \x01(\fH\x00R\x06output\x124\n" +
 	"\bsnapshot\x18\x02 \x01(\v2\x16.tymux.v1.PaneSnapshotH\x00R\bsnapshot\x12.\n" +
@@ -2722,7 +4195,8 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"output_gap\x18\x04 \x01(\bH\x00R\toutputGap\x12:\n" +
 	"\fgap_exceeded\x18\x05 \x01(\v2\x15.tymux.v1.GapExceededH\x00R\vgapExceeded\x123\n" +
 	"\theartbeat\x18\x06 \x01(\v2\x13.tymux.v1.HeartbeatH\x00R\theartbeat\x12:\n" +
-	"\foutput_chunk\x18\a \x01(\v2\x15.tymux.v1.OutputChunkH\x00R\voutputChunkB\t\n" +
+	"\foutput_chunk\x18\a \x01(\v2\x15.tymux.v1.OutputChunkH\x00R\voutputChunk\x128\n" +
+	"\tlifecycle\x18\b \x01(\v2\x18.tymux.v1.LifecycleEventH\x00R\tlifecycleB\t\n" +
 	"\apayload\"N\n" +
 	"\x14GetServerInfoRequest\x126\n" +
 	"\x17client_protocol_version\x18\x01 \x01(\rR\x15clientProtocolVersion\"\xee\x01\n" +
@@ -2733,7 +4207,92 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x1bmin_client_protocol_version\x18\x03 \x01(\rR\x18minClientProtocolVersion\x12\"\n" +
 	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12\x10\n" +
 	"\x03pid\x18\x05 \x01(\rR\x03pid\x12&\n" +
-	"\x0fstarted_at_unix\x18\x06 \x01(\x03R\rstartedAtUnix*J\n" +
+	"\x0fstarted_at_unix\x18\x06 \x01(\x03R\rstartedAtUnix\"\xbf\x03\n" +
+	"\rRestartPolicy\x12)\n" +
+	"\x04mode\x18\x01 \x01(\x0e2\x15.tymux.v1.RestartModeR\x04mode\x12&\n" +
+	"\fmax_restarts\x18\x02 \x01(\rH\x00R\vmaxRestarts\x88\x01\x01\x12 \n" +
+	"\twindow_ms\x18\x03 \x01(\x04H\x01R\bwindowMs\x88\x01\x01\x12-\n" +
+	"\x10initial_delay_ms\x18\x04 \x01(\x04H\x02R\x0einitialDelayMs\x88\x01\x01\x12#\n" +
+	"\n" +
+	"multiplier\x18\x05 \x01(\x01H\x03R\n" +
+	"multiplier\x88\x01\x01\x12%\n" +
+	"\fmax_delay_ms\x18\x06 \x01(\x04H\x04R\n" +
+	"maxDelayMs\x88\x01\x01\x12\x1b\n" +
+	"\x06jitter\x18\a \x01(\x01H\x05R\x06jitter\x88\x01\x01\x12-\n" +
+	"\x10healthy_after_ms\x18\b \x01(\x04H\x06R\x0ehealthyAfterMs\x88\x01\x01B\x0f\n" +
+	"\r_max_restartsB\f\n" +
+	"\n" +
+	"_window_msB\x13\n" +
+	"\x11_initial_delay_msB\r\n" +
+	"\v_multiplierB\x0f\n" +
+	"\r_max_delay_msB\t\n" +
+	"\a_jitterB\x13\n" +
+	"\x11_healthy_after_ms\"\xd3\x05\n" +
+	"\n" +
+	"PaneStatus\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12)\n" +
+	"\x05state\x18\x02 \x01(\x0e2\x13.tymux.v1.PaneStateR\x05state\x12/\n" +
+	"\x06policy\x18\x03 \x01(\v2\x17.tymux.v1.RestartPolicyR\x06policy\x12#\n" +
+	"\rrestart_count\x18\x04 \x01(\rR\frestartCount\x12,\n" +
+	"\x12restarts_in_window\x18\x05 \x01(\rR\x10restartsInWindow\x121\n" +
+	"\x14consecutive_failures\x18\x06 \x01(\rR\x13consecutiveFailures\x12)\n" +
+	"\x0elast_exit_code\x18\a \x01(\x05H\x00R\flastExitCode\x88\x01\x01\x12-\n" +
+	"\x10last_exit_signal\x18\b \x01(\x05H\x01R\x0elastExitSignal\x88\x01\x01\x123\n" +
+	"\x14last_exit_at_unix_ms\x18\t \x01(\x03H\x02R\x10lastExitAtUnixMs\x88\x01\x01\x129\n" +
+	"\x17next_restart_at_unix_ms\x18\n" +
+	" \x01(\x03H\x03R\x13nextRestartAtUnixMs\x88\x01\x01\x120\n" +
+	"\x12started_at_unix_ms\x18\v \x01(\x03H\x04R\x0fstartedAtUnixMs\x88\x01\x01\x12\x1b\n" +
+	"\tuptime_ms\x18\f \x01(\x04R\buptimeMs\x12\x15\n" +
+	"\x03pid\x18\r \x01(\rH\x05R\x03pid\x88\x01\x01\x12\x1e\n" +
+	"\vnow_unix_ms\x18\x0e \x01(\x03R\tnowUnixMsB\x11\n" +
+	"\x0f_last_exit_codeB\x13\n" +
+	"\x11_last_exit_signalB\x17\n" +
+	"\x15_last_exit_at_unix_msB\x1a\n" +
+	"\x18_next_restart_at_unix_msB\x15\n" +
+	"\x13_started_at_unix_msB\x06\n" +
+	"\x04_pid\"\xc7\x01\n" +
+	"\x17SetRestartPolicyRequest\x12\x19\n" +
+	"\apane_id\x18\x01 \x01(\tH\x00R\x06paneId\x12\x1f\n" +
+	"\n" +
+	"session_id\x18\x02 \x01(\tH\x00R\tsessionId\x12/\n" +
+	"\x06policy\x18\x03 \x01(\v2\x17.tymux.v1.RestartPolicyR\x06policy\x125\n" +
+	"\x17apply_to_existing_panes\x18\x04 \x01(\bR\x14applyToExistingPanesB\b\n" +
+	"\x06target\"H\n" +
+	"\x18SetRestartPolicyResponse\x12,\n" +
+	"\x06status\x18\x01 \x01(\v2\x14.tymux.v1.PaneStatusR\x06status\"/\n" +
+	"\x14GetPaneStatusRequest\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\"\x7f\n" +
+	"\x12RestartPaneRequest\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12#\n" +
+	"\rreset_backoff\x18\x02 \x01(\bR\fresetBackoff\x12\x1e\n" +
+	"\bgrace_ms\x18\x03 \x01(\x04H\x00R\agraceMs\x88\x01\x01B\v\n" +
+	"\t_grace_ms\"W\n" +
+	"\x0fStopPaneRequest\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12\x1e\n" +
+	"\bgrace_ms\x18\x02 \x01(\x04H\x00R\agraceMs\x88\x01\x01B\v\n" +
+	"\t_grace_ms\"+\n" +
+	"\x10StartPaneRequest\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\"4\n" +
+	"\x19ResetRestartBudgetRequest\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\"\xb9\x03\n" +
+	"\x0eLifecycleEvent\x120\n" +
+	"\x04kind\x18\x01 \x01(\x0e2\x1c.tymux.v1.LifecycleEventKindR\x04kind\x12)\n" +
+	"\x05state\x18\x02 \x01(\x0e2\x13.tymux.v1.PaneStateR\x05state\x12 \n" +
+	"\texit_code\x18\x03 \x01(\x05H\x00R\bexitCode\x88\x01\x01\x12$\n" +
+	"\vexit_signal\x18\x04 \x01(\x05H\x01R\n" +
+	"exitSignal\x88\x01\x01\x12\x1e\n" +
+	"\bdelay_ms\x18\x05 \x01(\x04H\x02R\adelayMs\x88\x01\x01\x129\n" +
+	"\x17next_restart_at_unix_ms\x18\x06 \x01(\x03H\x03R\x13nextRestartAtUnixMs\x88\x01\x01\x12\x15\n" +
+	"\x03pid\x18\a \x01(\rH\x04R\x03pid\x88\x01\x01\x12#\n" +
+	"\rrestart_count\x18\b \x01(\rR\frestartCount\x12\x1c\n" +
+	"\n" +
+	"at_unix_ms\x18\t \x01(\x03R\batUnixMsB\f\n" +
+	"\n" +
+	"_exit_codeB\x0e\n" +
+	"\f_exit_signalB\v\n" +
+	"\t_delay_msB\x1a\n" +
+	"\x18_next_restart_at_unix_msB\x06\n" +
+	"\x04_pid*J\n" +
 	"\bLiveness\x12\x18\n" +
 	"\x14LIVENESS_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rLIVENESS_LIVE\x10\x01\x12\x11\n" +
@@ -2741,7 +4300,29 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\vOrientation\x12\x1b\n" +
 	"\x17ORIENTATION_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16ORIENTATION_HORIZONTAL\x10\x01\x12\x18\n" +
-	"\x14ORIENTATION_VERTICAL\x10\x022\xbf\a\n" +
+	"\x14ORIENTATION_VERTICAL\x10\x02*\xb5\x01\n" +
+	"\tPaneState\x12\x1a\n" +
+	"\x16PANE_STATE_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fPANE_STATE_LIVE\x10\x01\x12\x15\n" +
+	"\x11PANE_STATE_EXITED\x10\x02\x12\x16\n" +
+	"\x12PANE_STATE_BACKOFF\x10\x03\x12\x19\n" +
+	"\x15PANE_STATE_RESTARTING\x10\x04\x12\x15\n" +
+	"\x11PANE_STATE_FAILED\x10\x05\x12\x16\n" +
+	"\x12PANE_STATE_STOPPED\x10\x06*\x9a\x01\n" +
+	"\vRestartMode\x12\x1c\n" +
+	"\x18RESTART_MODE_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12RESTART_MODE_NEVER\x10\x01\x12\x1b\n" +
+	"\x17RESTART_MODE_ON_FAILURE\x10\x02\x12\x17\n" +
+	"\x13RESTART_MODE_ALWAYS\x10\x03\x12\x1f\n" +
+	"\x1bRESTART_MODE_UNLESS_STOPPED\x10\x04*\xee\x01\n" +
+	"\x12LifecycleEventKind\x12$\n" +
+	" LIFECYCLE_EVENT_KIND_UNSPECIFIED\x10\x00\x12\x1f\n" +
+	"\x1bLIFECYCLE_EVENT_KIND_EXITED\x10\x01\x12*\n" +
+	"&LIFECYCLE_EVENT_KIND_RESTART_SCHEDULED\x10\x02\x12\"\n" +
+	"\x1eLIFECYCLE_EVENT_KIND_RESTARTED\x10\x03\x12\x1f\n" +
+	"\x1bLIFECYCLE_EVENT_KIND_FAILED\x10\x04\x12 \n" +
+	"\x1cLIFECYCLE_EVENT_KIND_STOPPED\x10\x052\xf1\n" +
+	"\n" +
 	"\fTymuxService\x12E\n" +
 	"\rGetServerInfo\x12\x1e.tymux.v1.GetServerInfoRequest\x1a\x14.tymux.v1.ServerInfo\x12B\n" +
 	"\rCreateSession\x12\x1e.tymux.v1.CreateSessionRequest\x1a\x11.tymux.v1.Session\x12M\n" +
@@ -2756,7 +4337,13 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\vWatchWindow\x12\x1c.tymux.v1.WatchWindowRequest\x1a\x1b.tymux.v1.WindowLayoutEvent0\x01\x12<\n" +
 	"\x06Attach\x12\x17.tymux.v1.AttachRequest\x1a\x15.tymux.v1.AttachEvent(\x010\x01\x12I\n" +
 	"\n" +
-	"WriteStdin\x12\x1b.tymux.v1.WriteStdinRequest\x1a\x1c.tymux.v1.WriteStdinResponse(\x01B\x96\x01\n" +
+	"WriteStdin\x12\x1b.tymux.v1.WriteStdinRequest\x1a\x1c.tymux.v1.WriteStdinResponse(\x01\x12Y\n" +
+	"\x10SetRestartPolicy\x12!.tymux.v1.SetRestartPolicyRequest\x1a\".tymux.v1.SetRestartPolicyResponse\x12E\n" +
+	"\rGetPaneStatus\x12\x1e.tymux.v1.GetPaneStatusRequest\x1a\x14.tymux.v1.PaneStatus\x12A\n" +
+	"\vRestartPane\x12\x1c.tymux.v1.RestartPaneRequest\x1a\x14.tymux.v1.PaneStatus\x12;\n" +
+	"\bStopPane\x12\x19.tymux.v1.StopPaneRequest\x1a\x14.tymux.v1.PaneStatus\x12=\n" +
+	"\tStartPane\x12\x1a.tymux.v1.StartPaneRequest\x1a\x14.tymux.v1.PaneStatus\x12O\n" +
+	"\x12ResetRestartBudget\x12#.tymux.v1.ResetRestartBudgetRequest\x1a\x14.tymux.v1.PaneStatusB\x96\x01\n" +
 	"\fcom.tymux.v1B\n" +
 	"TymuxProtoP\x01Z9github.com/tstapler/tymux/clients/go/gen/tymux/v1;tymuxv1\xa2\x02\x03TXX\xaa\x02\bTymux.V1\xca\x02\bTymux\\V1\xe2\x02\x14Tymux\\V1\\GPBMetadata\xea\x02\tTymux::V1b\x06proto3"
 
@@ -2772,107 +4359,149 @@ func file_tymux_v1_tymux_proto_rawDescGZIP() []byte {
 	return file_tymux_v1_tymux_proto_rawDescData
 }
 
-var file_tymux_v1_tymux_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
+var file_tymux_v1_tymux_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
+var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
 var file_tymux_v1_tymux_proto_goTypes = []any{
-	(Liveness)(0),                    // 0: tymux.v1.Liveness
-	(Orientation)(0),                 // 1: tymux.v1.Orientation
-	(*Session)(nil),                  // 2: tymux.v1.Session
-	(*Window)(nil),                   // 3: tymux.v1.Window
-	(*Layout)(nil),                   // 4: tymux.v1.Layout
-	(*Split)(nil),                    // 5: tymux.v1.Split
-	(*LayoutChild)(nil),              // 6: tymux.v1.LayoutChild
-	(*Pane)(nil),                     // 7: tymux.v1.Pane
-	(*CreateSessionRequest)(nil),     // 8: tymux.v1.CreateSessionRequest
-	(*ArgSpec)(nil),                  // 9: tymux.v1.ArgSpec
-	(*ListSessionsRequest)(nil),      // 10: tymux.v1.ListSessionsRequest
-	(*ListSessionsResponse)(nil),     // 11: tymux.v1.ListSessionsResponse
-	(*KillSessionRequest)(nil),       // 12: tymux.v1.KillSessionRequest
-	(*KillSessionResponse)(nil),      // 13: tymux.v1.KillSessionResponse
-	(*ReviveSessionRequest)(nil),     // 14: tymux.v1.ReviveSessionRequest
-	(*ReviveSessionResponse)(nil),    // 15: tymux.v1.ReviveSessionResponse
-	(*SplitPaneRequest)(nil),         // 16: tymux.v1.SplitPaneRequest
-	(*ClosePaneRequest)(nil),         // 17: tymux.v1.ClosePaneRequest
-	(*ClosePaneResponse)(nil),        // 18: tymux.v1.ClosePaneResponse
-	(*CreateWindowRequest)(nil),      // 19: tymux.v1.CreateWindowRequest
-	(*WatchWindowRequest)(nil),       // 20: tymux.v1.WatchWindowRequest
-	(*WindowLayoutEvent)(nil),        // 21: tymux.v1.WindowLayoutEvent
-	(*CapturePaneRequest)(nil),       // 22: tymux.v1.CapturePaneRequest
-	(*SearchScrollbackRequest)(nil),  // 23: tymux.v1.SearchScrollbackRequest
-	(*SearchScrollbackResponse)(nil), // 24: tymux.v1.SearchScrollbackResponse
-	(*PaneSnapshot)(nil),             // 25: tymux.v1.PaneSnapshot
-	(*Row)(nil),                      // 26: tymux.v1.Row
-	(*Cell)(nil),                     // 27: tymux.v1.Cell
-	(*AttachRequest)(nil),            // 28: tymux.v1.AttachRequest
-	(*WriteStdinRequest)(nil),        // 29: tymux.v1.WriteStdinRequest
-	(*WriteStdinResponse)(nil),       // 30: tymux.v1.WriteStdinResponse
-	(*Resize)(nil),                   // 31: tymux.v1.Resize
-	(*ExitStatus)(nil),               // 32: tymux.v1.ExitStatus
-	(*OutputChunk)(nil),              // 33: tymux.v1.OutputChunk
-	(*GapExceeded)(nil),              // 34: tymux.v1.GapExceeded
-	(*Heartbeat)(nil),                // 35: tymux.v1.Heartbeat
-	(*AttachEvent)(nil),              // 36: tymux.v1.AttachEvent
-	(*GetServerInfoRequest)(nil),     // 37: tymux.v1.GetServerInfoRequest
-	(*ServerInfo)(nil),               // 38: tymux.v1.ServerInfo
-	nil,                              // 39: tymux.v1.CreateSessionRequest.EnvEntry
+	(Liveness)(0),                     // 0: tymux.v1.Liveness
+	(Orientation)(0),                  // 1: tymux.v1.Orientation
+	(PaneState)(0),                    // 2: tymux.v1.PaneState
+	(RestartMode)(0),                  // 3: tymux.v1.RestartMode
+	(LifecycleEventKind)(0),           // 4: tymux.v1.LifecycleEventKind
+	(*Session)(nil),                   // 5: tymux.v1.Session
+	(*Window)(nil),                    // 6: tymux.v1.Window
+	(*Layout)(nil),                    // 7: tymux.v1.Layout
+	(*Split)(nil),                     // 8: tymux.v1.Split
+	(*LayoutChild)(nil),               // 9: tymux.v1.LayoutChild
+	(*Pane)(nil),                      // 10: tymux.v1.Pane
+	(*CreateSessionRequest)(nil),      // 11: tymux.v1.CreateSessionRequest
+	(*ArgSpec)(nil),                   // 12: tymux.v1.ArgSpec
+	(*ListSessionsRequest)(nil),       // 13: tymux.v1.ListSessionsRequest
+	(*ListSessionsResponse)(nil),      // 14: tymux.v1.ListSessionsResponse
+	(*KillSessionRequest)(nil),        // 15: tymux.v1.KillSessionRequest
+	(*KillSessionResponse)(nil),       // 16: tymux.v1.KillSessionResponse
+	(*ReviveSessionRequest)(nil),      // 17: tymux.v1.ReviveSessionRequest
+	(*ReviveSessionResponse)(nil),     // 18: tymux.v1.ReviveSessionResponse
+	(*SplitPaneRequest)(nil),          // 19: tymux.v1.SplitPaneRequest
+	(*ClosePaneRequest)(nil),          // 20: tymux.v1.ClosePaneRequest
+	(*ClosePaneResponse)(nil),         // 21: tymux.v1.ClosePaneResponse
+	(*CreateWindowRequest)(nil),       // 22: tymux.v1.CreateWindowRequest
+	(*WatchWindowRequest)(nil),        // 23: tymux.v1.WatchWindowRequest
+	(*WindowLayoutEvent)(nil),         // 24: tymux.v1.WindowLayoutEvent
+	(*CapturePaneRequest)(nil),        // 25: tymux.v1.CapturePaneRequest
+	(*SearchScrollbackRequest)(nil),   // 26: tymux.v1.SearchScrollbackRequest
+	(*SearchScrollbackResponse)(nil),  // 27: tymux.v1.SearchScrollbackResponse
+	(*PaneSnapshot)(nil),              // 28: tymux.v1.PaneSnapshot
+	(*TerminalModes)(nil),             // 29: tymux.v1.TerminalModes
+	(*Charsets)(nil),                  // 30: tymux.v1.Charsets
+	(*Hyperlink)(nil),                 // 31: tymux.v1.Hyperlink
+	(*Row)(nil),                       // 32: tymux.v1.Row
+	(*Cell)(nil),                      // 33: tymux.v1.Cell
+	(*AttachRequest)(nil),             // 34: tymux.v1.AttachRequest
+	(*WriteStdinRequest)(nil),         // 35: tymux.v1.WriteStdinRequest
+	(*WriteStdinResponse)(nil),        // 36: tymux.v1.WriteStdinResponse
+	(*Resize)(nil),                    // 37: tymux.v1.Resize
+	(*ExitStatus)(nil),                // 38: tymux.v1.ExitStatus
+	(*OutputChunk)(nil),               // 39: tymux.v1.OutputChunk
+	(*GapExceeded)(nil),               // 40: tymux.v1.GapExceeded
+	(*Heartbeat)(nil),                 // 41: tymux.v1.Heartbeat
+	(*AttachEvent)(nil),               // 42: tymux.v1.AttachEvent
+	(*GetServerInfoRequest)(nil),      // 43: tymux.v1.GetServerInfoRequest
+	(*ServerInfo)(nil),                // 44: tymux.v1.ServerInfo
+	(*RestartPolicy)(nil),             // 45: tymux.v1.RestartPolicy
+	(*PaneStatus)(nil),                // 46: tymux.v1.PaneStatus
+	(*SetRestartPolicyRequest)(nil),   // 47: tymux.v1.SetRestartPolicyRequest
+	(*SetRestartPolicyResponse)(nil),  // 48: tymux.v1.SetRestartPolicyResponse
+	(*GetPaneStatusRequest)(nil),      // 49: tymux.v1.GetPaneStatusRequest
+	(*RestartPaneRequest)(nil),        // 50: tymux.v1.RestartPaneRequest
+	(*StopPaneRequest)(nil),           // 51: tymux.v1.StopPaneRequest
+	(*StartPaneRequest)(nil),          // 52: tymux.v1.StartPaneRequest
+	(*ResetRestartBudgetRequest)(nil), // 53: tymux.v1.ResetRestartBudgetRequest
+	(*LifecycleEvent)(nil),            // 54: tymux.v1.LifecycleEvent
+	nil,                               // 55: tymux.v1.CreateSessionRequest.EnvEntry
 }
 var file_tymux_v1_tymux_proto_depIdxs = []int32{
-	3,  // 0: tymux.v1.Session.windows:type_name -> tymux.v1.Window
+	6,  // 0: tymux.v1.Session.windows:type_name -> tymux.v1.Window
 	0,  // 1: tymux.v1.Session.liveness:type_name -> tymux.v1.Liveness
-	4,  // 2: tymux.v1.Window.layout:type_name -> tymux.v1.Layout
-	7,  // 3: tymux.v1.Layout.pane:type_name -> tymux.v1.Pane
-	5,  // 4: tymux.v1.Layout.split:type_name -> tymux.v1.Split
+	7,  // 2: tymux.v1.Window.layout:type_name -> tymux.v1.Layout
+	10, // 3: tymux.v1.Layout.pane:type_name -> tymux.v1.Pane
+	8,  // 4: tymux.v1.Layout.split:type_name -> tymux.v1.Split
 	1,  // 5: tymux.v1.Split.orientation:type_name -> tymux.v1.Orientation
-	6,  // 6: tymux.v1.Split.children:type_name -> tymux.v1.LayoutChild
-	4,  // 7: tymux.v1.LayoutChild.layout:type_name -> tymux.v1.Layout
+	9,  // 6: tymux.v1.Split.children:type_name -> tymux.v1.LayoutChild
+	7,  // 7: tymux.v1.LayoutChild.layout:type_name -> tymux.v1.Layout
 	0,  // 8: tymux.v1.Pane.liveness:type_name -> tymux.v1.Liveness
-	39, // 9: tymux.v1.CreateSessionRequest.env:type_name -> tymux.v1.CreateSessionRequest.EnvEntry
-	9,  // 10: tymux.v1.CreateSessionRequest.arg_specs:type_name -> tymux.v1.ArgSpec
-	2,  // 11: tymux.v1.ListSessionsResponse.sessions:type_name -> tymux.v1.Session
-	2,  // 12: tymux.v1.ReviveSessionResponse.session:type_name -> tymux.v1.Session
-	1,  // 13: tymux.v1.SplitPaneRequest.orientation:type_name -> tymux.v1.Orientation
-	2,  // 14: tymux.v1.ClosePaneResponse.session:type_name -> tymux.v1.Session
-	4,  // 15: tymux.v1.WindowLayoutEvent.layout:type_name -> tymux.v1.Layout
-	26, // 16: tymux.v1.PaneSnapshot.grid:type_name -> tymux.v1.Row
-	0,  // 17: tymux.v1.PaneSnapshot.liveness:type_name -> tymux.v1.Liveness
-	27, // 18: tymux.v1.Row.cells:type_name -> tymux.v1.Cell
-	31, // 19: tymux.v1.AttachRequest.resize:type_name -> tymux.v1.Resize
-	25, // 20: tymux.v1.AttachEvent.snapshot:type_name -> tymux.v1.PaneSnapshot
-	32, // 21: tymux.v1.AttachEvent.exited:type_name -> tymux.v1.ExitStatus
-	34, // 22: tymux.v1.AttachEvent.gap_exceeded:type_name -> tymux.v1.GapExceeded
-	35, // 23: tymux.v1.AttachEvent.heartbeat:type_name -> tymux.v1.Heartbeat
-	33, // 24: tymux.v1.AttachEvent.output_chunk:type_name -> tymux.v1.OutputChunk
-	37, // 25: tymux.v1.TymuxService.GetServerInfo:input_type -> tymux.v1.GetServerInfoRequest
-	8,  // 26: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
-	10, // 27: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
-	12, // 28: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
-	14, // 29: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
-	22, // 30: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
-	23, // 31: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
-	16, // 32: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
-	17, // 33: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
-	19, // 34: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
-	20, // 35: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
-	28, // 36: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
-	29, // 37: tymux.v1.TymuxService.WriteStdin:input_type -> tymux.v1.WriteStdinRequest
-	38, // 38: tymux.v1.TymuxService.GetServerInfo:output_type -> tymux.v1.ServerInfo
-	2,  // 39: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
-	11, // 40: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
-	13, // 41: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
-	15, // 42: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
-	25, // 43: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
-	24, // 44: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
-	2,  // 45: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
-	18, // 46: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
-	2,  // 47: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
-	21, // 48: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
-	36, // 49: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
-	30, // 50: tymux.v1.TymuxService.WriteStdin:output_type -> tymux.v1.WriteStdinResponse
-	38, // [38:51] is the sub-list for method output_type
-	25, // [25:38] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	2,  // 9: tymux.v1.Pane.state:type_name -> tymux.v1.PaneState
+	55, // 10: tymux.v1.CreateSessionRequest.env:type_name -> tymux.v1.CreateSessionRequest.EnvEntry
+	12, // 11: tymux.v1.CreateSessionRequest.arg_specs:type_name -> tymux.v1.ArgSpec
+	45, // 12: tymux.v1.CreateSessionRequest.restart_policy:type_name -> tymux.v1.RestartPolicy
+	5,  // 13: tymux.v1.ListSessionsResponse.sessions:type_name -> tymux.v1.Session
+	5,  // 14: tymux.v1.ReviveSessionResponse.session:type_name -> tymux.v1.Session
+	1,  // 15: tymux.v1.SplitPaneRequest.orientation:type_name -> tymux.v1.Orientation
+	5,  // 16: tymux.v1.ClosePaneResponse.session:type_name -> tymux.v1.Session
+	7,  // 17: tymux.v1.WindowLayoutEvent.layout:type_name -> tymux.v1.Layout
+	32, // 18: tymux.v1.PaneSnapshot.grid:type_name -> tymux.v1.Row
+	0,  // 19: tymux.v1.PaneSnapshot.liveness:type_name -> tymux.v1.Liveness
+	31, // 20: tymux.v1.PaneSnapshot.hyperlinks:type_name -> tymux.v1.Hyperlink
+	29, // 21: tymux.v1.PaneSnapshot.modes:type_name -> tymux.v1.TerminalModes
+	30, // 22: tymux.v1.PaneSnapshot.charsets:type_name -> tymux.v1.Charsets
+	2,  // 23: tymux.v1.PaneSnapshot.state:type_name -> tymux.v1.PaneState
+	33, // 24: tymux.v1.Row.cells:type_name -> tymux.v1.Cell
+	37, // 25: tymux.v1.AttachRequest.resize:type_name -> tymux.v1.Resize
+	28, // 26: tymux.v1.AttachEvent.snapshot:type_name -> tymux.v1.PaneSnapshot
+	38, // 27: tymux.v1.AttachEvent.exited:type_name -> tymux.v1.ExitStatus
+	40, // 28: tymux.v1.AttachEvent.gap_exceeded:type_name -> tymux.v1.GapExceeded
+	41, // 29: tymux.v1.AttachEvent.heartbeat:type_name -> tymux.v1.Heartbeat
+	39, // 30: tymux.v1.AttachEvent.output_chunk:type_name -> tymux.v1.OutputChunk
+	54, // 31: tymux.v1.AttachEvent.lifecycle:type_name -> tymux.v1.LifecycleEvent
+	3,  // 32: tymux.v1.RestartPolicy.mode:type_name -> tymux.v1.RestartMode
+	2,  // 33: tymux.v1.PaneStatus.state:type_name -> tymux.v1.PaneState
+	45, // 34: tymux.v1.PaneStatus.policy:type_name -> tymux.v1.RestartPolicy
+	45, // 35: tymux.v1.SetRestartPolicyRequest.policy:type_name -> tymux.v1.RestartPolicy
+	46, // 36: tymux.v1.SetRestartPolicyResponse.status:type_name -> tymux.v1.PaneStatus
+	4,  // 37: tymux.v1.LifecycleEvent.kind:type_name -> tymux.v1.LifecycleEventKind
+	2,  // 38: tymux.v1.LifecycleEvent.state:type_name -> tymux.v1.PaneState
+	43, // 39: tymux.v1.TymuxService.GetServerInfo:input_type -> tymux.v1.GetServerInfoRequest
+	11, // 40: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
+	13, // 41: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
+	15, // 42: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
+	17, // 43: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
+	25, // 44: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
+	26, // 45: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
+	19, // 46: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
+	20, // 47: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
+	22, // 48: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
+	23, // 49: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
+	34, // 50: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
+	35, // 51: tymux.v1.TymuxService.WriteStdin:input_type -> tymux.v1.WriteStdinRequest
+	47, // 52: tymux.v1.TymuxService.SetRestartPolicy:input_type -> tymux.v1.SetRestartPolicyRequest
+	49, // 53: tymux.v1.TymuxService.GetPaneStatus:input_type -> tymux.v1.GetPaneStatusRequest
+	50, // 54: tymux.v1.TymuxService.RestartPane:input_type -> tymux.v1.RestartPaneRequest
+	51, // 55: tymux.v1.TymuxService.StopPane:input_type -> tymux.v1.StopPaneRequest
+	52, // 56: tymux.v1.TymuxService.StartPane:input_type -> tymux.v1.StartPaneRequest
+	53, // 57: tymux.v1.TymuxService.ResetRestartBudget:input_type -> tymux.v1.ResetRestartBudgetRequest
+	44, // 58: tymux.v1.TymuxService.GetServerInfo:output_type -> tymux.v1.ServerInfo
+	5,  // 59: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
+	14, // 60: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
+	16, // 61: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
+	18, // 62: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
+	28, // 63: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
+	27, // 64: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
+	5,  // 65: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
+	21, // 66: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
+	5,  // 67: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
+	24, // 68: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
+	42, // 69: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
+	36, // 70: tymux.v1.TymuxService.WriteStdin:output_type -> tymux.v1.WriteStdinResponse
+	48, // 71: tymux.v1.TymuxService.SetRestartPolicy:output_type -> tymux.v1.SetRestartPolicyResponse
+	46, // 72: tymux.v1.TymuxService.GetPaneStatus:output_type -> tymux.v1.PaneStatus
+	46, // 73: tymux.v1.TymuxService.RestartPane:output_type -> tymux.v1.PaneStatus
+	46, // 74: tymux.v1.TymuxService.StopPane:output_type -> tymux.v1.PaneStatus
+	46, // 75: tymux.v1.TymuxService.StartPane:output_type -> tymux.v1.PaneStatus
+	46, // 76: tymux.v1.TymuxService.ResetRestartBudget:output_type -> tymux.v1.PaneStatus
+	58, // [58:77] is the sub-list for method output_type
+	39, // [39:58] is the sub-list for method input_type
+	39, // [39:39] is the sub-list for extension type_name
+	39, // [39:39] is the sub-list for extension extendee
+	0,  // [0:39] is the sub-list for field type_name
 }
 
 func init() { file_tymux_v1_tymux_proto_init() }
@@ -2888,18 +4517,19 @@ func file_tymux_v1_tymux_proto_init() {
 		(*ArgSpec_Literal)(nil),
 		(*ArgSpec_FileContentsPath)(nil),
 	}
-	file_tymux_v1_tymux_proto_msgTypes[26].OneofWrappers = []any{
+	file_tymux_v1_tymux_proto_msgTypes[23].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[29].OneofWrappers = []any{
 		(*AttachRequest_PaneId)(nil),
 		(*AttachRequest_Input)(nil),
 		(*AttachRequest_Resize)(nil),
 	}
-	file_tymux_v1_tymux_proto_msgTypes[27].OneofWrappers = []any{
+	file_tymux_v1_tymux_proto_msgTypes[30].OneofWrappers = []any{
 		(*WriteStdinRequest_PaneId)(nil),
 		(*WriteStdinRequest_Data)(nil),
 		(*WriteStdinRequest_Close)(nil),
 	}
-	file_tymux_v1_tymux_proto_msgTypes[30].OneofWrappers = []any{}
-	file_tymux_v1_tymux_proto_msgTypes[34].OneofWrappers = []any{
+	file_tymux_v1_tymux_proto_msgTypes[33].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[37].OneofWrappers = []any{
 		(*AttachEvent_Output)(nil),
 		(*AttachEvent_Snapshot)(nil),
 		(*AttachEvent_Exited)(nil),
@@ -2907,14 +4537,24 @@ func file_tymux_v1_tymux_proto_init() {
 		(*AttachEvent_GapExceeded)(nil),
 		(*AttachEvent_Heartbeat)(nil),
 		(*AttachEvent_OutputChunk)(nil),
+		(*AttachEvent_Lifecycle)(nil),
 	}
+	file_tymux_v1_tymux_proto_msgTypes[40].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[41].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[42].OneofWrappers = []any{
+		(*SetRestartPolicyRequest_PaneId)(nil),
+		(*SetRestartPolicyRequest_SessionId)(nil),
+	}
+	file_tymux_v1_tymux_proto_msgTypes[45].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[46].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[49].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tymux_v1_tymux_proto_rawDesc), len(file_tymux_v1_tymux_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   38,
+			NumEnums:      5,
+			NumMessages:   51,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
