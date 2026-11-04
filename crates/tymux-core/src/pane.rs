@@ -1060,11 +1060,24 @@ struct StartedProcess {
     reply_fd: std::os::fd::OwnedFd,
 }
 
-/// True if `e` (or a cause) is `EMFILE`/`ENFILE`.
+/// True if `e` is `EMFILE`/`ENFILE`. portable-pty 0.8 reports `openpty` failure as
+/// `bail!("failed to openpty: {:?}", io::Error::last_os_error())`, so no `io::Error` is in the
+/// chain and the errno survives only as text; match both shapes.
 fn is_fd_exhaustion(e: &anyhow::Error) -> bool {
-    e.chain()
+    let in_chain = e
+        .chain()
         .filter_map(|c| c.downcast_ref::<std::io::Error>())
-        .any(|io| matches!(io.raw_os_error(), Some(n) if n == libc::EMFILE || n == libc::ENFILE))
+        .any(|io| matches!(io.raw_os_error(), Some(n) if n == libc::EMFILE || n == libc::ENFILE));
+    // "Too many open files" is also the prefix of the ENFILE wording on Linux and macOS.
+    in_chain
+        || e.chain().any(|c| {
+            let text = c.to_string();
+            text.contains("Too many open files")
+                || text.contains("code: 24,")
+                || text.contains("code: 23,")
+                || text.contains("os error 24")
+                || text.contains("os error 23")
+        })
 }
 
 /// Opens a pty of the given size and starts `command` on it. Shared by the first spawn and by
@@ -1312,17 +1325,27 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn is_fd_exhaustion_should_match_emfile_through_an_anyhow_chain_only() {
-        let emfile = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE))
-            .context("failed to openpty");
-        assert!(is_fd_exhaustion(&emfile));
-        let enoent = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOENT));
-        assert!(!is_fd_exhaustion(&enoent));
-    }
-
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn is_fd_exhaustion_should_match_the_error_portable_pty_really_produces() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let real = anyhow::anyhow!(
+                "failed to openpty: {:?}",
+                std::io::Error::from_raw_os_error(errno)
+            );
+            assert!(is_fd_exhaustion(&real), "{real}");
+        }
+        let io_in_chain = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE))
+            .context("spawn");
+        assert!(is_fd_exhaustion(&io_in_chain));
+        let enoent = anyhow::anyhow!(
+            "failed to openpty: {:?}",
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        );
+        assert!(!is_fd_exhaustion(&enoent));
+    }
 
     #[test]
     fn terminal_modes_maps_vt100_state_onto_the_proto_numbering() {
