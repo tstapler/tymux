@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,7 @@ use tymux_proto::v1::{
 };
 
 mod auth;
+mod listener_health;
 
 /// Default window (Task 1.1.2e / pre-mortem P1 #1) within which a pane
 /// exiting shortly after its last `Attach` stream dropped is treated as a
@@ -1865,6 +1867,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     log_detach_controlling_terminal_outcome(detach_controlling_terminal());
+    log_nofile_limit_outcome(listener_health::raise_nofile_limit());
 
     let addr = std::env::var("TYMUXD_ADDR").unwrap_or_else(|_| "127.0.0.1:7419".to_string());
     let socket_addr: std::net::SocketAddr = addr.parse()?;
@@ -2067,6 +2070,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let uds_rejection_count = Arc::new(AtomicI64::new(0));
     let uds_daemon = daemon.clone();
+    let uds_listener_fd = uds_listener.as_raw_fd();
     let uds_future = async {
         let res = configured_server_builder()
             .add_service(TymuxServiceServer::with_interceptor(
@@ -2079,7 +2083,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // handshake — not once per RPC (Epic 3.2 performance
                 // requirement).
                 futures::TryStreamExt::map_ok(
-                    tokio_stream::wrappers::UnixListenerStream::new(uds_listener),
+                    listener_health::log_accept_errors(
+                        tokio_stream::wrappers::UnixListenerStream::new(uds_listener),
+                        "uds",
+                        uds_listener_fd,
+                    ),
                     move |stream| auth::PreAuthorizedUnixStream::new(stream, uid, allowed_gid),
                 ),
                 shutdown_signal(),
@@ -2097,11 +2105,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         res
     };
 
+    let tcp_listener_fd = tcp_listener.as_ref().map(AsRawFd::as_raw_fd);
+    // tonic 0.12.3 ends the accept loop with `Ok(())` after a fatal accept error (it only logs
+    // it at trace), so "the TCP server returned" must be checked against a real shutdown.
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tcp_shutdown = {
+        let flag = shutdown_requested.clone();
+        async move {
+            shutdown_signal().await;
+            flag.store(true, Ordering::SeqCst);
+        }
+    };
     let tcp_future = async {
         let Some(tcp_listener) = tcp_listener else {
             return Ok(());
         };
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
+        let incoming = listener_health::log_accept_errors(
+            tokio_stream::wrappers::TcpListenerStream::new(tcp_listener),
+            "tcp",
+            tcp_listener_fd.unwrap_or(-1),
+        );
         let res = if let Some(token) = configured_token {
             let rejection_count = Arc::new(AtomicI64::new(0));
             configured_server_builder()
@@ -2109,12 +2132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     daemon,
                     auth::BearerAuthInterceptor::new(Arc::new(token), rejection_count),
                 ))
-                .serve_with_incoming_shutdown(incoming, shutdown_signal())
+                .serve_with_incoming_shutdown(incoming, tcp_shutdown)
                 .await
         } else {
             configured_server_builder()
                 .add_service(TymuxServiceServer::new(daemon))
-                .serve_with_incoming_shutdown(incoming, shutdown_signal())
+                .serve_with_incoming_shutdown(incoming, tcp_shutdown)
                 .await
         };
         // See the matching comment on uds_future above: log the moment
@@ -2122,6 +2145,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // after `tokio::join!` returns.
         if let Err(ref e) = res {
             tracing::error!(listener = "tcp", error = %e, "tcp listener exited before shutdown");
+        }
+        if tcp_accept_loop_ended_early(shutdown_requested.load(Ordering::SeqCst)) {
+            tracing::error!(
+                listener = "tcp",
+                "tcp accept loop ended without a shutdown request; exiting so a supervisor can \
+                 restart tymuxd"
+            );
+            std::process::exit(1);
         }
         res
     };
@@ -2134,7 +2165,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // only way to observe what an external caller actually sees.
     let tcp_health_future = async {
         if !tcp_disabled {
-            tcp_health_probe(tcp_probe_target(socket_addr)).await;
+            let end = tcp_health_probe(tcp_probe_target(socket_addr), tcp_listener_fd).await;
+            if end == TcpProbeEnd::ListenerDead {
+                // The tonic future never ends on its own here, so `join!` would idle
+                // forever; a supervisor can only respawn a process that exits.
+                tracing::error!(
+                    "tcp listener is unreachable; exiting so a supervisor can restart tymuxd"
+                );
+                std::process::exit(1);
+            }
         }
     };
 
@@ -2153,6 +2192,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tcp_res?;
     tracing::info!("tymuxd shut down");
     Ok(())
+}
+
+/// The TCP server future returning without SIGTERM/Ctrl-C means the listener is gone.
+fn tcp_accept_loop_ended_early(shutdown_requested: bool) -> bool {
+    !shutdown_requested
+}
+
+fn log_nofile_limit_outcome(outcome: std::io::Result<listener_health::NofileLimits>) {
+    match outcome {
+        Ok(l) => tracing::info!(
+            soft_before = l.soft_before,
+            soft_limit = l.soft_after,
+            hard_limit = l.hard,
+            "RLIMIT_NOFILE"
+        ),
+        Err(e) => tracing::error!(
+            error = %e,
+            soft_limit = listener_health::nofile_soft_limit(),
+            "could not raise RLIMIT_NOFILE; the daemon runs out of fds at the inherited limit"
+        ),
+    }
 }
 
 /// `TcpListener::bind`ing e.g. `0.0.0.0:7419` means the daemon accepts on
@@ -2178,6 +2238,17 @@ fn tcp_probe_target(addr: std::net::SocketAddr) -> std::net::SocketAddr {
 /// transient noise into an error-level log line.
 const TCP_HEALTH_PROBE_WARN_THRESHOLD: u32 = 3;
 
+/// Consecutive failed probes after which the daemon gives up and exits (~2 minutes at the
+/// 30s probe interval). A listener this long unreachable is not coming back on its own.
+const TCP_HEALTH_PROBE_EXIT_THRESHOLD: u32 = 4;
+
+/// How [`tcp_health_probe`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpProbeEnd {
+    Shutdown,
+    ListenerDead,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpProbeOutcome {
     Connected,
@@ -2188,6 +2259,8 @@ enum TcpProbeOutcome {
 enum TcpHealthProbeLog {
     None,
     Failing(u32),
+    /// Failed [`TCP_HEALTH_PROBE_EXIT_THRESHOLD`] times running: stop probing and exit.
+    Fatal(u32),
     Recovered,
 }
 
@@ -2214,7 +2287,9 @@ fn tcp_health_probe_transition(
             let next = consecutive_failures + 1;
             (
                 next,
-                if next >= TCP_HEALTH_PROBE_WARN_THRESHOLD {
+                if next >= TCP_HEALTH_PROBE_EXIT_THRESHOLD {
+                    TcpHealthProbeLog::Fatal(next)
+                } else if next >= TCP_HEALTH_PROBE_WARN_THRESHOLD {
                     TcpHealthProbeLog::Failing(next)
                 } else {
                     TcpHealthProbeLog::None
@@ -2229,7 +2304,13 @@ fn tcp_health_probe_transition(
 /// alive, TCP listener specifically unreachable" from "daemon fully
 /// healthy" without having to infer it from a pattern of external
 /// connection failures first.
-async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
+///
+/// Returns [`TcpProbeEnd::ListenerDead`] once the listener has been unreachable for
+/// [`TCP_HEALTH_PROBE_EXIT_THRESHOLD`] probes in a row. `listener_fd` is only for diagnostics.
+async fn tcp_health_probe(
+    probe_addr: std::net::SocketAddr,
+    listener_fd: Option<std::os::fd::RawFd>,
+) -> TcpProbeEnd {
     // Frequent enough to catch a wedged listener well before an operator
     // would notice from external symptoms alone, without adding meaningful
     // load.
@@ -2255,7 +2336,7 @@ async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
     loop {
         tokio::select! {
             _ = interval.tick() => {}
-            _ = &mut shutdown => return,
+            _ = &mut shutdown => return TcpProbeEnd::Shutdown,
         }
         let outcome =
             match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(probe_addr))
@@ -2266,13 +2347,37 @@ async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
             };
         let (next, action) = tcp_health_probe_transition(consecutive_failures, outcome);
         consecutive_failures = next;
+        let open_fds = listener_health::open_fd_count();
+        let fd_limit = listener_health::nofile_soft_limit();
+        if listener_health::fd_pressure(open_fds, fd_limit) {
+            tracing::warn!(
+                open_fds,
+                fd_limit,
+                "file descriptor usage is close to the limit"
+            );
+        }
+        let fd_state = || listener_fd.map(listener_health::fd_state);
         match action {
             TcpHealthProbeLog::None => {}
             TcpHealthProbeLog::Failing(count) => tracing::error!(
                 %probe_addr,
                 consecutive_failures = count,
+                listener_fd_state = ?fd_state(),
+                open_fds,
+                fd_limit,
                 "tcp listener health probe failed repeatedly — tymuxd is alive but its TCP endpoint may not be accepting connections"
             ),
+            TcpHealthProbeLog::Fatal(count) => {
+                tracing::error!(
+                    %probe_addr,
+                    consecutive_failures = count,
+                    listener_fd_state = ?fd_state(),
+                    open_fds,
+                    fd_limit,
+                    "tcp listener health probe failed too many times in a row"
+                );
+                return TcpProbeEnd::ListenerDead;
+            }
             TcpHealthProbeLog::Recovered => tracing::info!(
                 %probe_addr,
                 "tcp listener health probe recovered — accepting connections again"
@@ -6256,7 +6361,8 @@ mod tests {
     }
 
     #[test]
-    fn tcp_health_probe_transition_warns_once_threshold_reached_and_keeps_warning() {
+    fn tcp_health_probe_transition_warns_at_threshold_then_goes_fatal_at_exit_threshold() {
+        const { assert!(TCP_HEALTH_PROBE_WARN_THRESHOLD < TCP_HEALTH_PROBE_EXIT_THRESHOLD) };
         let mut failures = TCP_HEALTH_PROBE_WARN_THRESHOLD - 1;
         let (next, action) = tcp_health_probe_transition(failures, TcpProbeOutcome::Failed);
         failures = next;
@@ -6265,14 +6371,29 @@ mod tests {
             TcpHealthProbeLog::Failing(TCP_HEALTH_PROBE_WARN_THRESHOLD)
         );
 
-        // Still failing on the next tick — keeps warning, doesn't fall
-        // silent just because it already warned once.
+        // Keeps warning on each tick until the exit threshold is reached.
+        while failures + 1 < TCP_HEALTH_PROBE_EXIT_THRESHOLD {
+            let (next, action) = tcp_health_probe_transition(failures, TcpProbeOutcome::Failed);
+            assert_eq!(action, TcpHealthProbeLog::Failing(failures + 1));
+            failures = next;
+        }
+
         let (next, action) = tcp_health_probe_transition(failures, TcpProbeOutcome::Failed);
         assert_eq!(
             action,
-            TcpHealthProbeLog::Failing(TCP_HEALTH_PROBE_WARN_THRESHOLD + 1)
+            TcpHealthProbeLog::Fatal(TCP_HEALTH_PROBE_EXIT_THRESHOLD)
         );
-        assert_eq!(next, TCP_HEALTH_PROBE_WARN_THRESHOLD + 1);
+        assert_eq!(next, TCP_HEALTH_PROBE_EXIT_THRESHOLD);
+    }
+
+    #[test]
+    fn tcp_health_probe_transition_success_just_below_exit_threshold_resets_the_count() {
+        let (next, action) = tcp_health_probe_transition(
+            TCP_HEALTH_PROBE_EXIT_THRESHOLD - 1,
+            TcpProbeOutcome::Connected,
+        );
+        assert_eq!(next, 0);
+        assert_eq!(action, TcpHealthProbeLog::Recovered);
     }
 
     #[test]
@@ -6306,7 +6427,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener); // now refuses every connection
 
-        tokio::spawn(tcp_health_probe(addr));
+        tokio::spawn(tcp_health_probe(addr, None));
 
         // A few extra advances beyond the bare warn threshold, each
         // followed by a yield so the probe task is actually polled before
@@ -6319,6 +6440,90 @@ mod tests {
         }
 
         assert!(logs_contain("tcp listener health probe failed repeatedly"));
+    }
+
+    /// Advances the paused clock one probe interval at a time until `probe` finishes.
+    async fn drive_probe_to_end(probe: tokio::task::JoinHandle<TcpProbeEnd>) -> TcpProbeEnd {
+        for _ in 0..(TCP_HEALTH_PROBE_EXIT_THRESHOLD + 3) {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            if probe.is_finished() {
+                return probe.await.unwrap();
+            }
+        }
+        panic!("probe never gave up on a dead listener");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_health_probe_should_give_up_when_the_listener_is_gone() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let end = drive_probe_to_end(tokio::spawn(tcp_health_probe(addr, None))).await;
+
+        assert_eq!(end, TcpProbeEnd::ListenerDead);
+    }
+
+    /// The listening socket is gone from under a running server.
+    /// `dup2` of /dev/null over the listener's fd drops the socket (the port stops accepting)
+    /// but leaves the fd number valid, so the server's own later close stays harmless.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn tcp_health_probe_should_give_up_when_the_listener_fd_is_replaced_under_a_running_server(
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fd = listener.as_raw_fd();
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(TymuxServiceServer::new(test_daemon()))
+                .serve_with_incoming(listener_health::log_accept_errors(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    "tcp",
+                    fd,
+                )),
+        );
+        let dial = || tokio::net::TcpStream::connect(addr);
+        dial()
+            .await
+            .expect("listener should accept before the fd is replaced");
+
+        let devnull = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: both fds are open; dup2 atomically retargets `fd` at /dev/null.
+        assert_eq!(unsafe { libc::dup2(devnull.as_raw_fd(), fd) }, fd);
+        dial().await.expect_err("the port should be unbound now");
+
+        let end = drive_probe_to_end(tokio::spawn(tcp_health_probe(addr, Some(fd)))).await;
+
+        assert_eq!(end, TcpProbeEnd::ListenerDead);
+        assert!(logs_contain("failed too many times in a row"));
+        // The server may already have closed the fd by now, so only the field is stable.
+        assert!(
+            logs_contain("listener_fd_state"),
+            "probe log should carry the fd state"
+        );
+        server.abort();
+    }
+
+    /// Pins the tonic 0.12.3 behavior the daemon's early-exit check depends on: a fatal accept
+    /// error ends the server with `Ok(())` (and only a trace log), so `join!` never sees an error.
+    #[tokio::test]
+    async fn serve_with_incoming_should_return_ok_after_a_fatal_accept_error() {
+        let fatal = futures::stream::iter(vec![Err::<tokio::net::TcpStream, _>(
+            std::io::Error::from_raw_os_error(libc::EBADF),
+        )]);
+
+        let res = Server::builder()
+            .add_service(TymuxServiceServer::new(test_daemon()))
+            .serve_with_incoming(fatal)
+            .await;
+
+        assert!(res.is_ok(), "{res:?}");
+        assert!(tcp_accept_loop_ended_early(false));
+        assert!(!tcp_accept_loop_ended_early(true));
     }
 
     // --- Epic 5.1: accept/reject over a real UDS connection ---
