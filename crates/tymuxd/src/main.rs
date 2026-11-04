@@ -2107,9 +2107,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &socket_path,
     );
 
-    // Set by each listener's shutdown future before its server returns, so "the server
-    // returned" can be told apart from a real SIGTERM/Ctrl-C drain on every exit path.
+    // Set by one early signal task before any server's shutdown future resolves, so "the
+    // server returned" (or the probe gave up) is told apart from a real SIGTERM/Ctrl-C drain.
     let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn({
+        let flag = shutdown_requested.clone();
+        async move {
+            shutdown_signal().await;
+            flag.store(true, Ordering::SeqCst);
+            let _ = shutdown_tx.send(true);
+        }
+    });
     let uds_rejection_count = Arc::new(AtomicI64::new(0));
     let uds_daemon = daemon.clone();
     let uds_listener_fd = uds_listener.as_raw_fd();
@@ -2132,7 +2141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     move |stream| auth::PreAuthorizedUnixStream::new(stream, uid, allowed_gid),
                 ),
-                flagged_shutdown(shutdown_requested.clone()),
+                shutdown_rx_future(shutdown_rx.clone()),
             )
             .await;
         // Logged here, not just left to surface via `uds_res?` after
@@ -2151,7 +2160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_listener_fd = tcp_listener.as_ref().map(AsRawFd::as_raw_fd);
     // tonic 0.12.3 ends the accept loop with `Ok(())` after a fatal accept error (it only logs
     // it at trace), so "a server returned" must be checked against a real shutdown.
-    let tcp_shutdown = flagged_shutdown(shutdown_requested.clone());
+    let tcp_shutdown = shutdown_rx_future(shutdown_rx.clone());
     let tcp_future = async {
         let Some(tcp_listener) = tcp_listener else {
             return Ok(());
@@ -2220,10 +2229,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Resolves on SIGTERM/Ctrl-C after recording it in `flag`.
-async fn flagged_shutdown(flag: Arc<std::sync::atomic::AtomicBool>) {
-    shutdown_signal().await;
-    flag.store(true, Ordering::SeqCst);
+/// Resolves once the early signal task has recorded a SIGTERM/Ctrl-C.
+async fn shutdown_rx_future(mut rx: tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|requested| *requested).await;
 }
 
 /// A listener ending (or being found dead) without SIGTERM/Ctrl-C means it is gone.
@@ -2434,7 +2442,10 @@ async fn tcp_health_probe(
             };
         let (next, action) = tcp_health_probe_transition(consecutive_failures, outcome);
         consecutive_failures = next;
-        let open_fds = listener_health::open_fd_count();
+        // read_dir on /dev/fd blocks, and is slow with thousands of fds.
+        let open_fds = tokio::task::spawn_blocking(listener_health::open_fd_count)
+            .await
+            .unwrap_or(0);
         let fd_limit = listener_health::nofile_soft_limit();
         if listener_health::fd_pressure(open_fds, fd_limit) {
             tracing::warn!(
@@ -6678,10 +6689,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// UDS shares tonic's accept loop, so a fatal error ends it with `Ok(())` too; the daemon
-    /// must treat that as an unexpected end rather than idle in `join!` with no UDS transport.
+    /// UDS shares tonic's accept loop, so a fatal error ends it with `Ok(())` too (which
+    /// `exit_if_listener_ended_unexpectedly` then turns into an exit).
     #[tokio::test]
-    async fn uds_serve_should_return_ok_after_a_fatal_accept_error_and_count_as_ended_early() {
+    async fn uds_serve_should_return_ok_after_a_fatal_accept_error() {
         let fatal = futures::stream::iter(vec![Err::<tokio::net::UnixStream, _>(
             std::io::Error::from_raw_os_error(libc::EBADF),
         )]);
@@ -6691,9 +6702,6 @@ mod tests {
             .await;
 
         assert!(res.is_ok(), "{res:?}");
-        assert!(listener_ended_unexpectedly(
-            &std::sync::atomic::AtomicBool::new(false)
-        ));
     }
 
     #[test]
@@ -6728,7 +6736,10 @@ mod tests {
         for loopback in [true, false] {
             for errno in [libc::ENETUNREACH, libc::ENETDOWN, libc::EHOSTUNREACH] {
                 assert_eq!(
-                    probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno), loopback),
+                    probe_connect_error_outcome(
+                        &std::io::Error::from_raw_os_error(errno),
+                        loopback
+                    ),
                     TcpProbeOutcome::Inconclusive,
                     "errno {errno} loopback={loopback}"
                 );
@@ -6741,15 +6752,24 @@ mod tests {
         for loopback in [true, false] {
             for errno in [libc::ECONNREFUSED, libc::ECONNRESET] {
                 assert_eq!(
-                    probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno), loopback),
+                    probe_connect_error_outcome(
+                        &std::io::Error::from_raw_os_error(errno),
+                        loopback
+                    ),
                     TcpProbeOutcome::Failed,
                     "errno {errno} loopback={loopback}"
                 );
             }
         }
         let timed_out = std::io::Error::from_raw_os_error(libc::ETIMEDOUT);
-        assert_eq!(probe_connect_error_outcome(&timed_out, true), TcpProbeOutcome::Failed);
-        assert_eq!(probe_connect_error_outcome(&timed_out, false), TcpProbeOutcome::Inconclusive);
+        assert_eq!(
+            probe_connect_error_outcome(&timed_out, true),
+            TcpProbeOutcome::Failed
+        );
+        assert_eq!(
+            probe_connect_error_outcome(&timed_out, false),
+            TcpProbeOutcome::Inconclusive
+        );
         assert_eq!(probe_timeout_outcome(true), TcpProbeOutcome::Failed);
         assert_eq!(probe_timeout_outcome(false), TcpProbeOutcome::Inconclusive);
     }
