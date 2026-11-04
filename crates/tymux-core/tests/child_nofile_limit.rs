@@ -21,8 +21,17 @@ async fn pane_child_should_start_with_the_configured_soft_fd_limit() {
     tymux_core::set_child_nofile_soft_limit(CHILD_LIMIT);
 
     let out = std::env::temp_dir().join(format!("tymux-nofile-{}", std::process::id()));
+    // Linux/glibc spawns with posix_spawn and lowers the limit from the parent afterwards, so
+    // the child can win the race and see the raised limit first: wait (bounded) for it to drop.
+    let read_limit = if cfg!(all(target_os = "linux", target_env = "gnu")) {
+        format!(
+            "i=0; while [ \"$(ulimit -n)\" -gt {CHILD_LIMIT} ] && [ $i -lt 200000 ]; do i=$((i+1)); done; ulimit -n"
+        )
+    } else {
+        "ulimit -n".to_string()
+    };
     let launch = Launch {
-        args: vec!["-c".into(), format!("ulimit -n > {}", out.display())],
+        args: vec!["-c".into(), format!("{read_limit} > {}", out.display())],
         ..Launch::default()
     };
     let engine = Engine::with_persistence(Box::new(NullPersistenceBackend));

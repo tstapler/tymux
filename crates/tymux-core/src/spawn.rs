@@ -65,9 +65,10 @@ fn apply_child_nofile_limit_in_self() {
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
 }
 
-/// posix_spawn has no rlimit action, so lower the child's limit from the parent right after
-/// the spawn. `CLONE_VM|VFORK` suspends the parent until the child execs, so the program
-/// starts with the raised limit for a moment; this is best effort, unlike the `pre_exec` route.
+/// posix_spawn has no rlimit action, so lower the child's limit from the parent after the spawn.
+/// glibc's `CLONE_VM|VFORK` only returns once the child has exec'd, so the program is already
+/// running with the raised limit and may read it before this lands: best effort, unlike the
+/// `pre_exec` route (and `prlimit` can fail, e.g. EPERM on a setuid program).
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[allow(clippy::unnecessary_cast)]
 fn apply_child_nofile_limit_to_pid(pid: libc::pid_t) {
@@ -87,7 +88,13 @@ fn apply_child_nofile_limit_to_pid(pid: libc::pid_t) {
     }
     lim.rlim_cur = want as libc::rlim_t;
     // SAFETY: valid rlimit; a null old-limit pointer is allowed.
-    unsafe { libc::prlimit(pid, libc::RLIMIT_NOFILE, &lim, std::ptr::null_mut()) };
+    if unsafe { libc::prlimit(pid, libc::RLIMIT_NOFILE, &lim, std::ptr::null_mut()) } != 0 {
+        tracing::warn!(
+            pid,
+            error = %io::Error::last_os_error(),
+            "could not lower the pane child's fd limit; it keeps the daemon's raised limit"
+        );
+    }
 }
 
 /// Spawns `program` with the pty slave behind `master_fd` as stdin/stdout and
