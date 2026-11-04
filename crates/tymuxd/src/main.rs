@@ -2099,6 +2099,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &socket_path,
     );
 
+    // Set by each listener's shutdown future before its server returns, so "the server
+    // returned" can be told apart from a real SIGTERM/Ctrl-C drain on every exit path.
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let uds_rejection_count = Arc::new(AtomicI64::new(0));
     let uds_daemon = daemon.clone();
     let uds_listener_fd = uds_listener.as_raw_fd();
@@ -2121,7 +2124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     move |stream| auth::PreAuthorizedUnixStream::new(stream, uid, allowed_gid),
                 ),
-                shutdown_signal(),
+                flagged_shutdown(shutdown_requested.clone()),
             )
             .await;
         // Logged here, not just left to surface via `uds_res?` after
@@ -2133,20 +2136,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(ref e) = res {
             tracing::error!(listener = "uds", error = %e, "uds listener exited before shutdown");
         }
+        exit_if_listener_ended_unexpectedly("uds", &shutdown_requested);
         res
     };
 
     let tcp_listener_fd = tcp_listener.as_ref().map(AsRawFd::as_raw_fd);
     // tonic 0.12.3 ends the accept loop with `Ok(())` after a fatal accept error (it only logs
-    // it at trace), so "the TCP server returned" must be checked against a real shutdown.
-    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let tcp_shutdown = {
-        let flag = shutdown_requested.clone();
-        async move {
-            shutdown_signal().await;
-            flag.store(true, Ordering::SeqCst);
-        }
-    };
+    // it at trace), so "a server returned" must be checked against a real shutdown.
+    let tcp_shutdown = flagged_shutdown(shutdown_requested.clone());
     let tcp_future = async {
         let Some(tcp_listener) = tcp_listener else {
             return Ok(());
@@ -2177,14 +2174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(ref e) = res {
             tracing::error!(listener = "tcp", error = %e, "tcp listener exited before shutdown");
         }
-        if tcp_accept_loop_ended_early(shutdown_requested.load(Ordering::SeqCst)) {
-            tracing::error!(
-                listener = "tcp",
-                "tcp accept loop ended without a shutdown request; exiting so a supervisor can \
-                 restart tymuxd"
-            );
-            std::process::exit(1);
-        }
+        exit_if_listener_ended_unexpectedly("tcp", &shutdown_requested);
         res
     };
 
@@ -2200,10 +2190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if end == TcpProbeEnd::ListenerDead {
                 // The tonic future never ends on its own here, so `join!` would idle
                 // forever; a supervisor can only respawn a process that exits.
-                tracing::error!(
-                    "tcp listener is unreachable; exiting so a supervisor can restart tymuxd"
-                );
-                std::process::exit(1);
+                exit_if_listener_ended_unexpectedly("tcp-probe", &shutdown_requested);
             }
         }
     };
@@ -2225,9 +2212,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The TCP server future returning without SIGTERM/Ctrl-C means the listener is gone.
-fn tcp_accept_loop_ended_early(shutdown_requested: bool) -> bool {
-    !shutdown_requested
+/// Resolves on SIGTERM/Ctrl-C after recording it in `flag`.
+async fn flagged_shutdown(flag: Arc<std::sync::atomic::AtomicBool>) {
+    shutdown_signal().await;
+    flag.store(true, Ordering::SeqCst);
+}
+
+/// A listener ending (or being found dead) without SIGTERM/Ctrl-C means it is gone.
+fn listener_ended_unexpectedly(shutdown_requested: &std::sync::atomic::AtomicBool) -> bool {
+    !shutdown_requested.load(Ordering::SeqCst)
+}
+
+/// Exits non-zero so a supervisor can restart tymuxd, unless a shutdown drain is in progress.
+fn exit_if_listener_ended_unexpectedly(
+    listener: &'static str,
+    shutdown_requested: &std::sync::atomic::AtomicBool,
+) {
+    if listener_ended_unexpectedly(shutdown_requested) {
+        tracing::error!(
+            listener,
+            "listener ended without a shutdown request; exiting so a supervisor can restart tymuxd"
+        );
+        std::process::exit(1);
+    }
 }
 
 fn log_nofile_limit_outcome(outcome: std::io::Result<listener_health::NofileLimits>) {
@@ -2284,6 +2291,29 @@ enum TcpProbeEnd {
 enum TcpProbeOutcome {
     Connected,
     Failed,
+    /// The probe itself could not run (its own fd/memory exhaustion); says nothing about the
+    /// listener, so it neither counts as a failure nor resets the count.
+    Inconclusive,
+}
+
+/// Only errors that mean "nothing is accepting" count against the listener; local resource
+/// exhaustion in the probe's own `connect` does not.
+fn probe_connect_error_outcome(e: &std::io::Error) -> TcpProbeOutcome {
+    match e.raw_os_error() {
+        Some(n)
+            if [
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ENOBUFS,
+                libc::ENOMEM,
+                libc::EADDRNOTAVAIL,
+            ]
+            .contains(&n) =>
+        {
+            TcpProbeOutcome::Inconclusive
+        }
+        _ => TcpProbeOutcome::Failed,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2314,6 +2344,7 @@ fn tcp_health_probe_transition(
                 },
             )
         }
+        TcpProbeOutcome::Inconclusive => (consecutive_failures, TcpHealthProbeLog::None),
         TcpProbeOutcome::Failed => {
             let next = consecutive_failures + 1;
             (
@@ -2374,7 +2405,8 @@ async fn tcp_health_probe(
                 .await
             {
                 Ok(Ok(_stream)) => TcpProbeOutcome::Connected,
-                Ok(Err(_)) | Err(_) => TcpProbeOutcome::Failed,
+                Ok(Err(e)) => probe_connect_error_outcome(&e),
+                Err(_) => TcpProbeOutcome::Failed,
             };
         let (next, action) = tcp_health_probe_transition(consecutive_failures, outcome);
         consecutive_failures = next;
@@ -6520,63 +6552,178 @@ mod tests {
         assert_eq!(end, TcpProbeEnd::ListenerDead);
     }
 
-    /// The listening socket is gone from under a running server.
-    /// `dup2` of /dev/null over the listener's fd drops the socket (the port stops accepting)
-    /// but leaves the fd number valid, so the server's own later close stays harmless.
+    /// The accept stream ends under a running server (the listener closes and the port stops
+    /// accepting), then the real probe, with the listener fd for diagnostics, must give up.
+    /// Ends the stream instead of dup2-ing over the fd: dup2 mutates the process-global fd
+    /// table, which raced with other threads' fds in this multithreaded test binary.
     #[tokio::test(start_paused = true)]
     #[tracing_test::traced_test]
-    async fn tcp_health_probe_should_give_up_when_the_listener_fd_is_replaced_under_a_running_server(
-    ) {
+    async fn tcp_health_probe_should_give_up_when_the_listener_closes_under_a_running_server() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let fd = listener.as_raw_fd();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(
             Server::builder()
                 .add_service(TymuxServiceServer::new(test_daemon()))
-                .serve_with_incoming(listener_health::log_accept_errors(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    "tcp",
-                    fd,
+                .serve_with_incoming(futures::StreamExt::take_until(
+                    listener_health::log_accept_errors(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        "tcp",
+                        fd,
+                    ),
+                    close_rx,
                 )),
         );
-        let dial = || tokio::net::TcpStream::connect(addr);
-        dial()
+        tokio::net::TcpStream::connect(addr)
             .await
-            .expect("listener should accept before the fd is replaced");
+            .expect("listener should accept before it is closed");
 
-        let devnull = std::fs::File::open("/dev/null").unwrap();
-        // SAFETY: both fds are open; dup2 atomically retargets `fd` at /dev/null.
-        assert_eq!(unsafe { libc::dup2(devnull.as_raw_fd(), fd) }, fd);
-        dial().await.expect_err("the port should be unbound now");
+        close_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect_err("the port should be closed now");
 
         let end = drive_probe_to_end(tokio::spawn(tcp_health_probe(addr, Some(fd)))).await;
 
         assert_eq!(end, TcpProbeEnd::ListenerDead);
         assert!(logs_contain("failed too many times in a row"));
-        // The server may already have closed the fd by now, so only the field is stable.
+        // The fd number may be reused by now, so only the field is stable.
         assert!(
             logs_contain("listener_fd_state"),
             "probe log should carry the fd state"
         );
+    }
+
+    fn emfile() -> std::io::Error {
+        std::io::Error::from_raw_os_error(libc::EMFILE)
+    }
+
+    /// Pins the tonic 0.12.3 behavior the daemon depends on: any accept errno outside its
+    /// short allow-list ends the server with `Ok(())` (and only a debug log), so `join!` never
+    /// sees an error. This is why `log_accept_errors` must swallow non-fatal errnos itself.
+    #[tokio::test]
+    async fn serve_with_incoming_should_return_ok_after_any_non_allow_listed_accept_error() {
+        for errno in [libc::EBADF, libc::EMFILE] {
+            let failing = futures::stream::iter(vec![Err::<tokio::net::TcpStream, _>(
+                std::io::Error::from_raw_os_error(errno),
+            )]);
+
+            let res = Server::builder()
+                .add_service(TymuxServiceServer::new(test_daemon()))
+                .serve_with_incoming(failing)
+                .await;
+
+            assert!(res.is_ok(), "errno {errno}: {res:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_server_should_keep_serving_after_emfile_when_accept_errors_are_wrapped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures::stream::iter(vec![Err(emfile()), Err(emfile())])
+            .chain(tokio_stream::wrappers::TcpListenerStream::new(listener));
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(TymuxServiceServer::new(test_daemon()))
+                .serve_with_incoming(listener_health::log_accept_errors(incoming, "tcp", -1)),
+        );
+
+        let mut client = TymuxServiceClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        client
+            .get_server_info(GetServerInfoRequest {
+                client_protocol_version: 1,
+            })
+            .await
+            .expect("an RPC should succeed after the transient accept errors");
+        assert!(!server.is_finished(), "server must not have returned");
         server.abort();
     }
 
-    /// Pins the tonic 0.12.3 behavior the daemon's early-exit check depends on: a fatal accept
-    /// error ends the server with `Ok(())` (and only a trace log), so `join!` never sees an error.
+    #[tokio::test(start_paused = true)]
+    async fn uds_accept_stream_should_deliver_a_connection_after_emfile() {
+        let dir = std::path::PathBuf::from(format!("/tmp/tymuxd-e{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let incoming = futures::stream::iter(vec![Err(emfile())])
+            .chain(tokio_stream::wrappers::UnixListenerStream::new(listener));
+        let mut incoming = Box::pin(listener_health::log_accept_errors(incoming, "uds", -1));
+
+        let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
+
+        assert!(incoming.next().await.unwrap().is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// UDS shares tonic's accept loop, so a fatal error ends it with `Ok(())` too; the daemon
+    /// must treat that as an unexpected end rather than idle in `join!` with no UDS transport.
     #[tokio::test]
-    async fn serve_with_incoming_should_return_ok_after_a_fatal_accept_error() {
-        let fatal = futures::stream::iter(vec![Err::<tokio::net::TcpStream, _>(
+    async fn uds_serve_should_return_ok_after_a_fatal_accept_error_and_count_as_ended_early() {
+        let fatal = futures::stream::iter(vec![Err::<tokio::net::UnixStream, _>(
             std::io::Error::from_raw_os_error(libc::EBADF),
         )]);
-
         let res = Server::builder()
             .add_service(TymuxServiceServer::new(test_daemon()))
-            .serve_with_incoming(fatal)
+            .serve_with_incoming(listener_health::log_accept_errors(fatal, "uds", -1))
             .await;
 
         assert!(res.is_ok(), "{res:?}");
-        assert!(tcp_accept_loop_ended_early(false));
-        assert!(!tcp_accept_loop_ended_early(true));
+        assert!(listener_ended_unexpectedly(
+            &std::sync::atomic::AtomicBool::new(false)
+        ));
+    }
+
+    #[test]
+    fn listener_ended_unexpectedly_should_stand_down_once_shutdown_was_requested() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(listener_ended_unexpectedly(&flag));
+        flag.store(true, Ordering::SeqCst);
+        assert!(!listener_ended_unexpectedly(&flag));
+        // No exit: this would terminate the test binary if the guard were wrong.
+        exit_if_listener_ended_unexpectedly("test", &flag);
+    }
+
+    #[test]
+    fn probe_connect_error_outcome_should_not_blame_the_listener_for_the_probes_own_exhaustion() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EADDRNOTAVAIL,
+        ] {
+            assert_eq!(
+                probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno)),
+                TcpProbeOutcome::Inconclusive,
+                "errno {errno}"
+            );
+        }
+        for errno in [libc::ECONNREFUSED, libc::ETIMEDOUT, libc::ECONNRESET] {
+            assert_eq!(
+                probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno)),
+                TcpProbeOutcome::Failed,
+                "errno {errno}"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_health_probe_transition_inconclusive_leaves_the_failure_count_alone() {
+        assert_eq!(
+            tcp_health_probe_transition(5, TcpProbeOutcome::Inconclusive),
+            (5, TcpHealthProbeLog::None)
+        );
+        let almost = TCP_HEALTH_PROBE_EXIT_THRESHOLD - 1;
+        assert_eq!(
+            tcp_health_probe_transition(almost, TcpProbeOutcome::Inconclusive),
+            (almost, TcpHealthProbeLog::None),
+            "fd saturation must never push the probe over the exit threshold"
+        );
     }
 
     // --- Epic 5.1: accept/reject over a real UDS connection ---
