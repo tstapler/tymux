@@ -233,11 +233,16 @@ fn log_accept_error(
 /// First pause after a swallowed accept error; doubles per consecutive error up to the cap.
 const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(10);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// Non-fatal accept errors with no successful accept in between for this long are escalated to
+/// a fatal error: tonic never errors on them, so otherwise a daemon stuck at EMFILE would stay
+/// alive but unreachable forever, with nothing (UDS has no probe) to notice.
+const ACCEPT_PERSISTENT_ERROR_LIMIT: Duration = Duration::from_secs(120);
 
 /// Logs every accept error (rate-limited) and swallows the non-fatal ones after a capped
 /// backoff, so the stream only ever yields connections or a fatal error. Needed because tonic
 /// 0.12 ends its accept loop (serve returns `Ok(())`) on any errno other than a short
-/// allow-list, so a single EMFILE would otherwise take the whole listener down.
+/// allow-list, so a single EMFILE would otherwise take the whole listener down. Errors that
+/// persist for [`ACCEPT_PERSISTENT_ERROR_LIMIT`] without a success are forwarded after all.
 pub fn log_accept_errors<S, T>(
     incoming: S,
     listener: &'static str,
@@ -250,17 +255,20 @@ where
         incoming: std::pin::Pin<Box<S>>,
         limiter: AcceptErrorLimiter,
         backoff: Duration,
+        failing_since: Option<tokio::time::Instant>,
     }
     let state = State {
         incoming: Box::pin(incoming),
         limiter: AcceptErrorLimiter::default(),
         backoff: ACCEPT_BACKOFF_START,
+        failing_since: None,
     };
     futures::stream::unfold(state, move |mut st| async move {
         loop {
             match st.incoming.next().await? {
                 Ok(conn) => {
                     st.backoff = ACCEPT_BACKOFF_START;
+                    st.failing_since = None;
                     return Some((Ok(conn), st));
                 }
                 Err(e) => {
@@ -268,6 +276,15 @@ where
                         log_accept_error(listener, fd, &e, suppressed);
                     }
                     if matches!(classify_accept_error(&e), AcceptErrorKind::Fatal(_)) {
+                        return Some((Err(e), st));
+                    }
+                    let since = *st.failing_since.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= ACCEPT_PERSISTENT_ERROR_LIMIT {
+                        tracing::error!(
+                            listener, error = %e,
+                            "accept has failed continuously for {}s; giving up so the daemon can be restarted",
+                            ACCEPT_PERSISTENT_ERROR_LIMIT.as_secs()
+                        );
                         return Some((Err(e), st));
                     }
                     tokio::time::sleep(st.backoff).await;
@@ -437,6 +454,37 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(start.elapsed() <= ACCEPT_BACKOFF_MAX * 20);
         assert!(start.elapsed() >= ACCEPT_BACKOFF_MAX * 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn log_accept_errors_should_escalate_persistent_fd_exhaustion_to_an_error() {
+        let src = futures::stream::repeat_with(|| {
+            Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE))
+        });
+        let start = tokio::time::Instant::now();
+        let out: Vec<_> = log_accept_errors(src, "uds", -1).take(1).collect().await;
+
+        assert_eq!(out[0].as_ref().unwrap_err().raw_os_error(), Some(libc::EMFILE));
+        let waited = start.elapsed();
+        assert!(waited >= ACCEPT_PERSISTENT_ERROR_LIMIT, "{waited:?}");
+        assert!(waited < ACCEPT_PERSISTENT_ERROR_LIMIT + ACCEPT_BACKOFF_MAX * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn log_accept_errors_should_restart_the_persistence_clock_after_a_success() {
+        let fail = |n: u64| {
+            futures::stream::iter((0..n).map(|_| {
+                Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE))
+            }))
+        };
+        // ~100s of errors, a success, ~100s more: never 120s without a success.
+        let src = fail(100)
+            .chain(futures::stream::iter([Ok(1)]))
+            .chain(fail(100))
+            .chain(futures::stream::iter([Ok(2)]));
+        let out: Vec<_> = log_accept_errors(src, "uds", -1).collect().await;
+
+        assert!(matches!(out.as_slice(), [Ok(1), Ok(2)]), "{out:?}");
     }
 
     #[tokio::test(start_paused = true)]
