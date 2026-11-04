@@ -40,6 +40,8 @@ pub struct NofileLimits {
 
 /// Raises the soft `RLIMIT_NOFILE` toward the hard limit. Under launchd the soft limit can be
 /// as low as 256, which a few dozen panes exhaust.
+// rlim_t is u32 on some 32-bit targets, so the casts are needed there.
+#[allow(clippy::unnecessary_cast)]
 pub fn raise_nofile_limit() -> io::Result<NofileLimits> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -72,6 +74,7 @@ pub fn raise_nofile_limit() -> io::Result<NofileLimits> {
 }
 
 /// The current soft `RLIMIT_NOFILE`, or 0 if it cannot be read.
+#[allow(clippy::unnecessary_cast)]
 pub fn nofile_soft_limit() -> u64 {
     let mut lim = libc::rlimit {
         rlim_cur: 0,

@@ -276,6 +276,39 @@ fn orientation_to_proto(o: CoreOrientation) -> ProtoOrientation {
     }
 }
 
+/// `FAILED_PRECONDITION` for a pane with no running process, tagged with an `ErrorInfo` reason so
+/// clients can tell the two causes apart without matching the message.
+fn dead_pane_status(engine: &Engine, pane_id: Uuid) -> Status {
+    use tonic_types::{ErrorDetails, StatusExt};
+    let (reason, message) = if engine.exited_pane(pane_id).is_some() {
+        (
+            tymux_proto::REASON_PANE_EXITED,
+            format!(
+                "pane is not running and cannot be attached to or written to: its child exited \
+                 (pane_id={pane_id}). Its last screen is still readable with \
+                 CapturePane/SearchScrollback while the daemon holds it"
+            ),
+        )
+    } else {
+        (
+            tymux_proto::REASON_PANE_RESTORED_WITHOUT_SCREEN,
+            format!(
+                "pane was restored from disk without a screen, so it cannot be attached to, \
+                 written to, or captured (pane_id={pane_id}); respawn it with ReviveSession"
+            ),
+        )
+    };
+    Status::with_error_details(
+        tonic::Code::FailedPrecondition,
+        message,
+        ErrorDetails::with_error_info(
+            reason,
+            tymux_proto::ERROR_DOMAIN,
+            [("pane_id".to_string(), pane_id.to_string())],
+        ),
+    )
+}
+
 // tonic::Status is a fixed ~176 bytes we don't control; boxing it here
 // would just push the cost onto every call site.
 #[allow(clippy::result_large_err)]
@@ -711,12 +744,7 @@ fn spawn_error_to_status(e: anyhow::Error) -> Status {
 fn resolve_live_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::Pane>, Status> {
     match engine.pane_lookup(pane_id) {
         PaneLookup::Live(pane) => Ok(pane),
-        PaneLookup::Dead => Err(Status::failed_precondition(format!(
-            "pane is not running and cannot be attached to or written to: its child exited, or \
-             it was restored from disk without a screen (pane_id={pane_id}). Its last screen is \
-             still readable with CapturePane/SearchScrollback while the daemon holds it; a \
-             restored pane can be respawned with ReviveSession"
-        ))),
+        PaneLookup::Dead => Err(dead_pane_status(engine, pane_id)),
         PaneLookup::Unknown => Err(Status::not_found("no such pane")),
     }
 }
@@ -755,7 +783,8 @@ async fn next_lifecycle_event(
 
 /// For read-only screen RPCs (CapturePane, SearchScrollback): the pane if it is running, or if its
 /// child exited but the daemon still holds its last screen. A pane known only from a persisted
-/// record has no screen, so it keeps the `FAILED_PRECONDITION` of [`resolve_live_pane`].
+/// record has no screen, so it keeps the `FAILED_PRECONDITION` of [`resolve_live_pane`] (reason
+/// `PANE_RESTORED_WITHOUT_SCREEN`).
 #[allow(clippy::result_large_err)]
 fn resolve_readable_pane(engine: &Engine, pane_id: Uuid) -> Result<Arc<tymux_core::Pane>, Status> {
     resolve_live_pane(engine, pane_id).or_else(|status| match engine.exited_pane(pane_id) {
@@ -3346,6 +3375,15 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error_reason(&err),
+            tymux_proto::REASON_PANE_RESTORED_WITHOUT_SCREEN
+        );
+        assert!(
+            !err.message().contains("still readable"),
+            "a restored pane has no screen, so the message must not say it is readable: {}",
+            err.message()
+        );
 
         std::fs::remove_dir_all(&persist_dir).ok();
     }
@@ -5390,6 +5428,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        // Over the wire, so this also proves the detail survives gRPC transport.
+        assert_eq!(error_reason(&err), tymux_proto::REASON_PANE_EXITED);
+    }
+
+    fn error_reason(status: &Status) -> String {
+        use tonic_types::StatusExt;
+        status
+            .get_details_error_info()
+            .map(|info| info.reason)
+            .unwrap_or_default()
     }
 
     // --- Epic 3.2: application heartbeat + deferred viewport/geometry cleanup ---

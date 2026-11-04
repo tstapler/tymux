@@ -2214,7 +2214,10 @@ export const TymuxService: GenService<{
    * alternative to `tmux capture-pane` (which returns raw text you'd have
    * to re-parse). Cells carry attributes directly. scrollback_offset lets
    * a caller read a historical screen (copy-mode's navigation primitive)
-   * instead of the live one.
+   * instead of the live one. A pane whose child exited is still readable (liveness DEAD).
+   * A pane restored from disk has no screen: FAILED_PRECONDITION with ErrorInfo reason
+   * PANE_RESTORED_WITHOUT_SCREEN (domain "tymux.v1"); call ReviveSession and retry. Attach and
+   * write RPCs on an exited pane fail the same way with reason PANE_EXITED.
    *
    * @generated from rpc tymux.v1.TymuxService.CapturePane
    */
