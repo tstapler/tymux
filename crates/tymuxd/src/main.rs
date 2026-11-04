@@ -6560,48 +6560,42 @@ mod tests {
         assert_eq!(end, TcpProbeEnd::ListenerDead);
     }
 
-    /// The accept stream ends under a running server (the listener closes and the port stops
-    /// accepting), then the real probe, with the listener fd for diagnostics, must give up.
-    /// Ends the stream instead of dup2-ing over the fd: dup2 mutates the process-global fd
-    /// table, which raced with other threads' fds in this multithreaded test binary.
+    /// The probe must give up on a refusing port while a real server keeps running, and its
+    /// log must carry the server's listener fd state. The refusing port is a bound, never
+    /// listened-on socket: it is held for the whole test, so no parallel test's `bind(:0)` can
+    /// be handed it (a freed port was, and then accepted). No dup2 either: that mutates the
+    /// process-global fd table, which raced with other threads' fds in this test binary.
     #[tokio::test(start_paused = true)]
     #[tracing_test::traced_test]
-    async fn tcp_health_probe_should_give_up_when_the_listener_closes_under_a_running_server() {
+    async fn tcp_health_probe_should_give_up_on_a_refusing_port_while_a_server_keeps_running() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let fd = listener.as_raw_fd();
-        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(
             Server::builder()
                 .add_service(TymuxServiceServer::new(test_daemon()))
-                .serve_with_incoming(futures::StreamExt::take_until(
-                    listener_health::log_accept_errors(
-                        tokio_stream::wrappers::TcpListenerStream::new(listener),
-                        "tcp",
-                        fd,
-                    ),
-                    close_rx,
+                .serve_with_incoming(listener_health::log_accept_errors(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    "tcp",
+                    fd,
                 )),
         );
+        let refusing = tokio::net::TcpSocket::new_v4().unwrap();
+        refusing.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = refusing.local_addr().unwrap();
         tokio::net::TcpStream::connect(addr)
             .await
-            .expect("listener should accept before it is closed");
-
-        close_tx.send(()).unwrap();
-        server.await.unwrap().unwrap();
-        tokio::net::TcpStream::connect(addr)
-            .await
-            .expect_err("the port should be closed now");
+            .expect_err("a bound but unlistened port refuses connections");
 
         let end = drive_probe_to_end(tokio::spawn(tcp_health_probe(addr, Some(fd)))).await;
 
         assert_eq!(end, TcpProbeEnd::ListenerDead);
         assert!(logs_contain("failed too many times in a row"));
-        // The fd number may be reused by now, so only the field is stable.
         assert!(
-            logs_contain("listener_fd_state"),
-            "probe log should carry the fd state"
+            logs_contain("open socket"),
+            "probe log should carry the live listener fd state"
         );
+        assert!(!server.is_finished());
+        server.abort();
     }
 
     fn emfile() -> std::io::Error {

@@ -370,9 +370,9 @@ mod tests {
         let file = std::fs::File::open("/dev/null").unwrap();
         assert!(fd_state(file.as_raw_fd()).contains("not a socket"));
 
-        let closed = file.as_raw_fd();
-        drop(file);
-        assert!(fd_state(closed).contains("fcntl(F_GETFD) failed"));
+        // A number no process ever has open (above any rlimit), so a parallel test cannot be
+        // handed it the way it can a just-closed fd.
+        assert!(fd_state(i32::MAX).contains("fcntl(F_GETFD) failed"));
     }
 
     #[tokio::test]
