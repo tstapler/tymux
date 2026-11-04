@@ -42,6 +42,7 @@ pub fn set_child_nofile_soft_limit(soft: u64) {
 
 /// Lowers the calling process's soft `RLIMIT_NOFILE` to the configured child value. Only
 /// async-signal-safe calls (atomic load, get/setrlimit), so it is usable after fork.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))] // only the pre_exec route calls it
 #[allow(clippy::unnecessary_cast)]
 fn apply_child_nofile_limit_in_self() {
     let want = CHILD_NOFILE_SOFT.load(Ordering::Relaxed);
