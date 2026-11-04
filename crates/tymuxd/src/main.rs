@@ -2304,9 +2304,11 @@ enum TcpProbeOutcome {
     Inconclusive,
 }
 
-/// Only errors that mean "nothing is accepting" count against the listener; local resource
-/// exhaustion in the probe's own `connect` does not.
-fn probe_connect_error_outcome(e: &std::io::Error) -> TcpProbeOutcome {
+/// Only errors that mean "nothing is accepting" count against the listener. Local resource
+/// exhaustion and network-reachability errnos (a LAN/Tailscale bind whose interface is down)
+/// say nothing about the listener fd, so they are inconclusive. A timeout only counts on
+/// loopback, where a healthy listener always answers.
+fn probe_connect_error_outcome(e: &std::io::Error, loopback: bool) -> TcpProbeOutcome {
     match e.raw_os_error() {
         Some(n)
             if [
@@ -2315,12 +2317,24 @@ fn probe_connect_error_outcome(e: &std::io::Error) -> TcpProbeOutcome {
                 libc::ENOBUFS,
                 libc::ENOMEM,
                 libc::EADDRNOTAVAIL,
+                libc::ENETUNREACH,
+                libc::ENETDOWN,
+                libc::EHOSTUNREACH,
             ]
             .contains(&n) =>
         {
             TcpProbeOutcome::Inconclusive
         }
+        Some(n) if n == libc::ETIMEDOUT => probe_timeout_outcome(loopback),
         _ => TcpProbeOutcome::Failed,
+    }
+}
+
+fn probe_timeout_outcome(loopback: bool) -> TcpProbeOutcome {
+    if loopback {
+        TcpProbeOutcome::Failed
+    } else {
+        TcpProbeOutcome::Inconclusive
     }
 }
 
@@ -2392,6 +2406,8 @@ async fn tcp_health_probe(
     let mut interval = tokio::time::interval(PROBE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consecutive_failures = 0u32;
+    // `probe_addr` is loopback when the daemon binds a wildcard (see `tcp_probe_target`).
+    let loopback = probe_addr.ip().is_loopback();
 
     // Pinned once and reused across iterations, unlike a `shutdown_signal()`
     // call made fresh inside `select!` each time: this task also awaits the
@@ -2413,8 +2429,8 @@ async fn tcp_health_probe(
                 .await
             {
                 Ok(Ok(_stream)) => TcpProbeOutcome::Connected,
-                Ok(Err(e)) => probe_connect_error_outcome(&e),
-                Err(_) => TcpProbeOutcome::Failed,
+                Ok(Err(e)) => probe_connect_error_outcome(&e, loopback),
+                Err(_) => probe_timeout_outcome(loopback),
             };
         let (next, action) = tcp_health_probe_transition(consecutive_failures, outcome);
         consecutive_failures = next;
@@ -6700,18 +6716,42 @@ mod tests {
             libc::EADDRNOTAVAIL,
         ] {
             assert_eq!(
-                probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno)),
+                probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno), true),
                 TcpProbeOutcome::Inconclusive,
                 "errno {errno}"
             );
         }
-        for errno in [libc::ECONNREFUSED, libc::ETIMEDOUT, libc::ECONNRESET] {
-            assert_eq!(
-                probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno)),
-                TcpProbeOutcome::Failed,
-                "errno {errno}"
-            );
+    }
+
+    #[test]
+    fn probe_connect_error_outcome_should_not_blame_the_listener_for_network_unreachability() {
+        for loopback in [true, false] {
+            for errno in [libc::ENETUNREACH, libc::ENETDOWN, libc::EHOSTUNREACH] {
+                assert_eq!(
+                    probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno), loopback),
+                    TcpProbeOutcome::Inconclusive,
+                    "errno {errno} loopback={loopback}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn probe_connect_error_outcome_should_count_refusal_everywhere_and_timeouts_only_on_loopback() {
+        for loopback in [true, false] {
+            for errno in [libc::ECONNREFUSED, libc::ECONNRESET] {
+                assert_eq!(
+                    probe_connect_error_outcome(&std::io::Error::from_raw_os_error(errno), loopback),
+                    TcpProbeOutcome::Failed,
+                    "errno {errno} loopback={loopback}"
+                );
+            }
+        }
+        let timed_out = std::io::Error::from_raw_os_error(libc::ETIMEDOUT);
+        assert_eq!(probe_connect_error_outcome(&timed_out, true), TcpProbeOutcome::Failed);
+        assert_eq!(probe_connect_error_outcome(&timed_out, false), TcpProbeOutcome::Inconclusive);
+        assert_eq!(probe_timeout_outcome(true), TcpProbeOutcome::Failed);
+        assert_eq!(probe_timeout_outcome(false), TcpProbeOutcome::Inconclusive);
     }
 
     #[test]
