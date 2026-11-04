@@ -6554,8 +6554,14 @@ mod tests {
         // the next one lands — a couple of ticks get consumed by task
         // scheduling/registration overhead around the spawn itself, so the
         // exact threshold count alone isn't reliably enough real polls.
-        for _ in 0..(TCP_HEALTH_PROBE_WARN_THRESHOLD + 2) {
+        // Each tick awaits real IO and a blocking-pool fd count, which yields alone cannot
+        // wait for: advance, give them real time, and stop as soon as the log appears.
+        for _ in 0..200 {
+            if logs_contain("tcp listener health probe failed repeatedly") {
+                break;
+            }
             tokio::time::advance(Duration::from_secs(30)).await;
+            std::thread::sleep(Duration::from_millis(5));
             tokio::task::yield_now().await;
         }
 
@@ -6564,14 +6570,13 @@ mod tests {
 
     /// Advances the paused clock one probe interval at a time until `probe` finishes.
     async fn drive_probe_to_end(probe: tokio::task::JoinHandle<TcpProbeEnd>) -> TcpProbeEnd {
-        for _ in 0..(TCP_HEALTH_PROBE_EXIT_THRESHOLD + 3) {
-            tokio::time::advance(Duration::from_secs(30)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
+        for _ in 0..200 {
             if probe.is_finished() {
                 return probe.await.unwrap();
             }
+            tokio::time::advance(Duration::from_secs(30)).await;
+            std::thread::sleep(Duration::from_millis(5));
+            tokio::task::yield_now().await;
         }
         panic!("probe never gave up on a dead listener");
     }
