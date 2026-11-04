@@ -3143,6 +3143,11 @@ type ServerInfo struct {
 	Pid uint32 `protobuf:"varint,5,opt,name=pid,proto3" json:"pid,omitempty"`
 	// Daemon start time, seconds since the Unix epoch.
 	StartedAtUnix int64 `protobuf:"varint,6,opt,name=started_at_unix,json=startedAtUnix,proto3" json:"started_at_unix,omitempty"`
+	// File descriptors the daemon holds open right now, and its soft RLIMIT_NOFILE. Alert when
+	// open_fds nears max_open_fds: at the limit, new panes and connections fail with EMFILE.
+	// 0 when the daemon could not read the value (e.g. an older daemon omits both).
+	OpenFds       uint64 `protobuf:"varint,7,opt,name=open_fds,json=openFds,proto3" json:"open_fds,omitempty"`
+	MaxOpenFds    uint64 `protobuf:"varint,8,opt,name=max_open_fds,json=maxOpenFds,proto3" json:"max_open_fds,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3215,6 +3220,20 @@ func (x *ServerInfo) GetPid() uint32 {
 func (x *ServerInfo) GetStartedAtUnix() int64 {
 	if x != nil {
 		return x.StartedAtUnix
+	}
+	return 0
+}
+
+func (x *ServerInfo) GetOpenFds() uint64 {
+	if x != nil {
+		return x.OpenFds
+	}
+	return 0
+}
+
+func (x *ServerInfo) GetMaxOpenFds() uint64 {
+	if x != nil {
+		return x.MaxOpenFds
 	}
 	return 0
 }
@@ -4199,7 +4218,7 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\tlifecycle\x18\b \x01(\v2\x18.tymux.v1.LifecycleEventH\x00R\tlifecycleB\t\n" +
 	"\apayload\"N\n" +
 	"\x14GetServerInfoRequest\x126\n" +
-	"\x17client_protocol_version\x18\x01 \x01(\rR\x15clientProtocolVersion\"\xee\x01\n" +
+	"\x17client_protocol_version\x18\x01 \x01(\rR\x15clientProtocolVersion\"\xab\x02\n" +
 	"\n" +
 	"ServerInfo\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12)\n" +
@@ -4207,7 +4226,10 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x1bmin_client_protocol_version\x18\x03 \x01(\rR\x18minClientProtocolVersion\x12\"\n" +
 	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12\x10\n" +
 	"\x03pid\x18\x05 \x01(\rR\x03pid\x12&\n" +
-	"\x0fstarted_at_unix\x18\x06 \x01(\x03R\rstartedAtUnix\"\xbf\x03\n" +
+	"\x0fstarted_at_unix\x18\x06 \x01(\x03R\rstartedAtUnix\x12\x19\n" +
+	"\bopen_fds\x18\a \x01(\x04R\aopenFds\x12 \n" +
+	"\fmax_open_fds\x18\b \x01(\x04R\n" +
+	"maxOpenFds\"\xbf\x03\n" +
 	"\rRestartPolicy\x12)\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x15.tymux.v1.RestartModeR\x04mode\x12&\n" +
 	"\fmax_restarts\x18\x02 \x01(\rH\x00R\vmaxRestarts\x88\x01\x01\x12 \n" +

@@ -604,6 +604,11 @@ message ServerInfo {
   uint32 pid = 5;
   // Daemon start time, seconds since the Unix epoch.
   int64 started_at_unix = 6;
+  // File descriptors the daemon holds open right now, and its soft RLIMIT_NOFILE. Alert when
+  // open_fds nears max_open_fds: at the limit, new panes and connections fail with EMFILE.
+  // 0 when the daemon could not read the value (e.g. an older daemon omits both).
+  uint64 open_fds = 7;
+  uint64 max_open_fds = 8;
 }
 
 // ---- Pane lifecycle (ADR-0007) ----

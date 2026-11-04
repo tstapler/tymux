@@ -881,6 +881,8 @@ impl TymuxService for TymuxDaemon {
                 .collect(),
             pid: std::process::id(),
             started_at_unix,
+            open_fds: listener_health::open_fd_count(),
+            max_open_fds: listener_health::nofile_soft_limit(),
         }))
     }
 
@@ -3172,6 +3174,7 @@ mod tests {
             "create_session.stdin_file",
             "create_session.stdin_stream",
             "pane.lifecycle",
+            "server_info.fd_usage",
         ] {
             assert!(
                 info.capabilities.iter().any(|c| c == feature),
@@ -3180,6 +3183,8 @@ mod tests {
         }
         assert_eq!(info.pid, std::process::id());
         assert!(info.started_at_unix > 0);
+        assert!(info.max_open_fds > 0);
+        assert!(info.open_fds > 0 && info.open_fds <= info.max_open_fds);
     }
 
     #[tokio::test]

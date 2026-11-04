@@ -1060,6 +1060,13 @@ struct StartedProcess {
     reply_fd: std::os::fd::OwnedFd,
 }
 
+/// True if `e` (or a cause) is `EMFILE`/`ENFILE`.
+fn is_fd_exhaustion(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| matches!(io.raw_os_error(), Some(n) if n == libc::EMFILE || n == libc::ENFILE))
+}
+
 /// Opens a pty of the given size and starts `command` on it. Shared by the first spawn and by
 /// [`Pane::respawn`], so a restart launches exactly what the original did.
 fn start_process(
@@ -1073,12 +1080,18 @@ fn start_process(
     // pty allocated.
     let prepared = launch.prepare()?;
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .inspect_err(|e| {
+            if is_fd_exhaustion(e) {
+                tracing::error!(error = %e, "openpty failed: out of file descriptors (EMFILE/ENFILE)");
+            }
+        })?;
 
     #[cfg(unix)]
     let child: Box<dyn portable_pty::Child + Send + Sync> = {
@@ -1299,6 +1312,15 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn is_fd_exhaustion_should_match_emfile_through_an_anyhow_chain_only() {
+        let emfile = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE))
+            .context("failed to openpty");
+        assert!(is_fd_exhaustion(&emfile));
+        let enoent = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOENT));
+        assert!(!is_fd_exhaustion(&enoent));
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 

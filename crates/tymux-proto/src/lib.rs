@@ -20,4 +20,5 @@ pub const CAPABILITIES: &[&str] = &[
     "create_session.stdin_stream",
     "uds_auth",
     "pane.lifecycle",
+    "server_info.fd_usage",
 ];
