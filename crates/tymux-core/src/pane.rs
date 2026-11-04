@@ -1337,8 +1337,8 @@ mod tests {
             );
             assert!(is_fd_exhaustion(&real), "{real}");
         }
-        let io_in_chain = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE))
-            .context("spawn");
+        let io_in_chain =
+            anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE)).context("spawn");
         assert!(is_fd_exhaustion(&io_in_chain));
         let enoent = anyhow::anyhow!(
             "failed to openpty: {:?}",

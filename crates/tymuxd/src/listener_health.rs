@@ -278,7 +278,9 @@ where
                     if matches!(classify_accept_error(&e), AcceptErrorKind::Fatal(_)) {
                         return Some((Err(e), st));
                     }
-                    let since = *st.failing_since.get_or_insert_with(tokio::time::Instant::now);
+                    let since = *st
+                        .failing_since
+                        .get_or_insert_with(tokio::time::Instant::now);
                     if since.elapsed() >= ACCEPT_PERSISTENT_ERROR_LIMIT {
                         tracing::error!(
                             listener, error = %e,
@@ -464,7 +466,10 @@ mod tests {
         let start = tokio::time::Instant::now();
         let out: Vec<_> = log_accept_errors(src, "uds", -1).take(1).collect().await;
 
-        assert_eq!(out[0].as_ref().unwrap_err().raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(
+            out[0].as_ref().unwrap_err().raw_os_error(),
+            Some(libc::EMFILE)
+        );
         let waited = start.elapsed();
         assert!(waited >= ACCEPT_PERSISTENT_ERROR_LIMIT, "{waited:?}");
         assert!(waited < ACCEPT_PERSISTENT_ERROR_LIMIT + ACCEPT_BACKOFF_MAX * 2);
@@ -473,9 +478,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn log_accept_errors_should_restart_the_persistence_clock_after_a_success() {
         let fail = |n: u64| {
-            futures::stream::iter((0..n).map(|_| {
-                Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE))
-            }))
+            futures::stream::iter(
+                (0..n).map(|_| Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE))),
+            )
         };
         // ~100s of errors, a success, ~100s more: never 120s without a success.
         let src = fail(100)
