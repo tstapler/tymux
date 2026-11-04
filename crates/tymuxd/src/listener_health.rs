@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt};
 
 /// Soft-limit ceiling on macOS, where `setrlimit` fails above `OPEN_MAX`
 /// even though the reported hard limit is `RLIM_INFINITY`.
@@ -38,8 +38,35 @@ pub struct NofileLimits {
     pub hard: u64,
 }
 
+/// The next, lower soft limit to try after `setrlimit(target)` failed, or `None` once it would
+/// not beat the current soft limit. Halves the gap, which converges on whatever the kernel allows
+/// (e.g. `kern.maxfilesperproc` on macOS) without a sysctl.
+fn next_lower_target(target: u64, soft: u64) -> Option<u64> {
+    let next = soft + (target - soft) / 2;
+    (next > soft).then_some(next)
+}
+
+/// Tries `target`, then successively lower values, returning the first the kernel accepts.
+fn raise_with(
+    soft: u64,
+    target: u64,
+    mut set: impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut candidate = target;
+    loop {
+        match set(candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) => match next_lower_target(candidate, soft) {
+                Some(next) => candidate = next,
+                None => return Err(e),
+            },
+        }
+    }
+}
+
 /// Raises the soft `RLIMIT_NOFILE` toward the hard limit. Under launchd the soft limit can be
-/// as low as 256, which a few dozen panes exhaust.
+/// as low as 256, which a few dozen panes exhaust. If the kernel refuses the target, retries
+/// lower values; `soft_after` is the value that took effect.
 // rlim_t is u32 on some 32-bit targets, so the casts are needed there.
 #[allow(clippy::unnecessary_cast)]
 pub fn raise_nofile_limit() -> io::Result<NofileLimits> {
@@ -61,14 +88,17 @@ pub fn raise_nofile_limit() -> io::Result<NofileLimits> {
             hard,
         });
     }
-    lim.rlim_cur = target as libc::rlim_t;
-    // SAFETY: `lim` is a valid rlimit; rlim_cur <= rlim_max by construction.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let soft_after = raise_with(soft_before, target, |value| {
+        lim.rlim_cur = value as libc::rlim_t;
+        // SAFETY: `lim` is a valid rlimit; rlim_cur <= rlim_max by construction.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })?;
     Ok(NofileLimits {
         soft_before,
-        soft_after: target,
+        soft_after,
         hard,
     })
 }
@@ -132,10 +162,11 @@ pub fn fd_state(fd: RawFd) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptErrorKind {
-    /// The listener itself is unusable; tonic will spin on this error forever.
+    /// The listener itself is unusable; retrying cannot help.
     Fatal(&'static str),
     /// Descriptor exhaustion: the listener is fine but cannot accept right now.
     FdExhausted(&'static str),
+    /// Anything else (ECONNABORTED, ENOBUFS, ENOMEM, EPROTO, ...): retry after a backoff.
     Transient,
 }
 
@@ -199,8 +230,14 @@ fn log_accept_error(
     }
 }
 
-/// Logs every accept error (rate-limited) and passes the stream through unchanged. tonic 0.12
-/// logs these at trace level only, so a dead listener is otherwise silent.
+/// First pause after a swallowed accept error; doubles per consecutive error up to the cap.
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Logs every accept error (rate-limited) and swallows the non-fatal ones after a capped
+/// backoff, so the stream only ever yields connections or a fatal error. Needed because tonic
+/// 0.12 ends its accept loop (serve returns `Ok(())`) on any errno other than a short
+/// allow-list, so a single EMFILE would otherwise take the whole listener down.
 pub fn log_accept_errors<S, T>(
     incoming: S,
     listener: &'static str,
@@ -209,10 +246,34 @@ pub fn log_accept_errors<S, T>(
 where
     S: Stream<Item = io::Result<T>>,
 {
-    let mut limiter = AcceptErrorLimiter::default();
-    incoming.inspect_err(move |e| {
-        if let Some(suppressed) = limiter.admit(Instant::now()) {
-            log_accept_error(listener, fd, e, suppressed);
+    struct State<S> {
+        incoming: std::pin::Pin<Box<S>>,
+        limiter: AcceptErrorLimiter,
+        backoff: Duration,
+    }
+    let state = State {
+        incoming: Box::pin(incoming),
+        limiter: AcceptErrorLimiter::default(),
+        backoff: ACCEPT_BACKOFF_START,
+    };
+    futures::stream::unfold(state, move |mut st| async move {
+        loop {
+            match st.incoming.next().await? {
+                Ok(conn) => {
+                    st.backoff = ACCEPT_BACKOFF_START;
+                    return Some((Ok(conn), st));
+                }
+                Err(e) => {
+                    if let Some(suppressed) = st.limiter.admit(Instant::now()) {
+                        log_accept_error(listener, fd, &e, suppressed);
+                    }
+                    if matches!(classify_accept_error(&e), AcceptErrorKind::Fatal(_)) {
+                        return Some((Err(e), st));
+                    }
+                    tokio::time::sleep(st.backoff).await;
+                    st.backoff = (st.backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                }
+            }
         }
     })
 }
@@ -220,7 +281,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
 
     #[test]
     fn desired_soft_limit_should_rise_to_the_hard_limit_when_under_the_cap() {
@@ -327,5 +387,100 @@ mod tests {
         assert!(out[0].is_err() && matches!(out[1], Ok(7)));
         assert!(logs_contain("fatal errno"));
         assert!(logs_contain("EBADF"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn log_accept_errors_should_swallow_resource_errnos_and_still_deliver_the_next_connection(
+    ) {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EPROTO,
+            libc::ENETDOWN,
+        ] {
+            let src = futures::stream::iter(vec![
+                Err::<u8, _>(io::Error::from_raw_os_error(errno)),
+                Err(io::Error::from_raw_os_error(errno)),
+                Ok(7),
+            ]);
+            let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+
+            assert_eq!(out.len(), 1, "errno {errno} must not reach the consumer");
+            assert!(matches!(out[0], Ok(7)), "errno {errno}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn log_accept_errors_should_back_off_between_swallowed_errors() {
+        let src = futures::stream::iter(vec![
+            Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE)),
+            Err(io::Error::from_raw_os_error(libc::EMFILE)),
+            Ok(1),
+        ]);
+        let start = tokio::time::Instant::now();
+        let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(start.elapsed(), ACCEPT_BACKOFF_START * 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn log_accept_errors_should_cap_the_backoff() {
+        let errs = (0..20).map(|_| Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE)));
+        let src = futures::stream::iter(errs.chain(std::iter::once(Ok(1))));
+        let start = tokio::time::Instant::now();
+        let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+
+        assert_eq!(out.len(), 1);
+        assert!(start.elapsed() <= ACCEPT_BACKOFF_MAX * 20);
+        assert!(start.elapsed() >= ACCEPT_BACKOFF_MAX * 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn log_accept_errors_should_forward_every_fatal_errno() {
+        for errno in [libc::EBADF, libc::ENOTSOCK, libc::EINVAL] {
+            let src =
+                futures::stream::iter(vec![Err::<u8, _>(io::Error::from_raw_os_error(errno))]);
+            let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].as_ref().unwrap_err().raw_os_error(), Some(errno));
+        }
+    }
+
+    #[test]
+    fn next_lower_target_should_halve_the_gap_and_stop_at_the_soft_limit() {
+        assert_eq!(next_lower_target(10_240, 256), Some(5_248));
+        assert_eq!(next_lower_target(258, 256), Some(257));
+        assert_eq!(next_lower_target(257, 256), None);
+    }
+
+    #[test]
+    fn raise_with_should_fall_back_to_a_lower_value_when_the_target_is_refused() {
+        let mut tried = Vec::new();
+        let got = raise_with(256, 10_240, |v| {
+            tried.push(v);
+            if v > 4_000 {
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(tried, vec![10_240, 5_248, 2_752]);
+        assert_eq!(got, 2_752);
+    }
+
+    #[test]
+    fn raise_with_should_return_the_error_when_nothing_is_accepted() {
+        let err = raise_with(256, 1_000, |_| {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
     }
 }
