@@ -26,6 +26,7 @@ pub use persistence::{
     CURRENT_SCHEMA_VERSION, STALE_SESSION_MAX_AGE,
 };
 pub use replay_buffer::ReplayOutcome;
+pub use spawn::set_child_nofile_soft_limit;
 
 pub use restart::{
     Clock, ExitKind, ExitRecord, FixedJitter, Jitter, LifecycleEvent, LifecycleEventKind,

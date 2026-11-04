@@ -21,6 +21,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 constant_time_eq = "0.5"
+tonic-types = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

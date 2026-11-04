@@ -35,7 +35,10 @@ service TymuxService {
   // alternative to `tmux capture-pane` (which returns raw text you'd have
   // to re-parse). Cells carry attributes directly. scrollback_offset lets
   // a caller read a historical screen (copy-mode's navigation primitive)
-  // instead of the live one.
+  // instead of the live one. A pane whose child exited is still readable (liveness DEAD).
+  // A pane restored from disk has no screen: FAILED_PRECONDITION with ErrorInfo reason
+  // PANE_RESTORED_WITHOUT_SCREEN (domain "tymux.v1"); call ReviveSession and retry. Attach and
+  // write RPCs on an exited pane fail the same way with reason PANE_EXITED.
   rpc CapturePane(CapturePaneRequest) returns (PaneSnapshot);
   // Forward-only substring search through a pane's scrollback — the
   // direct, non-interactive access path for programmatic/agent callers
@@ -604,6 +607,11 @@ message ServerInfo {
   uint32 pid = 5;
   // Daemon start time, seconds since the Unix epoch.
   int64 started_at_unix = 6;
+  // File descriptors the daemon holds open right now, and its soft RLIMIT_NOFILE. Alert when
+  // open_fds nears max_open_fds: at the limit, new panes and connections fail with EMFILE.
+  // 0 when the daemon could not read the value (e.g. an older daemon omits both).
+  uint64 open_fds = 7;
+  uint64 max_open_fds = 8;
 }
 
 // ---- Pane lifecycle (ADR-0007) ----

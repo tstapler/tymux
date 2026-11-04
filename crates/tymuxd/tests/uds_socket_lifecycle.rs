@@ -646,7 +646,9 @@ async fn tymuxd_dual_listener_drains_concurrent_tcp_and_uds_attach_streams_on_si
         assert_attach_stream_drains_cleanly(&mut uds_stream, "uds"),
     );
 
-    daemon.wait_for_exit(Duration::from_secs(8));
+    // Exit 0, not 1: the early-exit paths for a dead listener must stand down during a drain.
+    let status = daemon.wait_for_exit(Duration::from_secs(8));
+    assert!(status.success(), "SIGTERM drain exited with {status:?}");
 
     std::fs::remove_dir_all(&xdg_state_home).ok();
 }

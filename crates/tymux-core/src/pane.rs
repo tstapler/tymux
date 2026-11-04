@@ -1060,6 +1060,26 @@ struct StartedProcess {
     reply_fd: std::os::fd::OwnedFd,
 }
 
+/// True if `e` is `EMFILE`/`ENFILE`. portable-pty 0.8 reports `openpty` failure as
+/// `bail!("failed to openpty: {:?}", io::Error::last_os_error())`, so no `io::Error` is in the
+/// chain and the errno survives only as text; match both shapes.
+fn is_fd_exhaustion(e: &anyhow::Error) -> bool {
+    let in_chain = e
+        .chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| matches!(io.raw_os_error(), Some(n) if n == libc::EMFILE || n == libc::ENFILE));
+    // "Too many open files" is also the prefix of the ENFILE wording on Linux and macOS.
+    in_chain
+        || e.chain().any(|c| {
+            let text = c.to_string();
+            text.contains("Too many open files")
+                || text.contains("code: 24,")
+                || text.contains("code: 23,")
+                || text.contains("os error 24")
+                || text.contains("os error 23")
+        })
+}
+
 /// Opens a pty of the given size and starts `command` on it. Shared by the first spawn and by
 /// [`Pane::respawn`], so a restart launches exactly what the original did.
 fn start_process(
@@ -1073,12 +1093,18 @@ fn start_process(
     // pty allocated.
     let prepared = launch.prepare()?;
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .inspect_err(|e| {
+            if is_fd_exhaustion(e) {
+                tracing::error!(error = %e, "openpty failed: out of file descriptors (EMFILE/ENFILE)");
+            }
+        })?;
 
     #[cfg(unix)]
     let child: Box<dyn portable_pty::Child + Send + Sync> = {
@@ -1301,6 +1327,25 @@ fn pack_attrs(cell: &vt100::Cell) -> u32 {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn is_fd_exhaustion_should_match_the_error_portable_pty_really_produces() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let real = anyhow::anyhow!(
+                "failed to openpty: {:?}",
+                std::io::Error::from_raw_os_error(errno)
+            );
+            assert!(is_fd_exhaustion(&real), "{real}");
+        }
+        let io_in_chain =
+            anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE)).context("spawn");
+        assert!(is_fd_exhaustion(&io_in_chain));
+        let enoent = anyhow::anyhow!(
+            "failed to openpty: {:?}",
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        );
+        assert!(!is_fd_exhaustion(&enoent));
+    }
 
     #[test]
     fn terminal_modes_maps_vt100_state_onto_the_proto_numbering() {
