@@ -24,9 +24,71 @@ use std::{
     process::{Command, Stdio},
 };
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{bail, Context, Result};
 
 use crate::launch::{Launch, PreparedLaunch};
+
+/// Soft `RLIMIT_NOFILE` that pane children get; 0 means "leave what the daemon has".
+static CHILD_NOFILE_SOFT: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the soft fd limit panes start with. The daemon raises its own limit for its many
+/// sockets and ptys, but programs in a pane (anything using `select`, or sized by the limit)
+/// should keep the limit they would have had without the daemon.
+pub fn set_child_nofile_soft_limit(soft: u64) {
+    CHILD_NOFILE_SOFT.store(soft, Ordering::Relaxed);
+}
+
+/// Lowers the calling process's soft `RLIMIT_NOFILE` to the configured child value. Only
+/// async-signal-safe calls (atomic load, get/setrlimit), so it is usable after fork.
+#[allow(clippy::unnecessary_cast)]
+fn apply_child_nofile_limit_in_self() {
+    let want = CHILD_NOFILE_SOFT.load(Ordering::Relaxed);
+    if want == 0 {
+        return;
+    }
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    if (lim.rlim_cur as u64) <= want {
+        return;
+    }
+    lim.rlim_cur = want as libc::rlim_t;
+    // Best effort: a pane with the higher limit still works.
+    // SAFETY: `lim` is a valid rlimit with rlim_cur <= rlim_max.
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+}
+
+/// posix_spawn has no rlimit action, so lower the child's limit from the parent right after
+/// the spawn. `CLONE_VM|VFORK` suspends the parent until the child execs, so the program
+/// starts with the raised limit for a moment; this is best effort, unlike the `pre_exec` route.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(clippy::unnecessary_cast)]
+fn apply_child_nofile_limit_to_pid(pid: libc::pid_t) {
+    let want = CHILD_NOFILE_SOFT.load(Ordering::Relaxed);
+    if want == 0 {
+        return;
+    }
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a null new-limit pointer and a valid, writable old-limit pointer.
+    if unsafe { libc::prlimit(pid, libc::RLIMIT_NOFILE, std::ptr::null(), &mut lim) } != 0
+        || (lim.rlim_cur as u64) <= want
+    {
+        return;
+    }
+    lim.rlim_cur = want as libc::rlim_t;
+    // SAFETY: valid rlimit; a null old-limit pointer is allowed.
+    unsafe { libc::prlimit(pid, libc::RLIMIT_NOFILE, &lim, std::ptr::null_mut()) };
+}
 
 /// Spawns `program` with the pty slave behind `master_fd` as stdin/stdout and
 /// controlling terminal, in a new session. Stderr is the slave too, unless
@@ -134,6 +196,7 @@ fn spawn_with_command(
                 return Err(io::Error::last_os_error());
             }
             close_inherited_fds();
+            apply_child_nofile_limit_in_self();
             Ok(())
         });
     }
@@ -413,6 +476,7 @@ mod posix {
                 envp.as_ptr(),
             );
             check(rc).with_context(|| format!("failed to spawn {arg0}"))?;
+            apply_child_nofile_limit_to_pid(pid);
             Ok(PosixChild { pid })
         }
     }

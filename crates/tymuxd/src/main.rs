@@ -900,6 +900,10 @@ impl TymuxService for TymuxDaemon {
             .get()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs() as i64);
+        // read_dir on /dev/fd blocks, and is slow with thousands of fds.
+        let open_fds = tokio::task::spawn_blocking(listener_health::open_fd_count)
+            .await
+            .unwrap_or(0);
         Ok(Response::new(ServerInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: tymux_proto::PROTOCOL_VERSION,
@@ -910,7 +914,7 @@ impl TymuxService for TymuxDaemon {
                 .collect(),
             pid: std::process::id(),
             started_at_unix,
-            open_fds: listener_health::open_fd_count(),
+            open_fds,
             max_open_fds: listener_health::nofile_soft_limit(),
         }))
     }
@@ -1898,7 +1902,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     log_detach_controlling_terminal_outcome(detach_controlling_terminal());
-    log_nofile_limit_outcome(listener_health::raise_nofile_limit());
+    let nofile = listener_health::raise_nofile_limit();
+    if let Ok(l) = &nofile {
+        tymux_core::set_child_nofile_soft_limit(l.soft_before);
+    }
+    log_nofile_limit_outcome(nofile);
 
     let addr = std::env::var("TYMUXD_ADDR").unwrap_or_else(|_| "127.0.0.1:7419".to_string());
     let socket_addr: std::net::SocketAddr = addr.parse()?;
