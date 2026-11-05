@@ -105,17 +105,19 @@ func TestNoRetryOnNonRefusedErrors(t *testing.T) {
 
 func TestEACCESIsHardErrorNeverFallsBack(t *testing.T) {
 	t.Parallel()
-	r := newRig(Options{})
-	r.unix.set(dialErr(syscall.EACCES), dialErr(syscall.EACCES))
-	err := list(t, r.c)
-	if !errors.Is(err, ErrSocketAccessDenied) || !errors.Is(err, syscall.EACCES) {
-		t.Fatalf("want ErrSocketAccessDenied wrapping EACCES, got %v", err)
-	}
-	if i, n := r.tcp.calls(); i != 0 || n != 0 {
-		t.Fatalf("EACCES fell back to tcp: probes=%d calls=%d", i, n)
-	}
-	if r.c.Active() != Unix || len(r.transitions.all()) != 0 {
-		t.Fatalf("selector moved on EACCES: %s %+v", r.c.Active(), r.transitions.all())
+	for _, errno := range []syscall.Errno{syscall.EACCES, syscall.EPERM} {
+		r := newRig(Options{})
+		r.unix.set(dialErr(errno), dialErr(errno))
+		err := list(t, r.c)
+		if !errors.Is(err, ErrSocketAccessDenied) || !errors.Is(err, errno) {
+			t.Fatalf("%v: want ErrSocketAccessDenied wrapping it, got %v", errno, err)
+		}
+		if i, n := r.tcp.calls(); i != 0 || n != 0 {
+			t.Fatalf("%v fell back to tcp: probes=%d calls=%d", errno, i, n)
+		}
+		if r.c.Active() != Unix || len(r.transitions.all()) != 0 {
+			t.Fatalf("selector moved on %v: %s %+v", errno, r.c.Active(), r.transitions.all())
+		}
 	}
 }
 
@@ -124,7 +126,7 @@ func TestRetriesAtMostOnce(t *testing.T) {
 	r := newRig(Options{})
 	r.unix.set(dialErr(syscall.ECONNREFUSED), dialErr(syscall.ECONNREFUSED))
 	r.tcp.set(nil, dialErr(syscall.ECONNREFUSED)) // probe passes, the real call is refused too
-	if err := list(t, r.c); !IsDialRefused(err) {
+	if err := list(t, r.c); !refusedForTest(err) {
 		t.Fatalf("want the refused error, got %v", err)
 	}
 	if _, n := r.unix.calls(); n != 1 {
@@ -140,7 +142,7 @@ func TestNoFailoverWhenFallbackProbeFails(t *testing.T) {
 	r := newRig(Options{})
 	r.unix.set(nil, dialErr(syscall.ENOENT))
 	r.tcp.set(dialErr(syscall.ECONNREFUSED), nil)
-	if err := list(t, r.c); !IsDialRefused(err) {
+	if err := list(t, r.c); !refusedForTest(err) {
 		t.Fatalf("want original refused error, got %v", err)
 	}
 	if _, n := r.tcp.calls(); n != 0 {
@@ -249,7 +251,7 @@ func TestReprobeEACCESSwitchesToUnixSoNextCallSurfacesIt(t *testing.T) {
 	t.Parallel()
 	r := newRig(Options{ReprobeInterval: time.Second})
 	fallBackToTCP(t, r)
-	r.unix.set(dialErr(syscall.EACCES), dialErr(syscall.EACCES))
+	r.unix.set(dialErr(syscall.EPERM), dialErr(syscall.EPERM))
 	r.clock.Advance(2 * time.Second)
 	err := list(t, r.c)
 	if !errors.Is(err, ErrSocketAccessDenied) {
@@ -337,7 +339,7 @@ func TestNilTCPDisablesFallbackAndNilUnixPinsTCP(t *testing.T) {
 	t.Parallel()
 	u := &fakeTransport{listErr: dialErr(syscall.ENOENT)}
 	c := NewFromTransports(u, nil, Options{})
-	if err := list(t, c); !IsDialRefused(err) {
+	if err := list(t, c); !refusedForTest(err) {
 		t.Fatalf("got %v", err)
 	}
 	tc := &fakeTransport{}
@@ -377,4 +379,61 @@ func TestNewFromTransportsRequiresOne(t *testing.T) {
 		}
 	}()
 	NewFromTransports(nil, nil, Options{})
+}
+
+func refusedForTest(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT)
+}
+
+func TestENOENTOnTCPIsNotARefusal(t *testing.T) {
+	t.Parallel()
+	r := newRig(Options{})
+	fallBackToTCP(t, r)
+	r.tcp.set(nil, dialErr(syscall.ENOENT))
+	_ = list(t, r.c)
+	if r.c.Active() != TCP {
+		t.Fatal("ENOENT on the tcp transport triggered a failover")
+	}
+}
+
+func TestZeroAndTypedNilClientsFailClearly(t *testing.T) {
+	t.Parallel()
+	if err := list(t, &Client{}); !errors.Is(err, ErrNoTransport) {
+		t.Fatalf("zero Client: %v", err)
+	}
+	if err := (&Client{}).Attach(context.Background()).Send(&v1.AttachRequest{}); !errors.Is(err, ErrNoTransport) {
+		t.Fatalf("zero Client Attach: %v", err)
+	}
+	var typedNil *fakeTransport
+	c := NewFromTransports(typedNil, &fakeTransport{}, Options{})
+	if err := list(t, c); err != nil || c.Active() != TCP {
+		t.Fatalf("typed-nil unix not normalized: err=%v active=%s", err, c.Active())
+	}
+}
+
+func TestCancelledReprobeDoesNotClobberNewerSchedule(t *testing.T) {
+	t.Parallel()
+	r := newRig(Options{ReprobeInterval: 30 * time.Second})
+	fallBackToTCP(t, r)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.unix.mu.Lock()
+	r.unix.infoHook = func(context.Context) error {
+		cancel()
+		r.clock.Advance(5 * time.Second)
+		r.c.switchTo(Unix, "other caller")
+		r.c.switchTo(TCP, "other caller again") // schedules the next probe 30s from now
+		return ctx.Err()
+	}
+	r.unix.mu.Unlock()
+	r.clock.Advance(31 * time.Second)
+	_, _ = r.c.ListSessions(ctx, connect.NewRequest(&v1.ListSessionsRequest{}))
+	base, _ := r.unix.calls()
+	r.unix.mu.Lock()
+	r.unix.infoHook = nil
+	r.unix.mu.Unlock()
+	r.clock.Advance(20 * time.Second) // inside the newer window
+	_ = list(t, r.c)
+	if p, _ := r.unix.calls(); p != base {
+		t.Fatal("probe ran inside the newer backoff window: claim restore clobbered it")
+	}
 }

@@ -10,7 +10,8 @@ import (
 )
 
 // Transport is the RPC surface a Client selects over: every unary RPC plus Attach.
-// WatchWindow and WriteStdin are not included; use a plain connect client for them.
+// Implemented by *Client and (via Wrap) the connect client; not for external implementation,
+// and may gain methods in minor releases. WatchWindow and WriteStdin are not included.
 type Transport interface {
 	GetServerInfo(context.Context, *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error)
 	CreateSession(context.Context, *connect.Request[v1.CreateSessionRequest]) (*connect.Response[v1.Session], error)

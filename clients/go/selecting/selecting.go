@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
 	"sync"
 	"syscall"
 	"time"
@@ -44,6 +45,9 @@ const (
 	defaultProbeTimeout    = 3 * time.Second
 	defaultReprobeInterval = 30 * time.Second
 )
+
+// ErrNoTransport is returned by a Client that has no transport (the zero Client).
+var ErrNoTransport = errors.New("tymux: selecting.Client has no transport; build it with New or NewFromTransports")
 
 // ErrSocketAccessDenied matches (errors.Is) an EACCES from the control socket.
 var ErrSocketAccessDenied = errors.New("tymux: not authorized to use tymuxd's Unix control socket")
@@ -82,6 +86,12 @@ type Options struct {
 	Now func() time.Time
 }
 
+// Client implements Transport. Transport is for *Client and the generated connect client, not
+// for external implementation: it gains a method whenever tymuxd gains a unary RPC, in a minor
+// release. WatchWindow and WriteStdin (streaming RPCs whose refused dial surfaces only on first
+// use) are not wrapped yet, so *Client is not a full tymuxv1connect.TymuxServiceClient; use a plain
+// connect client for those two and expect no failover or EACCES annotation on them.
+//
 // Client is a Transport that starts on Unix and fails over to TCP. Safe for concurrent use.
 //
 // Failover happens only on a refused dial (ECONNREFUSED/ENOENT) and the call is retried
@@ -128,7 +138,9 @@ func New(opts Options) *Client {
 
 // NewFromTransports selects between caller-supplied transports. Either may be nil: a
 // nil tcp disables fallback, a nil unix pins TCP.
+// It panics if both are nil (a typed nil pointer counts as nil).
 func NewFromTransports(unix, tcp Transport, opts Options) *Client {
+	unix, tcp = nilIfTypedNil(unix), nilIfTypedNil(tcp)
 	if unix == nil && tcp == nil {
 		panic("selecting: NewFromTransports needs at least one transport")
 	}
@@ -142,6 +154,15 @@ func NewFromTransports(unix, tcp Transport, opts Options) *Client {
 		opts.Now = time.Now
 	}
 	return &Client{unix: unix, tcp: tcp, opts: opts, useTCP: unix == nil}
+}
+
+func (c *Client) noTransport() bool { return c.unix == nil && c.tcp == nil }
+
+func nilIfTypedNil(t Transport) Transport {
+	if v := reflect.ValueOf(t); t != nil && v.Kind() == reflect.Pointer && v.IsNil() {
+		return nil
+	}
+	return t
 }
 
 // Active reports the transport new calls use.
@@ -172,7 +193,8 @@ func (c *Client) pick(ctx context.Context) (Transport, Kind) {
 	c.mu.Lock()
 	if c.useTCP && c.unix != nil && !c.opts.Now().Before(c.nextUnixProbe) {
 		prev := c.nextUnixProbe
-		c.nextUnixProbe = c.opts.Now().Add(c.opts.ReprobeInterval)
+		claimed := c.opts.Now().Add(c.opts.ReprobeInterval)
+		c.nextUnixProbe = claimed
 		c.mu.Unlock()
 		err := c.probe(ctx, c.unix)
 		switch {
@@ -182,8 +204,10 @@ func (c *Client) pick(ctx context.Context) (Transport, Kind) {
 			// A socket now exists and denies us: surface that instead of staying on TCP.
 			c.switchTo(Unix, "control socket denies access")
 		case ctx.Err() != nil:
-			c.mu.Lock() // our own cancellation says nothing about the socket: return the claim
-			c.nextUnixProbe = prev
+			c.mu.Lock()                         // our own cancellation says nothing about the socket: return the claim
+			if c.nextUnixProbe.Equal(claimed) { // unless switchTo has scheduled a newer probe since
+				c.nextUnixProbe = prev
+			}
 			c.mu.Unlock()
 		}
 		c.mu.Lock()
@@ -235,9 +259,10 @@ func (c *Client) log(warn bool, msg string, from, to Kind, why string) {
 	}
 }
 
-// IsDialRefused reports whether err proves the endpoint has no listener.
-func IsDialRefused(err error) bool {
-	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT)
+// isDialRefused reports whether err proves the endpoint has no listener: ECONNREFUSED, or ENOENT
+// for a Unix socket path (the same rule as liveness).
+func isDialRefused(kind Kind, err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || (kind == Unix && errors.Is(err, syscall.ENOENT))
 }
 
 // deniedAccess is a kernel-level (EACCES/EPERM) or daemon-level (PermissionDenied/Unauthenticated)
@@ -253,7 +278,7 @@ func deniedAccess(err error) bool {
 // annotate makes an EACCES from the control socket a clear, matchable hard error.
 func annotate(kind Kind, err error) error {
 	if kind == Unix && (errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)) && !errors.Is(err, ErrSocketAccessDenied) {
-		return fmt.Errorf("%w (ask the daemon's owner to add you to its --socket-group, or run as its OS user): %w",
+		return fmt.Errorf("%w (ask the daemon owner to grant your user its configured socket group, or run as the daemon's OS user): %w",
 			ErrSocketAccessDenied, err)
 	}
 	return err
@@ -263,7 +288,7 @@ func annotate(kind Kind, err error) error {
 // now different from from (or already was), so the caller may retry once. Only a refused
 // dial qualifies: EACCES and every other error are returned as they are.
 func (c *Client) failover(ctx context.Context, from Kind, err error) bool {
-	if err == nil || !IsDialRefused(err) {
+	if err == nil || !isDialRefused(from, err) {
 		return false
 	}
 	if c.Active() != from {
@@ -288,6 +313,9 @@ func (c *Client) failover(ctx context.Context, from Kind, err error) bool {
 // the first attempt's interceptors mutate it (e.g. Authorization), so it is restored before the
 // retry rather than leaking those headers to the other transport.
 func invoke[Resp any](ctx context.Context, c *Client, hdr http.Header, call func(Transport) (*connect.Response[Resp], error)) (*connect.Response[Resp], error) {
+	if c.noTransport() {
+		return nil, ErrNoTransport
+	}
 	orig := hdr.Clone()
 	t, kind := c.pick(ctx)
 	resp, err := call(t)

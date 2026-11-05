@@ -154,7 +154,7 @@ func TestRealAttachRefusedDialThenReattachLandsOnTCP(t *testing.T) {
 
 	first := c.Attach(context.Background())
 	err := first.Send(&v1.AttachRequest{})
-	if !IsDialRefused(err) {
+	if !refusedForTest(err) {
 		t.Fatalf("first Send = %v, want the real refused dial (not bare EOF)", err)
 	}
 	if c.Active() != TCP {

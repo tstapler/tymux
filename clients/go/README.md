@@ -9,7 +9,7 @@ Module `github.com/tstapler/tymux/clients/go`. The generated connect-go client l
 | `authinterceptor` | Bearer-token interceptor (unary and streaming) |
 | `capabilities` | Feature-detect optional daemon behavior from `GetServerInfo` |
 | `selecting` | Unix-first client with TCP fallback, stream-safe failover and re-probe |
-| `liveness` | Classify an endpoint as healthy / busy / unhealthy / not-listening |
+| `liveness` | Classify an endpoint as healthy / busy / access-denied / unhealthy / not-listening; gate kills on `Result.Alive()` |
 | `paneerr` | Classify `PANE_EXITED` / `PANE_RESTORED_WITHOUT_SCREEN` errors |
 
 ## Selecting transport
@@ -33,8 +33,15 @@ resp, err := c.ListSessions(ctx, connect.NewRequest(&tymuxv1.ListSessionsRequest
 - `Attach` streams: a refused dial surfaces from `Send` as the real error (connect-go
   reports only `io.EOF` there). The selector learns of it, the failed stream is not retried,
   and the next `Attach` uses the fallback.
+- The bearer token goes to the Unix transport only; `Options.TokenOnTCP` opts in to sending it
+  over the plaintext TCP fallback too.
+- The socket path is vetted before each dial: a symlink, or a socket in a world-writable
+  directory that is non-sticky or foreign-owned, is a hard `ErrSocketUntrusted` (no TCP fallback).
+  A private parent directory is trusted whoever owns the socket, so `--socket-group` deployments
+  work. The path algorithm (`udsdialer.DefaultSocketPath`) is shared with tymuxd, tymux-cli and
+  the TS client and is unchanged.
 - `Quiet: true` for one-shot probes (no `OnTransition`, Debug-only logging); `defer c.CloseIdle()`.
-- `WatchWindow` and `WriteStdin` are not wrapped; use the generated client for those.
+- `WatchWindow` and `WriteStdin` are not wrapped (no failover or EACCES annotation), so `*Client` is not a full `TymuxServiceClient`; use the generated client for those two. `Transport` is not for external implementation and may gain methods in minor releases.
 
 ## Consuming it
 

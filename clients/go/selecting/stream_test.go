@@ -47,7 +47,7 @@ func TestAttachRefusedDialSurfacesRealErrorFromSendAndFailsOver(t *testing.T) {
 	st := &fakeStream{sendErr: io.EOF, recv: func(int) (*v1.AttachEvent, error) { return nil, dialErr(syscall.ECONNREFUSED) }}
 	r, s := attachRig(t, st)
 	err := s.Send(&v1.AttachRequest{})
-	if !IsDialRefused(err) {
+	if !refusedForTest(err) {
 		t.Fatalf("Send = %v, want the refused dial, not a bare EOF", err)
 	}
 	if r.c.Active() != TCP {

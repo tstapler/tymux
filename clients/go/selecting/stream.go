@@ -11,8 +11,12 @@ import (
 
 // Attach opens the stream on the current transport. A refused dial is reported to the
 // selector from the stream's first Send/Receive, so the next Attach (e.g. a reconnect
-// loop's redial) lands on the fallback. The failed stream itself is not retried.
+// loop's redial) lands on the fallback. The failed stream itself is not retried. A failover
+// check may block that first Send/Receive for up to ProbeTimeout (bounded by ctx).
 func (c *Client) Attach(ctx context.Context) AttachStream {
+	if c.noTransport() {
+		return errStream{ErrNoTransport}
+	}
 	t, kind := c.pick(ctx)
 	return &failoverStream{inner: t.Attach(ctx), c: c, kind: kind, ctx: ctx}
 }
@@ -97,3 +101,11 @@ func (f *failoverStream) Receive() (*v1.AttachEvent, error) {
 
 func (f *failoverStream) CloseRequest() error  { return f.inner.CloseRequest() }
 func (f *failoverStream) CloseResponse() error { return f.inner.CloseResponse() }
+
+// errStream is the AttachStream of a Client with no transport.
+type errStream struct{ err error }
+
+func (s errStream) Send(*v1.AttachRequest) error      { return s.err }
+func (s errStream) Receive() (*v1.AttachEvent, error) { return nil, s.err }
+func (s errStream) CloseRequest() error               { return nil }
+func (s errStream) CloseResponse() error              { return nil }
