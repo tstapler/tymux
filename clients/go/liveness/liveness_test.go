@@ -68,6 +68,8 @@ func TestClassification(t *testing.T) {
 		{"dial timeout is busy", "tcp", dialFail(context.DeadlineExceeded), &prober{}, context.Background(), Busy, true, false},
 		{"rpc deadline is busy", "tcp", dialOK, &prober{err: connect.NewError(connect.CodeDeadlineExceeded, errors.New("slow"))}, context.Background(), Busy, true, true},
 		{"non-grpc reply is unhealthy", "tcp", dialOK, &prober{err: connect.NewError(connect.CodeUnknown, errors.New("http/1.1 banner"))}, context.Background(), Unhealthy, false, true},
+		{"unauthenticated reply is access denied", "tcp", dialOK, &prober{err: connect.NewError(connect.CodeUnauthenticated, errors.New("no token"))}, context.Background(), AccessDenied, false, true},
+		{"permission denied reply is access denied", "unix", dialOK, &prober{err: connect.NewError(connect.CodePermissionDenied, errors.New("uid rejected"))}, context.Background(), AccessDenied, false, true},
 		{"cancelled during dial is not 'down'", "tcp", dialFail(context.Canceled), &prober{}, cancelled, Unhealthy, false, false},
 		{"cancelled during rpc is not 'down'", "tcp", dialOK, &prober{err: context.Canceled}, cancelled, Unhealthy, false, true},
 	}
@@ -75,6 +77,9 @@ func TestClassification(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := Probe(tc.ctx, tc.network, "addr", tc.p, Options{Dial: tc.dial})
+			if got.Alive() != (tc.usable || tc.want == AccessDenied) {
+				t.Fatalf("%s: Alive() = %v", got, got.Alive())
+			}
 			if got != tc.want || got.Usable() != tc.usable {
 				t.Fatalf("got %s (usable=%v), want %s (usable=%v)", got, got.Usable(), tc.want, tc.usable)
 			}
@@ -90,5 +95,17 @@ func TestProbeTimeoutBoundsRPCAndReportsBusy(t *testing.T) {
 	p := &prober{hook: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
 	if got := Probe(context.Background(), "tcp", "a", p, Options{Dial: dialOK, ProbeTimeout: time.Millisecond}); got != Busy {
 		t.Fatalf("got %s, want busy", got)
+	}
+}
+
+func TestStringIsBoundsChecked(t *testing.T) {
+	t.Parallel()
+	for _, r := range []Result{-1, 99} {
+		if r.String() == "" {
+			t.Fatal("empty String for out-of-range Result")
+		}
+	}
+	if AccessDenied.String() != "access-denied" {
+		t.Fatalf("got %q", AccessDenied.String())
 	}
 }

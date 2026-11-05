@@ -5,6 +5,7 @@ package liveness
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"syscall"
 	"time"
@@ -23,6 +24,10 @@ const (
 	// Unhealthy: something answered but not as tymuxd, or the caller's ctx ended (no evidence either way,
 	// never usable, never proof the daemon is down).
 	Unhealthy
+	// AccessDenied: a daemon answered but rejected our credentials (Unauthenticated or
+	// PermissionDenied). It is alive and holding panes, so a supervisor must never kill or respawn it
+	// over this; fix the credentials instead. Not Usable by this client.
+	AccessDenied
 	// Busy: the dial or GetServerInfo timed out, or the dial failed with something other than a
 	// refusal (fd exhaustion, unreachable...). Inconclusive, so treated as usable.
 	Busy
@@ -31,11 +36,19 @@ const (
 )
 
 func (r Result) String() string {
-	return [...]string{"not-listening", "unhealthy", "busy", "healthy"}[r]
+	names := [...]string{"not-listening", "unhealthy", "access-denied", "busy", "healthy"}
+	if r < 0 || int(r) >= len(names) {
+		return fmt.Sprintf("Result(%d)", int(r))
+	}
+	return names[r]
 }
 
-// Usable reports whether callers should keep using, and never kill, the daemon.
-func (r Result) Usable() bool { return r >= Busy }
+// Usable reports whether this client can serve RPCs right now (Busy or Healthy).
+func (r Result) Usable() bool { return r == Busy || r == Healthy }
+
+// Alive reports whether a tymuxd is there and must never be killed or respawned: Usable, or
+// AccessDenied. Supervisors should gate destructive actions on !Alive(), not !Usable().
+func (r Result) Alive() bool { return r.Usable() || r == AccessDenied }
 
 // Prober is the one RPC Probe needs. A generated connect client bound to the single endpoint
 // satisfies it; do not pass a *selecting.Client, whose failover would let TCP mask a dead socket.
@@ -106,6 +119,9 @@ func Probe(ctx context.Context, network, address string, p Prober, opts Options)
 	case errors.Is(healthCtx.Err(), context.DeadlineExceeded) || connect.CodeOf(err) == connect.CodeDeadlineExceeded:
 		warn("tymuxd probe: no answer before the timeout, treating as busy")
 		return Busy
+	case connect.CodeOf(err) == connect.CodeUnauthenticated || connect.CodeOf(err) == connect.CodePermissionDenied:
+		warn("tymuxd probe: daemon rejected our credentials", "err", err)
+		return AccessDenied
 	default:
 		warn("tymuxd probe: listener did not answer as tymuxd", "err", err)
 		return Unhealthy
