@@ -70,14 +70,11 @@ func DialUnixHTTPClient(socketPath string) *http.Client {
 	}
 }
 
-// newTCPClient builds a TymuxServiceClient against the deprecated TCP
-// loopback address. tymuxd listens on loopback-only plain HTTP/2 (h2c, no
-// TLS — see the loopback-trust security model ADR) and is a strict gRPC
-// server (tonic), so the client needs an h2c-capable transport and
-// connect.WithGRPC(). token is attached via authinterceptor.Interceptor on
-// every outgoing call; an empty token is a no-op.
-func newTCPClient(baseURL, token string) tymuxv1connect.TymuxServiceClient {
-	httpClient := &http.Client{
+// DialTCPHTTPClient returns an *http.Client that speaks plaintext HTTP/2
+// (h2c) to the TCP loopback address a connect-go client passes at request
+// time. tymuxd has no TLS on either listener (loopback-trust ADR).
+func DialTCPHTTPClient() *http.Client {
+	return &http.Client{
 		Transport: &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
@@ -85,7 +82,14 @@ func newTCPClient(baseURL, token string) tymuxv1connect.TymuxServiceClient {
 			},
 		},
 	}
-	return tymuxv1connect.NewTymuxServiceClient(httpClient, baseURL, connect.WithGRPC(),
+}
+
+// newTCPClient builds a TymuxServiceClient against the deprecated TCP
+// loopback address. tymuxd is a strict gRPC server (tonic), so the client
+// needs connect.WithGRPC(). token is attached via authinterceptor.Interceptor
+// on every outgoing call; an empty token is a no-op.
+func newTCPClient(baseURL, token string) tymuxv1connect.TymuxServiceClient {
+	return tymuxv1connect.NewTymuxServiceClient(DialTCPHTTPClient(), baseURL, connect.WithGRPC(),
 		connect.WithInterceptors(authinterceptor.Interceptor{Token: token}))
 }
 
