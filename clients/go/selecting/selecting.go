@@ -2,7 +2,8 @@
 // falls back to the deprecated TCP loopback listener only when the socket is absent or
 // refusing connections.
 //
-// The socket path is vetted before each dial (see ErrSocketUntrusted). The path algorithm is
+// The socket path is vetted before each dial, and on Linux the connected peer's uid afterwards
+// (see ErrSocketUntrusted); elsewhere the path check is best effort. The path algorithm is
 // shared with tymuxd, tymux-cli and the TS client (udsdialer.DefaultSocketPath); changing it
 // needs a matching change in all of them.
 //
@@ -69,6 +70,10 @@ type Options struct {
 	// TokenOnTCP also sends Token over the TCP fallback. Off by default: the TCP listener is
 	// plaintext loopback, so after a fallback the token would go to whatever owns that port.
 	TokenOnTCP bool
+	// TrustedSocketOwnerUIDs lists extra uids allowed to own the Unix socket and its directory
+	// (the caller and root always are). Group-mode deployments, where tymuxd runs as another
+	// user and clients connect via its --socket-group, must opt in here. New only.
+	TrustedSocketOwnerUIDs []uint32
 	// ClientOptions are appended to the connect clients New builds (e.g. tracing interceptors).
 	ClientOptions []connect.ClientOption
 
@@ -127,7 +132,7 @@ func New(opts Options) *Client {
 	if opts.TokenOnTCP {
 		tcpToken = opts.Token
 	}
-	unixHTTP, tcpHTTP := dialUnixChecked(opts.SocketPath), udsdialer.DialTCPHTTPClient()
+	unixHTTP, tcpHTTP := dialUnixChecked(opts.SocketPath, newPolicy(opts.TrustedSocketOwnerUIDs)), udsdialer.DialTCPHTTPClient()
 	c := NewFromTransports(
 		Wrap(tymuxv1connect.NewTymuxServiceClient(unixHTTP, "http://unix", clientOpts(opts.Token)...)),
 		Wrap(tymuxv1connect.NewTymuxServiceClient(tcpHTTP, opts.TCPBaseURL, clientOpts(tcpToken)...)),
@@ -272,7 +277,7 @@ func deniedAccess(err error) bool {
 	case connect.CodePermissionDenied, connect.CodeUnauthenticated:
 		return true
 	}
-	return errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
+	return errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) || errors.Is(err, ErrSocketUntrusted)
 }
 
 // annotate makes an EACCES from the control socket a clear, matchable hard error.

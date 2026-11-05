@@ -35,11 +35,19 @@ resp, err := c.ListSessions(ctx, connect.NewRequest(&tymuxv1.ListSessionsRequest
   and the next `Attach` uses the fallback.
 - The bearer token goes to the Unix transport only; `Options.TokenOnTCP` opts in to sending it
   over the plaintext TCP fallback too.
-- The socket path is vetted before each dial: a symlink, or a socket in a world-writable
-  directory that is non-sticky or foreign-owned, is a hard `ErrSocketUntrusted` (no TCP fallback).
-  A private parent directory is trusted whoever owns the socket, so `--socket-group` deployments
-  work. The path algorithm (`udsdialer.DefaultSocketPath`) is shared with tymuxd, tymux-cli and
-  the TS client and is unchanged.
+- The socket is vetted before each dial (unix only; a no-op elsewhere), and on Linux the connected
+  peer's uid is checked after it. Anything failing is a hard `ErrSocketUntrusted` (no TCP fallback):
+  - every symlink on the path must be owned by root or the caller, and the socket itself must not be one;
+  - the socket and its resolved parent directory must have the same owner, who must be the caller,
+    root, or listed in `Options.TrustedSocketOwnerUIDs` (**group-mode clients, where tymuxd runs as
+    another user, must opt in**);
+  - in a world-writable directory the directory must be sticky and the socket owned by the caller or
+    a trusted uid, so a root-owned socket in `/tmp` is refused for non-root callers.
+  The path check is best effort (it races the dial); macOS has no peer-credential check in the
+  standard library, so there it is the only defence. The path algorithm
+  (`udsdialer.DefaultSocketPath`) is shared with tymuxd, tymux-cli and the TS client and is unchanged.
+- Supervisors probing the socket should use `selecting.CheckedDial` with `liveness.Options.Dial` and a
+  Prober from `selecting.NewUnixTransport`, so the probe cannot be pointed at a planted socket.
 - `Quiet: true` for one-shot probes (no `OnTransition`, Debug-only logging); `defer c.CloseIdle()`.
 - `WatchWindow` and `WriteStdin` are not wrapped (no failover or EACCES annotation), so `*Client` is not a full `TymuxServiceClient`; use the generated client for those two. `Transport` is not for external implementation and may gain methods in minor releases.
 
