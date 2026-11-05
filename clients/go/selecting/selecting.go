@@ -56,8 +56,11 @@ type Options struct {
 	SocketPath string
 	// TCPBaseURL defaults to DefaultTCPBaseURL. New only.
 	TCPBaseURL string
-	// Token is sent as a bearer token on both transports. New only.
+	// Token is sent as a bearer token on the Unix transport. New only.
 	Token string
+	// TokenOnTCP also sends Token over the TCP fallback. Off by default: the TCP listener is
+	// plaintext loopback, so after a fallback the token would go to whatever owns that port.
+	TokenOnTCP bool
 	// ClientOptions are appended to the connect clients New builds (e.g. tracing interceptors).
 	ClientOptions []connect.ClientOption
 
@@ -100,14 +103,20 @@ func New(opts Options) *Client {
 	if opts.TCPBaseURL == "" {
 		opts.TCPBaseURL = DefaultTCPBaseURL
 	}
-	copts := append([]connect.ClientOption{
-		connect.WithGRPC(),
-		connect.WithInterceptors(authinterceptor.Interceptor{Token: opts.Token}),
-	}, opts.ClientOptions...)
+	clientOpts := func(token string) []connect.ClientOption {
+		return append([]connect.ClientOption{
+			connect.WithGRPC(),
+			connect.WithInterceptors(authinterceptor.Interceptor{Token: token}),
+		}, opts.ClientOptions...)
+	}
+	tcpToken := ""
+	if opts.TokenOnTCP {
+		tcpToken = opts.Token
+	}
 	unixHTTP, tcpHTTP := udsdialer.DialUnixHTTPClient(opts.SocketPath), udsdialer.DialTCPHTTPClient()
 	c := NewFromTransports(
-		Wrap(tymuxv1connect.NewTymuxServiceClient(unixHTTP, "http://unix", copts...)),
-		Wrap(tymuxv1connect.NewTymuxServiceClient(tcpHTTP, opts.TCPBaseURL, copts...)),
+		Wrap(tymuxv1connect.NewTymuxServiceClient(unixHTTP, "http://unix", clientOpts(opts.Token)...)),
+		Wrap(tymuxv1connect.NewTymuxServiceClient(tcpHTTP, opts.TCPBaseURL, clientOpts(tcpToken)...)),
 		opts)
 	c.closers = []*http.Client{unixHTTP, tcpHTTP}
 	return c
@@ -271,10 +280,18 @@ func (c *Client) failover(ctx context.Context, from Kind, err error) bool {
 	return true
 }
 
-func invoke[Resp any](ctx context.Context, c *Client, call func(Transport) (*connect.Response[Resp], error)) (*connect.Response[Resp], error) {
+// invoke runs call, and after a refused dial retries it once. hdr is the request's header map:
+// the first attempt's interceptors mutate it (e.g. Authorization), so it is restored before the
+// retry rather than leaking those headers to the other transport.
+func invoke[Resp any](ctx context.Context, c *Client, hdr http.Header, call func(Transport) (*connect.Response[Resp], error)) (*connect.Response[Resp], error) {
+	orig := hdr.Clone()
 	t, kind := c.pick(ctx)
 	resp, err := call(t)
 	if err != nil && c.failover(ctx, kind, err) {
+		clear(hdr)
+		for k, v := range orig {
+			hdr[k] = v
+		}
 		t, kind = c.pick(ctx)
 		resp, err = call(t)
 	}
@@ -282,69 +299,69 @@ func invoke[Resp any](ctx context.Context, c *Client, call func(Transport) (*con
 }
 
 func (c *Client) GetServerInfo(ctx context.Context, r *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.ServerInfo], error) { return t.GetServerInfo(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.ServerInfo], error) { return t.GetServerInfo(ctx, r) })
 }
 
 func (c *Client) CreateSession(ctx context.Context, r *connect.Request[v1.CreateSessionRequest]) (*connect.Response[v1.Session], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.Session], error) { return t.CreateSession(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.Session], error) { return t.CreateSession(ctx, r) })
 }
 
 func (c *Client) ListSessions(ctx context.Context, r *connect.Request[v1.ListSessionsRequest]) (*connect.Response[v1.ListSessionsResponse], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.ListSessionsResponse], error) { return t.ListSessions(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.ListSessionsResponse], error) { return t.ListSessions(ctx, r) })
 }
 
 func (c *Client) KillSession(ctx context.Context, r *connect.Request[v1.KillSessionRequest]) (*connect.Response[v1.KillSessionResponse], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.KillSessionResponse], error) { return t.KillSession(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.KillSessionResponse], error) { return t.KillSession(ctx, r) })
 }
 
 func (c *Client) ReviveSession(ctx context.Context, r *connect.Request[v1.ReviveSessionRequest]) (*connect.Response[v1.ReviveSessionResponse], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.ReviveSessionResponse], error) { return t.ReviveSession(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.ReviveSessionResponse], error) { return t.ReviveSession(ctx, r) })
 }
 
 func (c *Client) CapturePane(ctx context.Context, r *connect.Request[v1.CapturePaneRequest]) (*connect.Response[v1.PaneSnapshot], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.PaneSnapshot], error) { return t.CapturePane(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.PaneSnapshot], error) { return t.CapturePane(ctx, r) })
 }
 
 func (c *Client) SearchScrollback(ctx context.Context, r *connect.Request[v1.SearchScrollbackRequest]) (*connect.Response[v1.SearchScrollbackResponse], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.SearchScrollbackResponse], error) {
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.SearchScrollbackResponse], error) {
 		return t.SearchScrollback(ctx, r)
 	})
 }
 
 func (c *Client) SplitPane(ctx context.Context, r *connect.Request[v1.SplitPaneRequest]) (*connect.Response[v1.Session], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.Session], error) { return t.SplitPane(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.Session], error) { return t.SplitPane(ctx, r) })
 }
 
 func (c *Client) ClosePane(ctx context.Context, r *connect.Request[v1.ClosePaneRequest]) (*connect.Response[v1.ClosePaneResponse], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.ClosePaneResponse], error) { return t.ClosePane(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.ClosePaneResponse], error) { return t.ClosePane(ctx, r) })
 }
 
 func (c *Client) CreateWindow(ctx context.Context, r *connect.Request[v1.CreateWindowRequest]) (*connect.Response[v1.Session], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.Session], error) { return t.CreateWindow(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.Session], error) { return t.CreateWindow(ctx, r) })
 }
 
 func (c *Client) SetRestartPolicy(ctx context.Context, r *connect.Request[v1.SetRestartPolicyRequest]) (*connect.Response[v1.SetRestartPolicyResponse], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.SetRestartPolicyResponse], error) {
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.SetRestartPolicyResponse], error) {
 		return t.SetRestartPolicy(ctx, r)
 	})
 }
 
 func (c *Client) GetPaneStatus(ctx context.Context, r *connect.Request[v1.GetPaneStatusRequest]) (*connect.Response[v1.PaneStatus], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.GetPaneStatus(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.GetPaneStatus(ctx, r) })
 }
 
 func (c *Client) RestartPane(ctx context.Context, r *connect.Request[v1.RestartPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.RestartPane(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.RestartPane(ctx, r) })
 }
 
 func (c *Client) StopPane(ctx context.Context, r *connect.Request[v1.StopPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.StopPane(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.StopPane(ctx, r) })
 }
 
 func (c *Client) StartPane(ctx context.Context, r *connect.Request[v1.StartPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.StartPane(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.StartPane(ctx, r) })
 }
 
 func (c *Client) ResetRestartBudget(ctx context.Context, r *connect.Request[v1.ResetRestartBudgetRequest]) (*connect.Response[v1.PaneStatus], error) {
-	return invoke(ctx, c, func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.ResetRestartBudget(ctx, r) })
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.ResetRestartBudget(ctx, r) })
 }

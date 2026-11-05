@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -20,13 +21,20 @@ import (
 type identHandler struct {
 	tymuxv1connect.UnimplementedTymuxServiceHandler
 	name string
+	auth atomic.Value // last Authorization header seen by GetServerInfo
 }
 
-func (h identHandler) GetServerInfo(context.Context, *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error) {
+func (h *identHandler) GetServerInfo(_ context.Context, r *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error) {
+	h.auth.Store(r.Header().Get("Authorization"))
 	return connect.NewResponse(&v1.ServerInfo{Version: h.name}), nil
 }
 
-func (h identHandler) Attach(_ context.Context, s *connect.BidiStream[v1.AttachRequest, v1.AttachEvent]) error {
+func (h *identHandler) lastAuth() string {
+	v, _ := h.auth.Load().(string)
+	return v
+}
+
+func (h *identHandler) Attach(_ context.Context, s *connect.BidiStream[v1.AttachRequest, v1.AttachEvent]) error {
 	for {
 		if _, err := s.Receive(); err != nil {
 			return nil
@@ -38,18 +46,19 @@ func (h identHandler) Attach(_ context.Context, s *connect.BidiStream[v1.AttachR
 }
 
 // serve runs an in-process h2c server and returns its listener; closing it simulates a daemon going away.
-func serve(t *testing.T, network, addr, name string) net.Listener {
+func serve(t *testing.T, network, addr, name string) (net.Listener, *identHandler) {
 	t.Helper()
 	l, err := net.Listen(network, addr)
 	if err != nil {
 		t.Fatal(err)
 	}
+	h := &identHandler{name: name}
 	mux := http.NewServeMux()
-	mux.Handle(tymuxv1connect.NewTymuxServiceHandler(identHandler{name: name}))
+	mux.Handle(tymuxv1connect.NewTymuxServiceHandler(h))
 	srv := &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
 	go func() { _ = srv.Serve(l) }()
 	t.Cleanup(func() { _ = srv.Close() })
-	return l
+	return l, h
 }
 
 func shortSocketPath(t *testing.T) string {
@@ -75,7 +84,7 @@ func TestRealUnixPreferredOverTCP(t *testing.T) {
 	t.Parallel()
 	sock := shortSocketPath(t)
 	serve(t, "unix", sock, "unix")
-	tcp := serve(t, "tcp", "127.0.0.1:0", "tcp")
+	tcp, _ := serve(t, "tcp", "127.0.0.1:0", "tcp")
 	c := New(Options{SocketPath: sock, TCPBaseURL: "http://" + tcp.Addr().String()})
 	defer c.CloseIdle()
 	if got := serverName(t, c); got != "unix" {
@@ -85,7 +94,7 @@ func TestRealUnixPreferredOverTCP(t *testing.T) {
 
 func TestRealFallsBackWhenSocketAbsentOrStale(t *testing.T) {
 	t.Parallel()
-	tcp := serve(t, "tcp", "127.0.0.1:0", "tcp")
+	tcp, _ := serve(t, "tcp", "127.0.0.1:0", "tcp")
 	base := "http://" + tcp.Addr().String()
 
 	t.Run("absent socket (ENOENT)", func(t *testing.T) {
@@ -122,7 +131,7 @@ func TestRealEACCESNeverFallsBackToTCP(t *testing.T) {
 	}
 	sock := shortSocketPath(t)
 	serve(t, "unix", sock, "unix")
-	tcp := serve(t, "tcp", "127.0.0.1:0", "tcp")
+	tcp, _ := serve(t, "tcp", "127.0.0.1:0", "tcp")
 	if err := os.Chmod(sock, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +148,7 @@ func TestRealEACCESNeverFallsBackToTCP(t *testing.T) {
 
 func TestRealAttachRefusedDialThenReattachLandsOnTCP(t *testing.T) {
 	t.Parallel()
-	tcp := serve(t, "tcp", "127.0.0.1:0", "tcp")
+	tcp, _ := serve(t, "tcp", "127.0.0.1:0", "tcp")
 	c := New(Options{SocketPath: shortSocketPath(t), TCPBaseURL: "http://" + tcp.Addr().String()})
 	defer c.CloseIdle()
 
@@ -161,4 +170,36 @@ func TestRealAttachRefusedDialThenReattachLandsOnTCP(t *testing.T) {
 	}
 	_ = second.CloseRequest()
 	_ = second.CloseResponse()
+}
+
+func TestRealTokenGoesToUnixOnlyUnlessTCPOptIn(t *testing.T) {
+	t.Parallel()
+	for _, optIn := range []bool{false, true} {
+		sock := shortSocketPath(t) // absent: forces the TCP fallback
+		tcp, tcpH := serve(t, "tcp", "127.0.0.1:0", "tcp")
+		c := New(Options{SocketPath: sock, TCPBaseURL: "http://" + tcp.Addr().String(), Token: "tok", TokenOnTCP: optIn})
+		if got := serverName(t, c); got != "tcp" {
+			t.Fatalf("served by %q", got)
+		}
+		c.CloseIdle()
+		want := ""
+		if optIn {
+			want = "Bearer tok"
+		}
+		if got := tcpH.lastAuth(); got != want {
+			t.Fatalf("TokenOnTCP=%v: tcp saw Authorization %q, want %q", optIn, got, want)
+		}
+	}
+}
+
+func TestRealTokenSentOnUnix(t *testing.T) {
+	t.Parallel()
+	sock := shortSocketPath(t)
+	_, uh := serve(t, "unix", sock, "unix")
+	c := New(Options{SocketPath: sock, Token: "tok"})
+	defer c.CloseIdle()
+	_ = serverName(t, c)
+	if got := uh.lastAuth(); got != "Bearer tok" {
+		t.Fatalf("unix saw %q", got)
+	}
 }
