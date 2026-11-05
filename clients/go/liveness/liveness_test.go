@@ -71,6 +71,7 @@ func TestClassification(t *testing.T) {
 		{"unauthenticated reply is access denied", "tcp", dialOK, &prober{err: connect.NewError(connect.CodeUnauthenticated, errors.New("no token"))}, context.Background(), AccessDenied, false, true},
 		{"permission denied reply is access denied", "unix", dialOK, &prober{err: connect.NewError(connect.CodePermissionDenied, errors.New("uid rejected"))}, context.Background(), AccessDenied, false, true},
 		{"untrusted socket dial is access denied, not busy", "unix", dialFail(untrustedDialErr{}), &prober{}, context.Background(), AccessDenied, false, false},
+		{"untrusted error wrapped in a connect error is access denied", "unix", dialOK, &prober{err: connect.NewError(connect.CodeUnavailable, untrustedDialErr{})}, context.Background(), AccessDenied, false, true},
 		{"cancelled during dial is not 'down'", "tcp", dialFail(context.Canceled), &prober{}, cancelled, Unhealthy, false, false},
 		{"cancelled during rpc is not 'down'", "tcp", dialOK, &prober{err: context.Canceled}, cancelled, Unhealthy, false, true},
 	}

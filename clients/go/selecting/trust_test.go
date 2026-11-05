@@ -154,6 +154,20 @@ func TestCheckSocketTrust(t *testing.T) {
 		{"caller-owned symlink resolving into an attacker dir", "/home/u/link/tymuxd.sock", fakeTree{files: map[string]fakeInfo{
 			"/home": {fs.ModeDir | 0o755, root}, "/home/u": {fs.ModeDir | 0o755, me}, "/home/u/link": {rlnk, me},
 			"/evil": {fs.ModeDir | 0o755, other}, "/evil/tymuxd.sock": {sock, other}}, links: map[string]string{"/home/u/link": "/evil"}}, policy(), true},
+		{"relative path", "tymuxd.sock", macDefault(), policy(), true},
+		{"dot-relative path", "./tymuxd.sock", macDefault(), policy(), true},
+		{"empty path", "", macDefault(), policy(), true},
+		{"dotdot after a symlink", "/home/u/lnk/../s", fakeTree{files: map[string]fakeInfo{
+			"/home": {fs.ModeDir | 0o755, root}, "/home/u": {fs.ModeDir | 0o777, me}}}, policy(), true},
+		{"double slash", "/run//tymuxd.sock", macDefault(), policy(), true},
+		{"trailing slash", "/run/tymuxd.sock/", macDefault(), policy(), true},
+		{"dot component", "/run/./tymuxd.sock", macDefault(), policy(), true},
+		{"attacker-owned sticky world-writable dir holding our socket", "/tmp/tymuxd-501/tymuxd.sock", with(macBase(), map[string]fakeInfo{
+			"/private/tmp/tymuxd-501": {fs.ModeDir | fs.ModeSticky | 0o777, other}, "/private/tmp/tymuxd-501/tymuxd.sock": {sock, me}}, nil), policy(), true},
+		{"group-writable dir owned by another user", "/srv/d/s", fakeTree{files: map[string]fakeInfo{
+			"/srv": {fs.ModeDir | 0o755, root}, "/srv/d": {fs.ModeDir | 0o770, other}, "/srv/d/s": {sock, other}}}, policy(other), true},
+		{"group-writable dir owned by the caller", "/srv/d/s", fakeTree{files: map[string]fakeInfo{
+			"/srv": {fs.ModeDir | 0o755, root}, "/srv/d": {fs.ModeDir | 0o770, me}, "/srv/d/s": {sock, me}}}, policy(), true},
 		{"final element symlink", "/run/tymuxd/tymuxd.sock", fakeTree{files: map[string]fakeInfo{
 			"/run": {fs.ModeDir | 0o755, root}, "/run/tymuxd": {priv, me}, "/run/tymuxd/tymuxd.sock": {rlnk, root}}}, policy(), true},
 		{"missing socket is left to the dial", "/run/tymuxd/tymuxd.sock", fakeTree{files: map[string]fakeInfo{

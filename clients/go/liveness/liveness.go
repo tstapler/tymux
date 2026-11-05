@@ -121,6 +121,9 @@ func Probe(ctx context.Context, network, address string, p Prober, opts Options)
 		return Healthy
 	case ctx.Err() != nil:
 		return Unhealthy
+	case isAccessDenied(err):
+		warn("tymuxd probe: endpoint refused as untrusted or unauthorized", "err", err)
+		return AccessDenied
 	case errors.Is(healthCtx.Err(), context.DeadlineExceeded) || connect.CodeOf(err) == connect.CodeDeadlineExceeded:
 		warn("tymuxd probe: no answer before the timeout, treating as busy")
 		return Busy

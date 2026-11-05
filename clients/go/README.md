@@ -5,7 +5,7 @@ Module `github.com/tstapler/tymux/clients/go`. The generated connect-go client l
 
 | Package | Purpose |
 |---|---|
-| `udsdialer` | Socket-path resolution and h2c `*http.Client`s for the Unix socket and TCP loopback |
+| `udsdialer` | Socket-path resolution and h2c `*http.Client`s for the Unix socket and TCP loopback. `DialUnixHTTPClient` and `DialWithFallback` are unchecked legacy helpers; use `selecting` |
 | `authinterceptor` | Bearer-token interceptor (unary and streaming) |
 | `capabilities` | Feature-detect optional daemon behavior from `GetServerInfo` |
 | `selecting` | Unix-first client with TCP fallback, stream-safe failover and re-probe |
@@ -37,12 +37,13 @@ resp, err := c.ListSessions(ctx, connect.NewRequest(&tymuxv1.ListSessionsRequest
   over the plaintext TCP fallback too.
 - The socket is vetted before each dial (unix only; a no-op elsewhere), and on Linux the connected
   peer's uid is checked after it. Anything failing is a hard `ErrSocketUntrusted` (no TCP fallback):
+  - the path must be absolute and clean (no `.`, `..`, `//`, trailing `/`), and the parent must not be group-writable;
   - every symlink on the path must be owned by root or the caller, and the socket itself must not be one;
   - the socket and its resolved parent directory must have the same owner, who must be the caller,
     root, or listed in `Options.TrustedSocketOwnerUIDs` (**group-mode clients, where tymuxd runs as
     another user, must opt in**);
   - in a world-writable directory the directory must be sticky and the socket owned by the caller or
-    a trusted uid, so a root-owned socket in `/tmp` is refused for non-root callers.
+    a trusted uid (and the directory owned by the caller, root or a trusted uid), so a root-owned socket in `/tmp` is refused for non-root callers.
   The path check is best effort (it races the dial); macOS has no peer-credential check in the
   standard library, so there it is the only defence. The path algorithm
   (`udsdialer.DefaultSocketPath`) is shared with tymuxd, tymux-cli and the TS client and is unchanged.

@@ -59,6 +59,9 @@ func ResolveSocketPath(uid int) string {
 // client passes at request time. Mirrors examples/list-sessions/main.go's
 // existing newClient shape, replacing net.Dial(network, addr) with a fixed
 // "unix" dial to socketPath — the seam research/stack.md §4 identified.
+//
+// It is an UNCHECKED legacy helper: it dials whatever is at socketPath. Prefer
+// selecting.CheckedDial / selecting.NewUnixTransport, which vet the path and peer first.
 func DialUnixHTTPClient(socketPath string) *http.Client {
 	return &http.Client{
 		Transport: &http2.Transport{
@@ -107,6 +110,8 @@ func newTCPClient(baseURL, token string) tymuxv1connect.TymuxServiceClient {
 // (syscall.ENOENT — no socket file, syscall.ECONNREFUSED — file present but
 // nothing listening, or any other error) means no daemon is there, so
 // falling back is legitimate and logged to stderr.
+//
+// Like DialUnixHTTPClient it does no socket-trust checking; prefer selecting.New.
 func DialWithFallback(token string) (tymuxv1connect.TymuxServiceClient, error) {
 	socketPath := ResolveSocketPath(os.Getuid())
 	conn, err := net.Dial("unix", socketPath)

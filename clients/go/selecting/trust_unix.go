@@ -31,12 +31,18 @@ func untrusted(format string, a ...any) error {
 //   - The socket and its resolved parent directory must have the same owner, who must be the
 //     caller, root, or in Options.TrustedSocketOwnerUIDs (needed for --socket-group deployments
 //     where the daemon runs as another user).
-//   - In a world-writable parent the directory must be sticky and the socket owned by the caller
-//     or a trusted uid; root alone is not enough, so a root-owned socket in /tmp is refused.
+//   - The path must be absolute and clean, and the parent must not be group-writable.
+//   - In a world-writable parent the directory must be sticky, owned by the caller, root or a
+//     trusted uid, and the socket owned by the caller or a trusted uid; root alone is not enough, so a root-owned socket in /tmp is refused.
 //
 // Missing files are left to the dial so ENOENT can still select the TCP fallback.
 func checkSocketTrust(path string, pol trustPolicy, f trustFS) error {
-	clean := filepath.Clean(path)
+	// The dial uses this exact string, so it must name one file unambiguously: the kernel resolves
+	// ".." after following symlinks, which a lexical Clean would not.
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return untrusted("socket path %q must be absolute and clean (no '.', '..', '//' or trailing '/')", path)
+	}
+	clean := path
 	elems := strings.Split(strings.Trim(clean, "/"), "/")
 	cur := "/"
 	for i, e := range elems {
@@ -72,14 +78,21 @@ func checkSocketTrust(path string, pol trustPolicy, f trustFS) error {
 	if !ok1 || !ok2 {
 		return nil
 	}
-	if di.Mode().Perm()&0o002 != 0 {
+	perm := di.Mode().Perm()
+	if perm&0o002 != 0 {
 		if di.Mode()&fs.ModeSticky == 0 {
 			return untrusted("%s is world-writable and not sticky", dir)
+		}
+		if !pol.allows(dirOwner) { // the directory's owner can still unlink and replace entries
+			return untrusted("shared directory %s is owned by uid %d", dir, dirOwner)
 		}
 		if !pol.allowsNonRoot(sockOwner) {
 			return untrusted("%s is owned by uid %d in shared directory %s", clean, sockOwner, dir)
 		}
 		return nil
+	}
+	if perm&0o020 != 0 {
+		return untrusted("%s is group-writable, so a group member could replace the socket", dir)
 	}
 	if sockOwner != dirOwner {
 		return untrusted("%s (uid %d) and its directory %s (uid %d) have different owners", clean, sockOwner, dir, dirOwner)

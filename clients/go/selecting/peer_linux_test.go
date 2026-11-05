@@ -45,3 +45,27 @@ func TestVerifyPeerChecksSocketPeerUID(t *testing.T) {
 		t.Fatalf("opted-in peer rejected: %v", err)
 	}
 }
+
+func TestVerifyPeerFailsClosed(t *testing.T) {
+	t.Parallel()
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	if err := verifyPeer(a, trustPolicy{uid: os.Getuid()}); !errors.Is(err, ErrSocketUntrusted) {
+		t.Fatalf("non-unix conn accepted: %v", err)
+	}
+	sock := shortSocketPath(t)
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close() // Control on a closed conn errors: credentials unavailable
+	if err := verifyPeer(c, trustPolicy{uid: os.Getuid()}); !errors.Is(err, ErrSocketUntrusted) {
+		t.Fatalf("unreadable credentials accepted: %v", err)
+	}
+}
