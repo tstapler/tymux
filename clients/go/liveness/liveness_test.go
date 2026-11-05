@@ -70,6 +70,7 @@ func TestClassification(t *testing.T) {
 		{"non-grpc reply is unhealthy", "tcp", dialOK, &prober{err: connect.NewError(connect.CodeUnknown, errors.New("http/1.1 banner"))}, context.Background(), Unhealthy, false, true},
 		{"unauthenticated reply is access denied", "tcp", dialOK, &prober{err: connect.NewError(connect.CodeUnauthenticated, errors.New("no token"))}, context.Background(), AccessDenied, false, true},
 		{"permission denied reply is access denied", "unix", dialOK, &prober{err: connect.NewError(connect.CodePermissionDenied, errors.New("uid rejected"))}, context.Background(), AccessDenied, false, true},
+		{"untrusted socket dial is access denied, not busy", "unix", dialFail(untrustedDialErr{}), &prober{}, context.Background(), AccessDenied, false, false},
 		{"cancelled during dial is not 'down'", "tcp", dialFail(context.Canceled), &prober{}, cancelled, Unhealthy, false, false},
 		{"cancelled during rpc is not 'down'", "tcp", dialOK, &prober{err: context.Canceled}, cancelled, Unhealthy, false, true},
 	}
@@ -109,3 +110,8 @@ func TestStringIsBoundsChecked(t *testing.T) {
 		t.Fatalf("got %q", AccessDenied.String())
 	}
 }
+
+type untrustedDialErr struct{}
+
+func (untrustedDialErr) Error() string      { return "socket not trusted" }
+func (untrustedDialErr) AccessDenied() bool { return true }

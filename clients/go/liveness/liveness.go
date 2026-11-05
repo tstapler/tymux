@@ -65,7 +65,9 @@ type Logger interface {
 type Options struct {
 	DialTimeout  time.Duration // default 5s
 	ProbeTimeout time.Duration // default 10s, for GetServerInfo: a loaded daemon answers slowly
-	// Dial is the raw-dial seam (default net.Dialer.DialContext with DialTimeout).
+	// Dial is the raw-dial seam (default net.Dialer.DialContext with DialTimeout). For a Unix socket
+	// use selecting.CheckedDial and a Prober from selecting.NewUnixTransport so the probe applies
+	// the same trust checks as the client; the plain default dials whatever is at the path.
 	Dial   func(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error)
 	Logger Logger
 }
@@ -98,6 +100,9 @@ func Probe(ctx context.Context, network, address string, p Prober, opts Options)
 		switch {
 		case ctx.Err() != nil:
 			return Unhealthy
+		case isAccessDenied(err):
+			warn("tymuxd probe: dial refused as untrusted or unauthorized", "err", err)
+			return AccessDenied
 		case dialRefused(network, err):
 			warn("tymuxd probe: nothing listening", "err", err)
 			return NotListening
@@ -126,6 +131,13 @@ func Probe(ctx context.Context, network, address string, p Prober, opts Options)
 		warn("tymuxd probe: listener did not answer as tymuxd", "err", err)
 		return Unhealthy
 	}
+}
+
+// isAccessDenied matches errors that declare themselves a trust or credentials refusal (such as
+// selecting.ErrSocketUntrusted from selecting.CheckedDial) without importing their package.
+func isAccessDenied(err error) bool {
+	var ad interface{ AccessDenied() bool }
+	return errors.As(err, &ad) && ad.AccessDenied()
 }
 
 // dialRefused: only ECONNREFUSED (and ENOENT for unix paths) prove nothing listens. Timeouts and
