@@ -2,6 +2,10 @@
 // falls back to the deprecated TCP loopback listener only when the socket is absent or
 // refusing connections.
 //
+// The socket path is vetted before each dial (see ErrSocketUntrusted). The path algorithm is
+// shared with tymuxd, tymux-cli and the TS client (udsdialer.DefaultSocketPath); changing it
+// needs a matching change in all of them.
+//
 // Security: EACCES on the socket means a daemon is listening and denied this user. That
 // is a hard error (ErrSocketAccessDenied) and never falls back to the unauthenticated
 // TCP listener (project_plans/unix-socket-auth, loopback-trust ADR).
@@ -113,7 +117,7 @@ func New(opts Options) *Client {
 	if opts.TokenOnTCP {
 		tcpToken = opts.Token
 	}
-	unixHTTP, tcpHTTP := udsdialer.DialUnixHTTPClient(opts.SocketPath), udsdialer.DialTCPHTTPClient()
+	unixHTTP, tcpHTTP := dialUnixChecked(opts.SocketPath), udsdialer.DialTCPHTTPClient()
 	c := NewFromTransports(
 		Wrap(tymuxv1connect.NewTymuxServiceClient(unixHTTP, "http://unix", clientOpts(opts.Token)...)),
 		Wrap(tymuxv1connect.NewTymuxServiceClient(tcpHTTP, opts.TCPBaseURL, clientOpts(tcpToken)...)),
