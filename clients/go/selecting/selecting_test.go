@@ -354,3 +354,27 @@ type recordingLogger struct {
 
 func (l *recordingLogger) Debug(string, ...any) { l.mu.Lock(); l.debugs++; l.mu.Unlock() }
 func (l *recordingLogger) Warn(string, ...any)  { l.mu.Lock(); l.warns++; l.mu.Unlock() }
+
+func TestReprobePermissionDeniedSwitchesToUnix(t *testing.T) {
+	t.Parallel()
+	for _, code := range []connect.Code{connect.CodePermissionDenied, connect.CodeUnauthenticated} {
+		r := newRig(Options{ReprobeInterval: time.Second})
+		fallBackToTCP(t, r)
+		r.unix.set(connect.NewError(code, errors.New("rejected")), nil)
+		r.clock.Advance(2 * time.Second)
+		_ = list(t, r.c)
+		if r.c.Active() != Unix {
+			t.Fatalf("%s: stayed on tcp after the daemon rejected us", code)
+		}
+	}
+}
+
+func TestNewFromTransportsRequiresOne(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("want panic")
+		}
+	}()
+	NewFromTransports(nil, nil, Options{})
+}

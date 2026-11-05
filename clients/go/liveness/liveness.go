@@ -37,7 +37,8 @@ func (r Result) String() string {
 // Usable reports whether callers should keep using, and never kill, the daemon.
 func (r Result) Usable() bool { return r >= Busy }
 
-// Prober is the one RPC Probe needs; a *selecting.Client or a generated connect client satisfies it.
+// Prober is the one RPC Probe needs. A generated connect client bound to the single endpoint
+// satisfies it; do not pass a *selecting.Client, whose failover would let TCP mask a dead socket.
 type Prober interface {
 	GetServerInfo(context.Context, *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error)
 }
@@ -49,8 +50,8 @@ type Logger interface {
 
 // Options tunes Probe. The zero value is usable.
 type Options struct {
-	DialTimeout  time.Duration // default 2s
-	ProbeTimeout time.Duration // default 3s, for GetServerInfo
+	DialTimeout  time.Duration // default 5s
+	ProbeTimeout time.Duration // default 10s, for GetServerInfo: a loaded daemon answers slowly
 	// Dial is the raw-dial seam (default net.Dialer.DialContext with DialTimeout).
 	Dial   func(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error)
 	Logger Logger
@@ -58,13 +59,14 @@ type Options struct {
 
 // Probe dials network/address, then calls GetServerInfo (O(1), unlike ListSessions) on p.
 // A busy daemon is not a dead one: only a definite refusal reports NotListening.
-// Pass a p that targets exactly this endpoint, so a healthy fallback cannot mask it.
+// Probe checks one endpoint; to check Unix-then-TCP, call it per endpoint and never consult TCP
+// when Unix is Busy. Pass a p that targets exactly this endpoint, so a healthy fallback cannot mask it.
 func Probe(ctx context.Context, network, address string, p Prober, opts Options) Result {
 	if opts.DialTimeout <= 0 {
-		opts.DialTimeout = 2 * time.Second
+		opts.DialTimeout = 5 * time.Second
 	}
 	if opts.ProbeTimeout <= 0 {
-		opts.ProbeTimeout = 3 * time.Second
+		opts.ProbeTimeout = 10 * time.Second
 	}
 	dial := opts.Dial
 	if dial == nil {

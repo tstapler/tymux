@@ -116,6 +116,9 @@ func New(opts Options) *Client {
 // NewFromTransports selects between caller-supplied transports. Either may be nil: a
 // nil tcp disables fallback, a nil unix pins TCP.
 func NewFromTransports(unix, tcp Transport, opts Options) *Client {
+	if unix == nil && tcp == nil {
+		panic("selecting: NewFromTransports needs at least one transport")
+	}
 	if opts.ProbeTimeout <= 0 {
 		opts.ProbeTimeout = defaultProbeTimeout
 	}
@@ -162,7 +165,7 @@ func (c *Client) pick(ctx context.Context) (Transport, Kind) {
 		switch {
 		case err == nil:
 			c.switchTo(Unix, "control socket answers again")
-		case errors.Is(err, syscall.EACCES):
+		case deniedAccess(err):
 			// A socket now exists and denies us: surface that instead of staying on TCP.
 			c.switchTo(Unix, "control socket denies access")
 		case ctx.Err() != nil:
@@ -224,9 +227,19 @@ func IsDialRefused(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT)
 }
 
+// deniedAccess is a kernel-level (EACCES/EPERM) or daemon-level (PermissionDenied/Unauthenticated)
+// refusal from a daemon that is listening: never a reason to use TCP.
+func deniedAccess(err error) bool {
+	switch connect.CodeOf(err) {
+	case connect.CodePermissionDenied, connect.CodeUnauthenticated:
+		return true
+	}
+	return errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
+}
+
 // annotate makes an EACCES from the control socket a clear, matchable hard error.
 func annotate(kind Kind, err error) error {
-	if kind == Unix && errors.Is(err, syscall.EACCES) && !errors.Is(err, ErrSocketAccessDenied) {
+	if kind == Unix && (errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)) && !errors.Is(err, ErrSocketAccessDenied) {
 		return fmt.Errorf("%w (ask the daemon's owner to add you to its --socket-group, or run as its OS user): %w",
 			ErrSocketAccessDenied, err)
 	}
