@@ -2122,14 +2122,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             flag.store(true, Ordering::SeqCst);
             let _ = shutdown_tx.send(true);
             // tonic only returns after every open connection drains, and an Attach stream never
-            // ends on its own, so cap the wait. Exiting drops the connections; panes are
-            // untouched (no pane Drop kills children, and state is already durable).
-            tokio::time::sleep(shutdown_drain).await;
-            tracing::warn!(
-                drain_secs = shutdown_drain.as_secs_f64(),
-                "shutdown drain timed out with connections still open; exiting"
-            );
-            std::process::exit(0);
+            // ends on its own, so cap the wait. An OS thread, not a task: it must still fire if
+            // runtime teardown blocks. Exiting drops the connections; panes are untouched (no
+            // pane Drop kills children, and state is already durable).
+            std::thread::spawn(move || {
+                std::thread::sleep(shutdown_drain);
+                tracing::warn!(
+                    drain_secs = shutdown_drain.as_secs_f64(),
+                    "shutdown drain timed out with connections still open; exiting"
+                );
+                std::process::exit(0);
+            });
         }
     });
     let uds_rejection_count = Arc::new(AtomicI64::new(0));
@@ -2257,9 +2260,12 @@ async fn shutdown_rx_future(mut rx: tokio::sync::watch::Receiver<bool>) {
 /// Default cap on how long SIGTERM/Ctrl-C waits for open connections before exiting.
 const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
+/// Floor for the drain, so `0` still lets tonic send GOAWAY and the exit log line go out.
+const MIN_SHUTDOWN_DRAIN: Duration = Duration::from_millis(100);
+
 /// `--shutdown-drain-secs <N>` / `--shutdown-drain-secs=<N>`, else `TYMUXD_SHUTDOWN_DRAIN_SECS`,
-/// else [`DEFAULT_SHUTDOWN_DRAIN`]. Accepts fractional seconds; invalid or negative values fall
-/// back to the default.
+/// else [`DEFAULT_SHUTDOWN_DRAIN`]. Accepts fractional seconds, floored at
+/// [`MIN_SHUTDOWN_DRAIN`]; invalid or negative values fall back to the default.
 fn resolve_shutdown_drain(args: &[String], env: impl Fn(&str) -> Option<String>) -> Duration {
     const FLAG: &str = "--shutdown-drain-secs";
     let from_flag = args.iter().enumerate().find_map(|(i, a)| {
@@ -2271,7 +2277,7 @@ fn resolve_shutdown_drain(args: &[String], env: impl Fn(&str) -> Option<String>)
         .or_else(|| env("TYMUXD_SHUTDOWN_DRAIN_SECS"))
         .and_then(|v| v.trim().parse::<f64>().ok())
         .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
-        .unwrap_or(DEFAULT_SHUTDOWN_DRAIN)
+        .map_or(DEFAULT_SHUTDOWN_DRAIN, |d| d.max(MIN_SHUTDOWN_DRAIN))
 }
 
 /// The `on_dead` hook for [`listener_health::log_accept_errors`]: exits non-zero straight from
@@ -2467,8 +2473,7 @@ async fn tcp_health_probe(
     // `probe_addr` is loopback when the daemon binds a wildcard (see `tcp_probe_target`).
     let loopback = probe_addr.ip().is_loopback();
 
-    // Pinned once and reused across iterations: a future created fresh inside each `select!`
-    // would miss a shutdown that arrives while the connect/timeout below runs outside it.
+    // Pinned once so the same future is polled across iterations rather than rebuilt each time.
     tokio::pin!(shutdown);
 
     loop {
@@ -6830,6 +6835,10 @@ mod tests {
             resolve_shutdown_drain(&args(&["--shutdown-drain-secs=0.5"]), no_env),
             Duration::from_millis(500)
         );
+        assert_eq!(
+            resolve_shutdown_drain(&args(&["--shutdown-drain-secs=0"]), no_env),
+            MIN_SHUTDOWN_DRAIN
+        );
         for bad in ["abc", "-1", "NaN"] {
             let bad_env = move |_: &str| Some(bad.to_string());
             assert_eq!(
@@ -6877,6 +6886,20 @@ mod tests {
             .await;
 
         assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_health_probe_should_return_shutdown_when_the_shutdown_future_is_ready() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let end = tcp_health_probe(addr, None, std::future::ready(())).await;
+        assert_eq!(end, TcpProbeEnd::Shutdown);
+    }
+
+    #[test]
+    fn exit_on_listener_death_should_be_a_no_op_once_shutdown_was_requested() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Would terminate the test binary if the shutdown guard were not wired in.
+        exit_on_listener_death(&flag)("uds");
     }
 
     #[test]

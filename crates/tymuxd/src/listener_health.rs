@@ -263,12 +263,14 @@ where
         limiter: AcceptErrorLimiter,
         backoff: Duration,
         failing_since: Option<tokio::time::Instant>,
+        last_error: Option<tokio::time::Instant>,
     }
     let state = State {
         incoming: Box::pin(incoming),
         limiter: AcceptErrorLimiter::default(),
         backoff: ACCEPT_BACKOFF_START,
         failing_since: None,
+        last_error: None,
     };
     let on_dead = std::sync::Arc::new(on_dead);
     futures::stream::unfold(state, move |mut st| {
@@ -293,9 +295,17 @@ where
                             on_dead(listener);
                             return Some((Err(e), st));
                         }
-                        let since = *st
-                            .failing_since
-                            .get_or_insert_with(tokio::time::Instant::now);
+                        // A long quiet gap means the earlier errors were isolated, not a streak.
+                        let now = tokio::time::Instant::now();
+                        if st
+                            .last_error
+                            .is_some_and(|t| now.duration_since(t) > ACCEPT_BACKOFF_MAX * 2)
+                        {
+                            st.failing_since = None;
+                            st.backoff = ACCEPT_BACKOFF_START;
+                        }
+                        st.last_error = Some(now);
+                        let since = *st.failing_since.get_or_insert(now);
                         if since.elapsed() >= ACCEPT_PERSISTENT_ERROR_LIMIT {
                             tracing::error!(
                                 listener, error = %e,
@@ -520,6 +530,26 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(start.elapsed() <= ACCEPT_BACKOFF_MAX * 20);
         assert!(start.elapsed() >= ACCEPT_BACKOFF_MAX * 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn log_accept_errors_should_not_escalate_isolated_errors_separated_by_idle_time() {
+        let (seen, on_dead) = dead_recorder();
+        let src = futures::stream::unfold(0u8, |step| async move {
+            match step {
+                0 => Some((Err(io::Error::from_raw_os_error(libc::ECONNABORTED)), 1)),
+                1 => {
+                    tokio::time::sleep(ACCEPT_PERSISTENT_ERROR_LIMIT * 2).await;
+                    Some((Err(io::Error::from_raw_os_error(libc::ECONNABORTED)), 2))
+                }
+                2 => Some((Ok::<u8, io::Error>(1), 3)),
+                _ => None,
+            }
+        });
+        let mut out = Box::pin(log_accept_errors(src, "tcp", -1, on_dead));
+
+        assert!(out.next().await.unwrap().is_ok());
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

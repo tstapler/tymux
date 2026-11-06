@@ -3,6 +3,7 @@
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tymux_proto::v1::attach_request::Payload;
@@ -13,12 +14,19 @@ use uuid::Uuid;
 
 struct Daemon {
     child: Child,
+    dirs: Vec<std::path::PathBuf>,
+    /// Filled by a reader thread so a full pipe never blocks the daemon, and so a grandchild
+    /// pane holding the pipe open cannot hang the test.
+    log: Arc<Mutex<String>>,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        for dir in &self.dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -30,22 +38,22 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Short path: macOS `sun_path` is ~104 bytes.
-fn short_socket_path() -> std::path::PathBuf {
+/// Short dir: macOS `sun_path` is ~104 bytes.
+fn short_socket_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(format!(
         "/tmp/t-{}",
         &Uuid::new_v4().simple().to_string()[..8]
     ))
-    .join("s.sock")
 }
 
 fn spawn(addr: &str, drain_secs: &str) -> Daemon {
     let state = std::env::temp_dir().join(format!("tymuxd-drain-{}", Uuid::new_v4().simple()));
     std::fs::create_dir_all(&state).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_tymuxd"))
+    let socket_dir = short_socket_dir();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tymuxd"))
         .env("TYMUXD_ADDR", addr)
-        .env("XDG_STATE_HOME", state)
-        .env("TYMUXD_SOCKET_PATH", short_socket_path())
+        .env("XDG_STATE_HOME", &state)
+        .env("TYMUXD_SOCKET_PATH", socket_dir.join("s.sock"))
         .env("RUST_LOG", "info")
         .arg("--shutdown-drain-secs")
         .arg(drain_secs)
@@ -53,7 +61,25 @@ fn spawn(addr: &str, drain_secs: &str) -> Daemon {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn tymuxd");
-    Daemon { child }
+    let log = Arc::new(Mutex::new(String::new()));
+    let mut stdout = child.stdout.take().unwrap();
+    let sink = log.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    Daemon {
+        child,
+        dirs: vec![state, socket_dir],
+        log,
+    }
 }
 
 async fn connect(addr: &str) -> TymuxServiceClient<tonic::transport::Channel> {
@@ -128,14 +154,22 @@ async fn sigterm_should_exit_zero_within_the_drain_bound_while_an_attach_stream_
     };
     assert_eq!(exit.code(), Some(0), "bounded drain exits 0, got {exit:?}");
 
-    let mut log = String::new();
-    daemon
-        .child
-        .stdout
-        .take()
+    // The reader thread may lag the exit slightly; wait (bounded) for the last line.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !daemon
+        .log
+        .lock()
         .unwrap()
-        .read_to_string(&mut log)
-        .unwrap();
+        .contains("shutdown drain timed out")
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let log = daemon.log.lock().unwrap().clone();
+    assert!(
+        log.contains("shutdown drain timed out"),
+        "the drain timer, not a clean drain, should have ended the process:\n{log}"
+    );
     assert_eq!(
         log.matches("received SIGTERM").count(),
         1,
