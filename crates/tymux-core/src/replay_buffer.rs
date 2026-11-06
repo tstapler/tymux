@@ -108,6 +108,11 @@ impl ReplayBuffer {
         }
     }
 
+    /// Every retained `(seq, chunk)`, oldest first (handoff export).
+    pub(crate) fn entries(&self) -> Vec<(u64, Vec<u8>)> {
+        self.entries.iter().cloned().collect()
+    }
+
     /// The seq of the oldest entry still retained, or `None` if empty.
     pub(crate) fn oldest_seq(&self) -> Option<u64> {
         self.entries.front().map(|(seq, _)| *seq)

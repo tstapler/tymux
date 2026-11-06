@@ -19,6 +19,7 @@ pub use layout::{
     LayoutError, LayoutNode, Orientation, PtyRect, RemoveOutcome, MIN_PANE_COLS, MIN_PANE_ROWS,
     RECOMMENDED_SPLIT_MIN_ROWS,
 };
+pub use pane::handoff::{clear_cloexec, set_cloexec, PaneHandoff, ScreenState, HANDOFF_SCHEMA};
 pub use pane::{CellSnapshot, Charsets, Pane, PaneSnapshot, StdinError, TerminalModes};
 pub use persistence::{
     default_sessions_dir, FsPersistenceBackend, NullPersistenceBackend, PersistedLayoutNode,

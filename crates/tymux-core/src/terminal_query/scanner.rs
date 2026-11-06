@@ -118,6 +118,11 @@ pub(crate) struct QueryScanner {
 }
 
 impl QueryScanner {
+    /// The bytes currently held back, without releasing them (handoff export).
+    pub(crate) fn peek_held(&self) -> &[u8] {
+        &self.held
+    }
+
     /// Bytes held back for an unfinished sequence; call at end of stream to release them.
     pub(crate) fn take_held(&mut self) -> Vec<u8> {
         self.tracker.seq_start = None;
