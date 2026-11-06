@@ -14,6 +14,8 @@ Replacing the `tymuxd` process loses every live pane. The daemon owns each pty m
 4. A daemon without the capability, or a refused preflight, falls back to drain-only policy: the supervisor never kills or replaces a daemon that has live panes.
 5. Proto changes are additive; no `PROTOCOL_VERSION` bump.
 
+6. A handoff to the same version (re-exec the same or a rebuilt binary to pick up config, fd-limit or state changes) is supported (owner decision, 2026-11-05). The proof of completion is `ServerInfo.handoff_generation` advancing on the same pid, not a version change; supervisors stay fail-closed for same-version requests until a daemon advertises the counter.
+
 ## Why this option
 
 It keeps the child pid, the parent/child relation (so `waitpid` exit codes and ADR 0007 restart policy keep working), and the listener backlog, with no extra process. Verified on macOS arm64 by a prototype: the master survives exec only when CLOEXEC is cleared, the child never sees SIGHUP, output buffered during the gap arrives gapless, and a client connected during the gap is accepted from the inherited listener (design.md section 9).

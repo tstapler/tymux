@@ -147,6 +147,10 @@ Refuse to replace the daemon while any pane is live; upgrade on idle.
 
 A tiny, almost-never-upgraded companion process (the systemd `FileDescriptorStore` idea, which launchd has no equivalent for) holds a dup of every pane's master fd and pid, handed over by SCM_RIGHTS when a pane is created. If the daemon dies for any reason, the restarted daemon asks the keeper for the fds. Gains: survival of crashes and SIGKILL (the cases option 1 cannot cover) and a stronger rollback story (the keeper still holds the masters if the post-exec image dies). Loses: exit codes (the keeper is not the parent), the vt100 grid and replay buffer (the new daemon starts blank and forces redraw with `SIGWINCH`), and adds one process plus a protocol. Phase 4, only if crash survival becomes a goal.
 
+## 5.0 Same-version handoff (owner decision 2026-11-05)
+
+Required, not optional: re-exec of the same version picks up config, `RLIMIT_NOFILE` and persisted-state changes without losing panes. `expected_version` may equal the running version; success is `handoff_generation` incremented with the pid unchanged (a version change cannot prove it). Schema compatibility is trivially satisfied (writer range intersects itself). Supervisors must not treat "same pid, same version" as success and refuse a same-version request until the daemon exposes `handoff_generation`. Compatibility matrix addition: running vN handoff-capable to vN (same or rebuilt file): graceful, verified by generation.
+
 ## 5. Comparison
 
 | | 1 re-exec | 2 side-by-side | 3 shim/pane | 4 re-adopt pids | 5 drain | 6 keeper |
