@@ -9,6 +9,9 @@ use portable_pty::CommandBuilder;
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use tokio::sync::{broadcast, Notify};
 
+#[cfg(unix)]
+pub mod handoff;
+
 use crate::restart::LifecycleEvent;
 use uuid::Uuid;
 
@@ -70,6 +73,12 @@ fn release_scrollback_budget(lines: usize) {
 /// keystrokes, so this is deliberately larger than tymux-cli's 1024-byte
 /// stdin-forwarding buffer.
 const PTY_READ_BUF_SIZE: usize = 4096;
+/// How long the reader waits for pty data before re-checking for a handoff freeze; bounds the
+/// freeze latency, and idle cost is one `poll` per pane per interval.
+#[cfg(unix)]
+const READER_POLL_INTERVAL_MS: i32 = 100;
+/// Back-off while a frozen reader waits for the freeze to be lifted (or the process to exec).
+const FROZEN_READER_SLEEP_MS: u64 = 5;
 
 /// How long a SIGHUP'd child gets before `Pane::kill` escalates to SIGKILL.
 #[cfg(unix)]
@@ -164,6 +173,11 @@ pub struct Pane {
     /// already reflected in a given snapshot and must not be replayed.
     output_seq: AtomicU64,
     exited: Arc<AtomicBool>,
+    /// Held by the reader thread across one read-and-apply of a pty chunk, so a handoff freeze
+    /// that takes it knows no byte is held outside the screen, replay buffer and kernel pty.
+    read_gate: Mutex<()>,
+    /// Set by [`Self::freeze_reads`]; the reader checks it under `read_gate`, before reading.
+    reads_frozen: AtomicBool,
     /// Test hook: makes `resize` take at least this long, standing in for the slow reallocation
     /// huge sizes used to cause (the size clamp removed that).
     #[cfg(test)]
@@ -379,7 +393,24 @@ impl Pane {
         cols: u16,
     ) -> Result<Arc<Self>> {
         let process = start_process(command, launch, cwd, rows, cols)?;
+        Ok(Self::assemble(
+            command, launch, cwd, id, rows, cols, process, None,
+        ))
+    }
 
+    /// Wraps a running `process` in a pane. `seed` carries state inherited from a previous
+    /// daemon image (see `handoff`); `None` for a fresh spawn.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        command: &str,
+        launch: &Launch,
+        cwd: Option<&str>,
+        id: Option<Uuid>,
+        rows: u16,
+        cols: u16,
+        process: StartedProcess,
+        seed: Option<handoff::Seed>,
+    ) -> Arc<Self> {
         let scrollback_lines = allocate_scrollback_budget();
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
         let writer = Arc::new(Mutex::new(process.writer));
@@ -400,6 +431,11 @@ impl Pane {
         )));
         let (lifecycle_tx, _) = broadcast::channel(LIFECYCLE_CHANNEL_CAPACITY);
         let replay_budget_bytes = allocate_replay_budget();
+        let mut replay_buffer = ReplayBuffer::new(replay_budget_bytes);
+        let (seed_seq, seed_generation) = match seed {
+            Some(seed) => seed.apply(&parser, &mut replay_buffer),
+            None => (0, 0),
+        };
 
         let effective_cwd = cwd.map(str::to_string).unwrap_or_else(|| {
             std::env::current_dir()
@@ -418,21 +454,23 @@ impl Pane {
             rows: AtomicU32::new(rows as u32),
             cols: AtomicU32::new(cols as u32),
             scrollback_lines,
-            replay: Mutex::new(ReplayBuffer::new(replay_budget_bytes)),
+            replay: Mutex::new(replay_buffer),
             replay_budget_bytes,
             output_tx: output_tx.clone(),
             clients: ClientRegistry::default(),
             query_replies: replies.clone(),
             #[cfg(test)]
             push_bump_hook: Mutex::new(None),
-            output_seq: AtomicU64::new(0),
+            output_seq: AtomicU64::new(seed_seq),
             exited: Arc::new(AtomicBool::new(false)),
+            read_gate: Mutex::new(()),
+            reads_frozen: AtomicBool::new(false),
             #[cfg(test)]
             resize_delay_ms: std::sync::atomic::AtomicU64::new(0),
             exit_notify: Notify::new(),
             exit_code: Mutex::new(None),
             pid: Arc::new(AtomicU32::new(process.pid.unwrap_or(0))),
-            generation: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(seed_generation)),
             last_signal: AtomicI32::new(0),
             restart_pending: AtomicBool::new(false),
             retired: AtomicBool::new(false),
@@ -445,7 +483,7 @@ impl Pane {
             _reader_handle: Mutex::new(None),
         });
         pane.start_reader(process.reader);
-        Ok(pane)
+        pane
     }
 
     /// Starts the thread that feeds the child's output into the screen model, the replay buffer
@@ -460,7 +498,23 @@ impl Pane {
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; PTY_READ_BUF_SIZE];
             let mut scanner = QueryScanner::default();
+            #[cfg(unix)]
+            let poll_fd = pane_for_reader.master.lock().unwrap().as_raw_fd();
             loop {
+                // Wait for readable data without holding the gate, so a freeze never waits on an
+                // idle pane. Only a pty that cannot be polled falls back to a plain blocking read.
+                #[cfg(unix)]
+                if let Some(fd) = poll_fd {
+                    if !handoff::poll_readable(fd, READER_POLL_INTERVAL_MS) {
+                        continue;
+                    }
+                }
+                let _gate = pane_for_reader.read_gate.lock().unwrap();
+                if pane_for_reader.reads_frozen.load(Ordering::SeqCst) {
+                    drop(_gate);
+                    std::thread::sleep(Duration::from_millis(FROZEN_READER_SLEEP_MS));
+                    continue;
+                }
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
