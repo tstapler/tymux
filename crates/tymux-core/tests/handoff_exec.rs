@@ -217,7 +217,7 @@ fn aborted_export_rearms_cloexec_and_output_resumes() {
 }
 
 #[test]
-fn adopting_a_dead_child_or_closed_fd_fails_cleanly() {
+fn adopting_a_closed_fd_fails_cleanly() {
     let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
     pane.freeze_reads();
     let mut exported = pane.export_handoff().unwrap();
