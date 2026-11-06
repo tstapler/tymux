@@ -1,20 +1,16 @@
-//! #49 — `tymuxd --version`/`--help` must print and exit 0 without ever
-//! binding a port or touching persisted state, unlike every other argv the
-//! daemon accepts. `TYMUXD_ADDR` is deliberately pointed at an address this
-//! process can't bind as non-root (privileged port 1) so a run that
-//! regressed into actually starting the daemon fails loudly instead of
-//! silently passing on a lucky bind — and if the test process itself is
-//! root (e.g. a containerized CI runner, where that bind would succeed),
-//! `run_with_timeout`'s deadline still turns a genuine regression into a
-//! panic instead of a suite-wide hang, mirroring `uds_socket_startup_failures.rs::run_tymuxd`.
+//! Informational commands must exit before state access or listener startup.
+//! An invalid address makes an accidental daemon launch fail instead of bind.
 
 use std::process::{Command, Output};
 use std::time::Duration;
 
 fn run_with_timeout(flag: &str) -> Output {
+    let state = std::env::temp_dir().join(format!("tymux-build-info-{}", std::process::id()));
     let mut child = Command::new(env!("CARGO_BIN_EXE_tymuxd"))
         .arg(flag)
-        .env("TYMUXD_ADDR", "127.0.0.1:1")
+        .env("TYMUXD_ADDR", "not-a-socket-address")
+        .env("TYMUXD_SOCKET_PATH", state.join("daemon.sock"))
+        .env("TYMUXD_DATA_DIR", state.join("data"))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -27,6 +23,7 @@ fn run_with_timeout(flag: &str) -> Output {
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             panic!(
                 "tymuxd {flag} should have exited promptly, but the daemon appears to have started"
             );
@@ -36,6 +33,21 @@ fn run_with_timeout(flag: &str) -> Output {
     child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("failed to collect tymuxd {flag} output: {e}"))
+}
+
+#[test]
+fn build_info_reports_embedded_commit_without_starting_daemon() {
+    let output = run_with_timeout("--build-info");
+    assert!(output.status.success(), "build info failed: {:?}", output);
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).expect("build info JSON");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    let commit = info["commit"].as_str().expect("commit identity");
+    assert_eq!(commit, env!("TYMUX_BUILD_SHA"));
+    if commit != "unknown" {
+        assert!(matches!(commit.len(), 40 | 64), "invalid commit: {commit}");
+        assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+    assert_eq!(info["dirty"], env!("TYMUX_BUILD_DIRTY"));
 }
 
 #[test]
