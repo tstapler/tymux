@@ -178,6 +178,13 @@ pub struct Pane {
     read_gate: Mutex<()>,
     /// Set by [`Self::freeze_reads`]; the reader checks it under `read_gate`, before reading.
     reads_frozen: AtomicBool,
+    /// Set under `read_gate` when the reader sees EOF, so a handoff export can tell a pane whose
+    /// child is already exiting from a live one.
+    eof_seen: AtomicBool,
+    /// Copy of the query scanner's held-back bytes, refreshed under `read_gate` after each chunk.
+    scanner_held: Mutex<Vec<u8>>,
+    /// Held-back bytes inherited from a previous daemon image, fed to the scanner when the reader starts.
+    adopted_held: Mutex<Vec<u8>>,
     /// Test hook: makes `resize` take at least this long, standing in for the slow reallocation
     /// huge sizes used to cause (the size clamp removed that).
     #[cfg(test)]
@@ -432,8 +439,12 @@ impl Pane {
         let (lifecycle_tx, _) = broadcast::channel(LIFECYCLE_CHANNEL_CAPACITY);
         let replay_budget_bytes = allocate_replay_budget();
         let mut replay_buffer = ReplayBuffer::new(replay_budget_bytes);
+        let mut adopted_held = None;
         let (seed_seq, seed_generation) = match seed {
-            Some(seed) => seed.apply(&parser, &mut replay_buffer),
+            Some(seed) => {
+                adopted_held = Some(seed.scanner_held.clone());
+                seed.apply(&parser, &mut replay_buffer)
+            }
             None => (0, 0),
         };
 
@@ -465,6 +476,9 @@ impl Pane {
             exited: Arc::new(AtomicBool::new(false)),
             read_gate: Mutex::new(()),
             reads_frozen: AtomicBool::new(false),
+            eof_seen: AtomicBool::new(false),
+            scanner_held: Mutex::new(Vec::new()),
+            adopted_held: Mutex::new(Vec::new()),
             #[cfg(test)]
             resize_delay_ms: std::sync::atomic::AtomicU64::new(0),
             exit_notify: Notify::new(),
@@ -482,6 +496,9 @@ impl Pane {
             _child: Mutex::new(process.child),
             _reader_handle: Mutex::new(None),
         });
+        if let Some(held) = adopted_held {
+            *pane.adopted_held.lock().unwrap() = held;
+        }
         pane.start_reader(process.reader);
         pane
     }
@@ -495,9 +512,16 @@ impl Pane {
         let output_tx = self.output_tx.clone();
         let replies = self.query_replies.clone();
         let pane_for_reader = self.clone();
+        self.eof_seen.store(false, Ordering::SeqCst);
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; PTY_READ_BUF_SIZE];
             let mut scanner = QueryScanner::default();
+            {
+                let adopted = std::mem::take(&mut *pane_for_reader.adopted_held.lock().unwrap());
+                // Re-tokenizing the unfinished sequence re-holds it; nothing is emitted for it.
+                let _ = scanner.feed(&adopted);
+                *pane_for_reader.scanner_held.lock().unwrap() = scanner.peek_held().to_vec();
+            }
             #[cfg(unix)]
             let poll_fd = pane_for_reader.master.lock().unwrap().as_raw_fd();
             loop {
@@ -516,7 +540,10 @@ impl Pane {
                     continue;
                 }
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        pane_for_reader.eof_seen.store(true, Ordering::SeqCst);
+                        break;
+                    }
                     Ok(n) => {
                         // Task 1.3.1a: the sequence bump happens inside the
                         // same `parser` lock guard as `process(..)`, so the
@@ -541,6 +568,12 @@ impl Pane {
                             replies.set_daemon_answers(daemon_answers);
                             parser.process(&buf[..n]);
                             let scanned = scanner.feed(&buf[..n]);
+                            {
+                                let mut mirror = pane_for_reader.scanner_held.lock().unwrap();
+                                if !mirror.is_empty() || !scanner.peek_held().is_empty() {
+                                    *mirror = scanner.peek_held().to_vec();
+                                }
+                            }
                             {
                                 let mut replay = pane_for_reader.replay.lock().unwrap();
                                 replay.push(next, scanned.stripped());

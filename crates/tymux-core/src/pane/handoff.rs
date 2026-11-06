@@ -53,10 +53,15 @@ pub struct PaneHandoff {
     pub output_seq: u64,
     pub replay: Vec<(u64, Vec<u8>)>,
     pub screen: ScreenState,
+    /// Bytes of an unfinished escape sequence the query scanner was holding back. The emulator
+    /// already consumed them, so the adopting image re-feeds both the emulator and the scanner.
+    #[serde(default)]
+    pub scanner_held: Vec<u8>,
 }
 
 /// State applied to a freshly built pane before its reader starts.
 pub(super) struct Seed {
+    pub(super) scanner_held: Vec<u8>,
     screen: ScreenState,
     output_seq: u64,
     replay: Vec<(u64, Vec<u8>)>,
@@ -70,7 +75,9 @@ impl Seed {
         parser: &Mutex<vt100::Parser<QueryResponder>>,
         replay: &mut ReplayBuffer,
     ) -> (u64, u64) {
-        restore_screen(&mut parser.lock().unwrap(), &self.screen);
+        let mut parser = parser.lock().unwrap();
+        restore_screen(&mut parser, &self.screen);
+        parser.process(&self.scanner_held);
         for (seq, chunk) in &self.replay {
             replay.push(*seq, chunk);
         }
@@ -315,13 +322,17 @@ impl Pane {
 
     /// Exports this frozen, live pane and clears `FD_CLOEXEC` on its master (and `stdin_stream`
     /// pipe) so they survive `exec`. Call [`Self::abort_handoff`] if the exec does not happen.
+    ///
+    /// The caller must stop spawning children (respawn, new panes, any `Command`) from the first
+    /// export until the exec or abort, or a child inherits the exported masters. An error means
+    /// this pane was left as it was, but earlier panes still need `abort_handoff`.
     pub fn export_handoff(&self) -> Result<PaneHandoff> {
         ensure!(
             self.reads_frozen.load(Ordering::SeqCst),
             "freeze_reads must precede export_handoff"
         );
         ensure!(
-            !self.is_exited() && !self.restart_pending(),
+            !self.is_exited() && !self.restart_pending() && !self.eof_seen.load(Ordering::SeqCst),
             "pane {} has no live process to hand off",
             self.id
         );
@@ -346,9 +357,13 @@ impl Pane {
             let seq = self.output_seq.load(Ordering::SeqCst);
             (export_screen(&mut parser), seq, replay)
         };
+        let scanner_held = self.scanner_held.lock().unwrap().clone();
         clear_cloexec(master_fd)?;
         if let Some(fd) = stdin_writer_fd {
-            clear_cloexec(fd)?;
+            if let Err(e) = clear_cloexec(fd) {
+                let _ = set_cloexec(master_fd, true);
+                return Err(e.into());
+            }
         }
         Ok(PaneHandoff {
             id: self.id,
@@ -364,6 +379,7 @@ impl Pane {
             output_seq,
             replay,
             screen,
+            scanner_held,
         })
     }
 
@@ -410,6 +426,7 @@ impl Pane {
             reply_fd,
         };
         let seed = Seed {
+            scanner_held: handoff.scanner_held,
             screen: handoff.screen,
             output_seq: handoff.output_seq,
             replay: handoff.replay,

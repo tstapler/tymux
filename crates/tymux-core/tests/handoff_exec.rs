@@ -15,6 +15,10 @@ use tymux_core::{Launch, Pane, PaneHandoff, ReplayOutcome};
 const TEST_NAME: &str = "pane_survives_exec_with_stream_and_exit_code_intact";
 const STAGE_ENV: &str = "TYMUX_HANDOFF_STAGE";
 const STATE_ENV: &str = "TYMUX_HANDOFF_STATE";
+const PRE_TICK_ENV: &str = "TYMUX_HANDOFF_LAST_PRE_TICK";
+/// Typed after the freeze: the tty echoes it into the kernel buffer, so it must reach the new
+/// image exactly once, through the pty rather than through the exported replay.
+const GAP_MARKER: &str = "GAPMARK7431";
 
 fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -69,6 +73,16 @@ fn old_image() {
     for p in panes {
         p.freeze_reads();
     }
+    let last_pre_tick = *ticks(&replay_text(&counter)).last().unwrap();
+    counter
+        .write_input(format!("{GAP_MARKER}\n").as_bytes())
+        .unwrap();
+    // The echo is produced by the tty line discipline; give it a moment to be queued.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !replay_text(&counter).contains(GAP_MARKER),
+        "frozen reader consumed the marker"
+    );
     let exported: Vec<PaneHandoff> = panes.iter().map(|p| p.export_handoff().unwrap()).collect();
     let state = std::env::temp_dir().join(format!("tymux-handoff-{}.json", std::process::id()));
     std::fs::write(&state, serde_json::to_vec(&exported).unwrap()).unwrap();
@@ -77,6 +91,7 @@ fn old_image() {
         .args([TEST_NAME, "--exact", "--nocapture", "--test-threads=1"])
         .env(STAGE_ENV, "new")
         .env(STATE_ENV, &state)
+        .env(PRE_TICK_ENV, last_pre_tick.to_string())
         .exec();
     panic!("exec failed: {err}");
 }
@@ -100,10 +115,25 @@ fn new_image() {
     wait_until("ticks after the handoff", || {
         ticks(&replay_text(&counter)).len() >= 25
     });
-    let seen = ticks(&replay_text(&counter));
+    let text = replay_text(&counter);
+    let seen = ticks(&text);
     assert_gapless(
         &seen,
         "ticks must be gapless and duplicate-free across exec",
+    );
+    let last_pre_tick: u64 = std::env::var(PRE_TICK_ENV).unwrap().parse().unwrap();
+    assert!(
+        seen.contains(&last_pre_tick),
+        "pre-exec replay was not carried over"
+    );
+    assert!(
+        *seen.last().unwrap() > last_pre_tick,
+        "no output after adoption"
+    );
+    assert_eq!(
+        text.matches(GAP_MARKER).count(),
+        1,
+        "the byte written during the gap must arrive exactly once"
     );
     assert!(
         counter.snapshot_with_seq().1 > export_seq,
@@ -164,5 +194,52 @@ fn frozen_reader_consumes_nothing_until_unfrozen() {
     });
     let seen = ticks(&replay_text(&pane));
     assert_gapless(&seen, "freeze must not drop or duplicate bytes");
+    pane.kill().unwrap();
+}
+
+#[test]
+fn aborted_export_rearms_cloexec_and_output_resumes() {
+    let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+    pane.write_input(b"i=0; while :; do echo tick $i; i=$((i+1)); sleep 0.01; done\n")
+        .unwrap();
+    wait_until("first output", || pane.snapshot_with_seq().1 > 0);
+    pane.freeze_reads();
+    let exported = pane.export_handoff().unwrap();
+    let cloexec = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0;
+    assert!(!cloexec(exported.master_fd), "export must clear CLOEXEC");
+
+    pane.abort_handoff();
+
+    assert!(cloexec(exported.master_fd), "abort must re-arm CLOEXEC");
+    let at = pane.snapshot_with_seq().1;
+    wait_until("output after abort", || pane.snapshot_with_seq().1 > at);
+    pane.kill().unwrap();
+}
+
+#[test]
+fn adopting_a_dead_child_or_closed_fd_fails_cleanly() {
+    let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+    pane.freeze_reads();
+    let mut exported = pane.export_handoff().unwrap();
+    exported.master_fd = 1_000_000;
+    assert!(
+        Pane::from_adopted(exported.clone()).is_err(),
+        "closed fd must be rejected"
+    );
+    pane.abort_handoff();
+    pane.kill().unwrap();
+}
+
+#[test]
+fn export_carries_an_unfinished_escape_sequence() {
+    let pane = Pane::spawn("/bin/sh", 24, 80).unwrap();
+    // A cursor-position query cut off before its final byte stays held by the query scanner.
+    pane.write_input(b"printf '\\033[6'; sleep 30\n").unwrap();
+    wait_until("partial sequence held", || {
+        pane.freeze_reads();
+        let held = pane.export_handoff().map(|h| h.scanner_held);
+        pane.abort_handoff();
+        matches!(held, Ok(h) if h == b"\x1b[6")
+    });
     pane.kill().unwrap();
 }
