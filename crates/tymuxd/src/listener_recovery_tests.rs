@@ -124,7 +124,13 @@ async fn run_recovery_generation(mode: &str) {
     tokio::time::pause();
     let address = refusing.local_addr().unwrap();
     let probe = tokio::spawn(async move {
-        supervise_tcp_listener(address, None, &std::sync::atomic::AtomicBool::new(false)).await;
+        supervise_tcp_listener(
+            address,
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            std::future::pending(),
+        )
+        .await;
     });
     for _ in 0..100 {
         tokio::time::advance(Duration::from_secs(5)).await;
