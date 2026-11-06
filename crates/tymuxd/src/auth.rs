@@ -529,8 +529,7 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
 pub struct PeerIdentity {
     pub uid: u32,
     pub gid: u32,
-    /// Only read by the Linux group-membership check.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     pub pid: Option<i32>,
 }
 
@@ -539,6 +538,7 @@ impl From<&tokio::net::unix::UCred> for PeerIdentity {
         Self {
             uid: cred.uid(),
             gid: cred.gid(),
+            #[cfg(target_os = "linux")]
             pid: cred.pid(),
         }
     }
