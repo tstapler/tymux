@@ -1869,6 +1869,7 @@ OPTIONS:
     --socket-path <PATH>        Unix-domain-socket path [env: TYMUXD_SOCKET_PATH]
     --socket-group <GROUP>      POSIX group granted full daemon access over the UDS [env: TYMUXD_SOCKET_GROUP]
     --disable-tcp-loopback      Disable the TCP loopback listener [env: TYMUXD_DISABLE_TCP_LOOPBACK]
+    --shutdown-drain-secs <N>   Max seconds SIGTERM waits for open connections before exiting 0 (default 5) [env: TYMUXD_SHUTDOWN_DRAIN_SECS]
 
 Also read from the environment: TYMUXD_ADDR (default 127.0.0.1:7419),
 TYMUXD_STALE_SESSION_MAX_AGE_DAYS, TYMUXD_GRACE_PERIOD_MS,
@@ -2111,12 +2112,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // server returned" (or the probe gave up) is told apart from a real SIGTERM/Ctrl-C drain.
     let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_drain = resolve_shutdown_drain(&args, |k| std::env::var(k).ok());
+    // The only signal handler: a second one (the health probe used to install its own) logged
+    // "received SIGTERM" twice for one signal.
     tokio::spawn({
         let flag = shutdown_requested.clone();
         async move {
             shutdown_signal().await;
             flag.store(true, Ordering::SeqCst);
             let _ = shutdown_tx.send(true);
+            // tonic only returns after every open connection drains, and an Attach stream never
+            // ends on its own, so cap the wait. Exiting drops the connections; panes are
+            // untouched (no pane Drop kills children, and state is already durable).
+            tokio::time::sleep(shutdown_drain).await;
+            tracing::warn!(
+                drain_secs = shutdown_drain.as_secs_f64(),
+                "shutdown drain timed out with connections still open; exiting"
+            );
+            std::process::exit(0);
         }
     });
     let uds_rejection_count = Arc::new(AtomicI64::new(0));
@@ -2138,6 +2151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio_stream::wrappers::UnixListenerStream::new(uds_listener),
                         "uds",
                         uds_listener_fd,
+                        exit_on_listener_death(&shutdown_requested),
                     ),
                     move |stream| auth::PreAuthorizedUnixStream::new(stream, uid, allowed_gid),
                 ),
@@ -2169,6 +2183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio_stream::wrappers::TcpListenerStream::new(tcp_listener),
             "tcp",
             tcp_listener_fd.unwrap_or(-1),
+            exit_on_listener_death(&shutdown_requested),
         );
         let res = if let Some(token) = configured_token {
             let rejection_count = Arc::new(AtomicI64::new(0));
@@ -2203,7 +2218,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // only way to observe what an external caller actually sees.
     let tcp_health_future = async {
         if !tcp_disabled {
-            let end = tcp_health_probe(tcp_probe_target(socket_addr), tcp_listener_fd).await;
+            let end = tcp_health_probe(
+                tcp_probe_target(socket_addr),
+                tcp_listener_fd,
+                shutdown_rx_future(shutdown_rx.clone()),
+            )
+            .await;
             if end == TcpProbeEnd::ListenerDead {
                 // The tonic future never ends on its own here, so `join!` would idle
                 // forever; a supervisor can only respawn a process that exits.
@@ -2232,6 +2252,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Resolves once the early signal task has recorded a SIGTERM/Ctrl-C.
 async fn shutdown_rx_future(mut rx: tokio::sync::watch::Receiver<bool>) {
     let _ = rx.wait_for(|requested| *requested).await;
+}
+
+/// Default cap on how long SIGTERM/Ctrl-C waits for open connections before exiting.
+const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// `--shutdown-drain-secs <N>` / `--shutdown-drain-secs=<N>`, else `TYMUXD_SHUTDOWN_DRAIN_SECS`,
+/// else [`DEFAULT_SHUTDOWN_DRAIN`]. Accepts fractional seconds; invalid or negative values fall
+/// back to the default.
+fn resolve_shutdown_drain(args: &[String], env: impl Fn(&str) -> Option<String>) -> Duration {
+    const FLAG: &str = "--shutdown-drain-secs";
+    let from_flag = args.iter().enumerate().find_map(|(i, a)| {
+        a.strip_prefix("--shutdown-drain-secs=")
+            .map(str::to_owned)
+            .or_else(|| (a == FLAG).then(|| args.get(i + 1).cloned()).flatten())
+    });
+    from_flag
+        .or_else(|| env("TYMUXD_SHUTDOWN_DRAIN_SECS"))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+        .unwrap_or(DEFAULT_SHUTDOWN_DRAIN)
+}
+
+/// The `on_dead` hook for [`listener_health::log_accept_errors`]: exits non-zero straight from
+/// the accept stream, since tonic's serve future may never return while connections are open.
+fn exit_on_listener_death(
+    shutdown_requested: &Arc<std::sync::atomic::AtomicBool>,
+) -> impl Fn(&'static str) + Send + 'static {
+    let flag = shutdown_requested.clone();
+    move |listener| exit_if_listener_ended_unexpectedly(listener, &flag)
 }
 
 /// A listener ending (or being found dead) without SIGTERM/Ctrl-C means it is gone.
@@ -2402,6 +2451,7 @@ fn tcp_health_probe_transition(
 async fn tcp_health_probe(
     probe_addr: std::net::SocketAddr,
     listener_fd: Option<std::os::fd::RawFd>,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> TcpProbeEnd {
     // Frequent enough to catch a wedged listener well before an operator
     // would notice from external symptoms alone, without adding meaningful
@@ -2417,14 +2467,8 @@ async fn tcp_health_probe(
     // `probe_addr` is loopback when the daemon binds a wildcard (see `tcp_probe_target`).
     let loopback = probe_addr.ip().is_loopback();
 
-    // Pinned once and reused across iterations, unlike a `shutdown_signal()`
-    // call made fresh inside `select!` each time: this task also awaits the
-    // probe's own connect/timeout (up to PROBE_TIMEOUT) *outside* `select!`,
-    // and a per-iteration signal future has no registration during that
-    // window — a SIGTERM delivered then would be missed entirely, hanging
-    // this task and, with it, the `tokio::join!` in `main()` that waits on
-    // it alongside the UDS/TCP listeners.
-    let shutdown = shutdown_signal();
+    // Pinned once and reused across iterations: a future created fresh inside each `select!`
+    // would miss a shutdown that arrives while the connect/timeout below runs outside it.
     tokio::pin!(shutdown);
 
     loop {
@@ -6547,7 +6591,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener); // now refuses every connection
 
-        tokio::spawn(tcp_health_probe(addr, None));
+        tokio::spawn(tcp_health_probe(addr, None, std::future::pending()));
 
         // A few extra advances beyond the bare warn threshold, each
         // followed by a yield so the probe task is actually polled before
@@ -6587,7 +6631,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let end = drive_probe_to_end(tokio::spawn(tcp_health_probe(addr, None))).await;
+        let end = drive_probe_to_end(tokio::spawn(tcp_health_probe(
+            addr,
+            None,
+            std::future::pending(),
+        )))
+        .await;
 
         assert_eq!(end, TcpProbeEnd::ListenerDead);
     }
@@ -6609,6 +6658,7 @@ mod tests {
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     "tcp",
                     fd,
+                    |_| {},
                 )),
         );
         let refusing = tokio::net::TcpSocket::new_v4().unwrap();
@@ -6618,7 +6668,12 @@ mod tests {
             .await
             .expect_err("a bound but unlistened port refuses connections");
 
-        let end = drive_probe_to_end(tokio::spawn(tcp_health_probe(addr, Some(fd)))).await;
+        let end = drive_probe_to_end(tokio::spawn(tcp_health_probe(
+            addr,
+            Some(fd),
+            std::future::pending(),
+        )))
+        .await;
 
         assert_eq!(end, TcpProbeEnd::ListenerDead);
         assert!(logs_contain("failed too many times in a row"));
@@ -6662,7 +6717,12 @@ mod tests {
         let server = tokio::spawn(
             Server::builder()
                 .add_service(TymuxServiceServer::new(test_daemon()))
-                .serve_with_incoming(listener_health::log_accept_errors(incoming, "tcp", -1)),
+                .serve_with_incoming(listener_health::log_accept_errors(
+                    incoming,
+                    "tcp",
+                    -1,
+                    |_| {},
+                )),
         );
 
         let mut client = TymuxServiceClient::connect(format!("http://{addr}"))
@@ -6678,6 +6738,111 @@ mod tests {
         server.abort();
     }
 
+    /// The regression behind the lingering v1.12 daemons: tonic's serve future does not return
+    /// while a connection is open, so the death hook must fire from the accept stream itself.
+    #[tokio::test]
+    async fn listener_death_hook_should_fire_while_serve_is_still_draining_an_open_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
+            .take(1)
+            .chain(futures::stream::once(async move {
+                let _ = kill_rx.await;
+                Err(std::io::Error::from_raw_os_error(libc::EBADF))
+            }));
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_flag = dead.clone();
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(TymuxServiceServer::new(test_daemon()))
+                .serve_with_incoming_shutdown(
+                    listener_health::log_accept_errors(incoming, "uds", -1, move |_| {
+                        hook_flag.store(true, Ordering::SeqCst)
+                    }),
+                    // The shutdown variant is what makes tonic wait for open connections.
+                    std::future::pending::<()>(),
+                ),
+        );
+
+        let mut client = TymuxServiceClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        // An idle HTTP/2 connection closes at once on graceful shutdown; a live Attach stream
+        // is what keeps tonic's drain (and so `serve`) from returning.
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(
+                sole_pane(&session.windows[0]).id.clone(),
+            )),
+            resume_from_seq: None,
+            subscribe_lifecycle: false,
+        })
+        .await
+        .unwrap();
+        let mut events = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+        events.message().await.unwrap().expect("first attach event");
+        kill_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dead.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the hook should fire once the accept stream hits a fatal error");
+
+        assert!(
+            !server.is_finished(),
+            "serve is still draining the open connection"
+        );
+        drop((tx, events, client));
+        server.abort();
+    }
+
+    #[test]
+    fn resolve_shutdown_drain_should_prefer_flag_then_env_then_default() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let no_env = |_: &str| None;
+        let env_2 = |_: &str| Some("2".to_string());
+
+        assert_eq!(
+            resolve_shutdown_drain(&args(&[]), no_env),
+            DEFAULT_SHUTDOWN_DRAIN
+        );
+        assert_eq!(
+            resolve_shutdown_drain(&args(&[]), env_2),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            resolve_shutdown_drain(&args(&["--shutdown-drain-secs", "7"]), env_2),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            resolve_shutdown_drain(&args(&["--shutdown-drain-secs=0.5"]), no_env),
+            Duration::from_millis(500)
+        );
+        for bad in ["abc", "-1", "NaN"] {
+            let bad_env = move |_: &str| Some(bad.to_string());
+            assert_eq!(
+                resolve_shutdown_drain(&args(&[]), bad_env),
+                DEFAULT_SHUTDOWN_DRAIN
+            );
+        }
+        assert_eq!(
+            resolve_shutdown_drain(&args(&["--shutdown-drain-secs"]), no_env),
+            DEFAULT_SHUTDOWN_DRAIN
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn uds_accept_stream_should_deliver_a_connection_after_emfile() {
         let dir = std::path::PathBuf::from(format!("/tmp/tymuxd-e{}", std::process::id()));
@@ -6686,7 +6851,12 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let incoming = futures::stream::iter(vec![Err(emfile())])
             .chain(tokio_stream::wrappers::UnixListenerStream::new(listener));
-        let mut incoming = Box::pin(listener_health::log_accept_errors(incoming, "uds", -1));
+        let mut incoming = Box::pin(listener_health::log_accept_errors(
+            incoming,
+            "uds",
+            -1,
+            |_| {},
+        ));
 
         let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
 
@@ -6703,7 +6873,7 @@ mod tests {
         )]);
         let res = Server::builder()
             .add_service(TymuxServiceServer::new(test_daemon()))
-            .serve_with_incoming(listener_health::log_accept_errors(fatal, "uds", -1))
+            .serve_with_incoming(listener_health::log_accept_errors(fatal, "uds", -1, |_| {}))
             .await;
 
         assert!(res.is_ok(), "{res:?}");

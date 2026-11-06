@@ -215,6 +215,7 @@ fn log_accept_error(
     match classify_accept_error(e) {
         AcceptErrorKind::Fatal(name) => tracing::error!(
             listener, errno, errno_name = name, error = %e, fd_state = %fd_state(fd),
+            open_fds = open_fd_count(), fd_limit = nofile_soft_limit(),
             suppressed_since_last_log,
             "accept failed with a fatal errno: the listener socket is broken and will not recover"
         ),
@@ -243,10 +244,16 @@ const ACCEPT_PERSISTENT_ERROR_LIMIT: Duration = Duration::from_secs(120);
 /// 0.12 ends its accept loop (serve returns `Ok(())`) on any errno other than a short
 /// allow-list, so a single EMFILE would otherwise take the whole listener down. Errors that
 /// persist for [`ACCEPT_PERSISTENT_ERROR_LIMIT`] without a success are forwarded after all.
+///
+/// `on_dead` runs (with the listener name) the moment the stream is about to end for good: a fatal
+/// or escalated error, or the inner stream ending. It must fire here rather than after
+/// `serve_with_incoming_shutdown` returns, because tonic only returns once every open connection
+/// has drained, and a long-lived Attach stream never does.
 pub fn log_accept_errors<S, T>(
     incoming: S,
     listener: &'static str,
     fd: RawFd,
+    on_dead: impl Fn(&'static str) + Send + 'static,
 ) -> impl Stream<Item = io::Result<T>>
 where
     S: Stream<Item = io::Result<T>>,
@@ -263,34 +270,44 @@ where
         backoff: ACCEPT_BACKOFF_START,
         failing_since: None,
     };
-    futures::stream::unfold(state, move |mut st| async move {
-        loop {
-            match st.incoming.next().await? {
-                Ok(conn) => {
-                    st.backoff = ACCEPT_BACKOFF_START;
-                    st.failing_since = None;
-                    return Some((Ok(conn), st));
-                }
-                Err(e) => {
-                    if let Some(suppressed) = st.limiter.admit(Instant::now()) {
-                        log_accept_error(listener, fd, &e, suppressed);
+    let on_dead = std::sync::Arc::new(on_dead);
+    futures::stream::unfold(state, move |mut st| {
+        let on_dead = on_dead.clone();
+        async move {
+            loop {
+                let Some(next) = st.incoming.next().await else {
+                    on_dead(listener);
+                    return None;
+                };
+                match next {
+                    Ok(conn) => {
+                        st.backoff = ACCEPT_BACKOFF_START;
+                        st.failing_since = None;
+                        return Some((Ok(conn), st));
                     }
-                    if matches!(classify_accept_error(&e), AcceptErrorKind::Fatal(_)) {
-                        return Some((Err(e), st));
+                    Err(e) => {
+                        if let Some(suppressed) = st.limiter.admit(Instant::now()) {
+                            log_accept_error(listener, fd, &e, suppressed);
+                        }
+                        if matches!(classify_accept_error(&e), AcceptErrorKind::Fatal(_)) {
+                            on_dead(listener);
+                            return Some((Err(e), st));
+                        }
+                        let since = *st
+                            .failing_since
+                            .get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() >= ACCEPT_PERSISTENT_ERROR_LIMIT {
+                            tracing::error!(
+                                listener, error = %e,
+                                "accept has failed continuously for {}s; giving up so the daemon can be restarted",
+                                ACCEPT_PERSISTENT_ERROR_LIMIT.as_secs()
+                            );
+                            on_dead(listener);
+                            return Some((Err(e), st));
+                        }
+                        tokio::time::sleep(st.backoff).await;
+                        st.backoff = (st.backoff * 2).min(ACCEPT_BACKOFF_MAX);
                     }
-                    let since = *st
-                        .failing_since
-                        .get_or_insert_with(tokio::time::Instant::now);
-                    if since.elapsed() >= ACCEPT_PERSISTENT_ERROR_LIMIT {
-                        tracing::error!(
-                            listener, error = %e,
-                            "accept has failed continuously for {}s; giving up so the daemon can be restarted",
-                            ACCEPT_PERSISTENT_ERROR_LIMIT.as_secs()
-                        );
-                        return Some((Err(e), st));
-                    }
-                    tokio::time::sleep(st.backoff).await;
-                    st.backoff = (st.backoff * 2).min(ACCEPT_BACKOFF_MAX);
                 }
             }
         }
@@ -401,11 +418,58 @@ mod tests {
             Err::<u8, _>(io::Error::from_raw_os_error(libc::EBADF)),
             Ok(7),
         ]);
-        let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+        let out: Vec<_> = log_accept_errors(src, "tcp", -1, |_| {}).collect().await;
 
         assert!(out[0].is_err() && matches!(out[1], Ok(7)));
         assert!(logs_contain("fatal errno"));
         assert!(logs_contain("EBADF"));
+    }
+
+    fn dead_recorder() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        impl Fn(&'static str) + Send + 'static,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        (seen, move |l| sink.lock().unwrap().push(l))
+    }
+
+    #[tokio::test]
+    async fn log_accept_errors_should_report_the_listener_dead_before_yielding_a_fatal_error() {
+        let (seen, on_dead) = dead_recorder();
+        let src = futures::stream::iter(vec![
+            Ok::<u8, _>(1),
+            Err(io::Error::from_raw_os_error(libc::EBADF)),
+        ]);
+        let mut out = Box::pin(log_accept_errors(src, "uds", -1, on_dead));
+
+        assert!(out.next().await.unwrap().is_ok());
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(out.next().await.unwrap().is_err());
+        assert_eq!(*seen.lock().unwrap(), vec!["uds"]);
+    }
+
+    #[tokio::test]
+    async fn log_accept_errors_should_report_the_listener_dead_when_the_inner_stream_ends() {
+        let (seen, on_dead) = dead_recorder();
+        let src = futures::stream::iter(vec![Ok::<u8, io::Error>(1)]);
+        let out: Vec<_> = log_accept_errors(src, "tcp", -1, on_dead).collect().await;
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(*seen.lock().unwrap(), vec!["tcp"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn log_accept_errors_should_not_report_dead_for_a_swallowed_transient_error() {
+        let (seen, on_dead) = dead_recorder();
+        let src = futures::stream::iter(vec![
+            Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE)),
+            Ok(1),
+        ]);
+        let mut out = Box::pin(log_accept_errors(src, "uds", -1, on_dead));
+
+        assert!(out.next().await.unwrap().is_ok());
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -425,7 +489,7 @@ mod tests {
                 Err(io::Error::from_raw_os_error(errno)),
                 Ok(7),
             ]);
-            let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+            let out: Vec<_> = log_accept_errors(src, "tcp", -1, |_| {}).collect().await;
 
             assert_eq!(out.len(), 1, "errno {errno} must not reach the consumer");
             assert!(matches!(out[0], Ok(7)), "errno {errno}");
@@ -440,7 +504,7 @@ mod tests {
             Ok(1),
         ]);
         let start = tokio::time::Instant::now();
-        let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+        let out: Vec<_> = log_accept_errors(src, "tcp", -1, |_| {}).collect().await;
 
         assert_eq!(out.len(), 1);
         assert_eq!(start.elapsed(), ACCEPT_BACKOFF_START * 3);
@@ -451,7 +515,7 @@ mod tests {
         let errs = (0..20).map(|_| Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE)));
         let src = futures::stream::iter(errs.chain(std::iter::once(Ok(1))));
         let start = tokio::time::Instant::now();
-        let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+        let out: Vec<_> = log_accept_errors(src, "tcp", -1, |_| {}).collect().await;
 
         assert_eq!(out.len(), 1);
         assert!(start.elapsed() <= ACCEPT_BACKOFF_MAX * 20);
@@ -464,7 +528,10 @@ mod tests {
             Err::<u8, _>(io::Error::from_raw_os_error(libc::EMFILE))
         });
         let start = tokio::time::Instant::now();
-        let out: Vec<_> = log_accept_errors(src, "uds", -1).take(1).collect().await;
+        let out: Vec<_> = log_accept_errors(src, "uds", -1, |_| {})
+            .take(1)
+            .collect()
+            .await;
 
         assert_eq!(
             out[0].as_ref().unwrap_err().raw_os_error(),
@@ -487,7 +554,7 @@ mod tests {
             .chain(futures::stream::iter([Ok(1)]))
             .chain(fail(100))
             .chain(futures::stream::iter([Ok(2)]));
-        let out: Vec<_> = log_accept_errors(src, "uds", -1).collect().await;
+        let out: Vec<_> = log_accept_errors(src, "uds", -1, |_| {}).collect().await;
 
         assert!(matches!(out.as_slice(), [Ok(1), Ok(2)]), "{out:?}");
     }
@@ -497,7 +564,7 @@ mod tests {
         for errno in [libc::EBADF, libc::ENOTSOCK, libc::EINVAL] {
             let src =
                 futures::stream::iter(vec![Err::<u8, _>(io::Error::from_raw_os_error(errno))]);
-            let out: Vec<_> = log_accept_errors(src, "tcp", -1).collect().await;
+            let out: Vec<_> = log_accept_errors(src, "tcp", -1, |_| {}).collect().await;
 
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].as_ref().unwrap_err().raw_os_error(), Some(errno));

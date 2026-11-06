@@ -529,6 +529,8 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
 pub struct PeerIdentity {
     pub uid: u32,
     pub gid: u32,
+    /// Only read by the Linux group-membership check.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub pid: Option<i32>,
 }
 
