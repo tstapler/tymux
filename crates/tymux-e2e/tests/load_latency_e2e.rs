@@ -166,7 +166,7 @@ async fn run_config(p: &Params) {
         .await;
         // Standing attach with a draining reader, like the squad's standing streams.
         let (tx, mut rx) = attach(&mut client, &id).await;
-        // The hint applies only while a stream is open, so send it after attaching.
+        // A hint resets when the pane's last stream ends; sent after attaching it applies at once.
         if p.activity_hint {
             let _ = client
                 .set_pane_activity(SetPaneActivityRequest {
