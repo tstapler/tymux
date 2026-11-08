@@ -2249,6 +2249,13 @@ mod tests {
             {
                 unreachable!("test never issues RPCs")
             }
+            async fn set_pane_activity(
+                &self,
+                _request: tonic::Request<tymux_proto::v1::SetPaneActivityRequest>,
+            ) -> Result<tonic::Response<tymux_proto::v1::SetPaneActivityResponse>, tonic::Status>
+            {
+                unreachable!("test never issues RPCs")
+            }
             async fn get_pane_status(
                 &self,
                 _request: tonic::Request<GetPaneStatusRequest>,

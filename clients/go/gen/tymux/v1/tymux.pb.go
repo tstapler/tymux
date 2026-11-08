@@ -255,6 +255,55 @@ func (RestartMode) EnumDescriptor() ([]byte, []int) {
 	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{3}
 }
 
+type PaneActivity int32
+
+const (
+	PaneActivity_PANE_ACTIVITY_UNSPECIFIED PaneActivity = 0 // treated as NORMAL: the unhinted default
+	PaneActivity_PANE_ACTIVITY_INTERACTIVE PaneActivity = 1
+	PaneActivity_PANE_ACTIVITY_BACKGROUND  PaneActivity = 2
+)
+
+// Enum value maps for PaneActivity.
+var (
+	PaneActivity_name = map[int32]string{
+		0: "PANE_ACTIVITY_UNSPECIFIED",
+		1: "PANE_ACTIVITY_INTERACTIVE",
+		2: "PANE_ACTIVITY_BACKGROUND",
+	}
+	PaneActivity_value = map[string]int32{
+		"PANE_ACTIVITY_UNSPECIFIED": 0,
+		"PANE_ACTIVITY_INTERACTIVE": 1,
+		"PANE_ACTIVITY_BACKGROUND":  2,
+	}
+)
+
+func (x PaneActivity) Enum() *PaneActivity {
+	p := new(PaneActivity)
+	*p = x
+	return p
+}
+
+func (x PaneActivity) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PaneActivity) Descriptor() protoreflect.EnumDescriptor {
+	return file_tymux_v1_tymux_proto_enumTypes[4].Descriptor()
+}
+
+func (PaneActivity) Type() protoreflect.EnumType {
+	return &file_tymux_v1_tymux_proto_enumTypes[4]
+}
+
+func (x PaneActivity) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PaneActivity.Descriptor instead.
+func (PaneActivity) EnumDescriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{4}
+}
+
 type LifecycleEventKind int32
 
 const (
@@ -302,11 +351,11 @@ func (x LifecycleEventKind) String() string {
 }
 
 func (LifecycleEventKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_tymux_v1_tymux_proto_enumTypes[4].Descriptor()
+	return file_tymux_v1_tymux_proto_enumTypes[5].Descriptor()
 }
 
 func (LifecycleEventKind) Type() protoreflect.EnumType {
-	return &file_tymux_v1_tymux_proto_enumTypes[4]
+	return &file_tymux_v1_tymux_proto_enumTypes[5]
 }
 
 func (x LifecycleEventKind) Number() protoreflect.EnumNumber {
@@ -315,7 +364,7 @@ func (x LifecycleEventKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LifecycleEventKind.Descriptor instead.
 func (LifecycleEventKind) EnumDescriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{4}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{5}
 }
 
 type Session struct {
@@ -3658,6 +3707,94 @@ func (x *SetRestartPolicyResponse) GetStatus() *PaneStatus {
 	return nil
 }
 
+type SetPaneActivityRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PaneId        string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	Activity      PaneActivity           `protobuf:"varint,2,opt,name=activity,proto3,enum=tymux.v1.PaneActivity" json:"activity,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetPaneActivityRequest) Reset() {
+	*x = SetPaneActivityRequest{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetPaneActivityRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetPaneActivityRequest) ProtoMessage() {}
+
+func (x *SetPaneActivityRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetPaneActivityRequest.ProtoReflect.Descriptor instead.
+func (*SetPaneActivityRequest) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *SetPaneActivityRequest) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+func (x *SetPaneActivityRequest) GetActivity() PaneActivity {
+	if x != nil {
+		return x.Activity
+	}
+	return PaneActivity_PANE_ACTIVITY_UNSPECIFIED
+}
+
+type SetPaneActivityResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetPaneActivityResponse) Reset() {
+	*x = SetPaneActivityResponse{}
+	mi := &file_tymux_v1_tymux_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetPaneActivityResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetPaneActivityResponse) ProtoMessage() {}
+
+func (x *SetPaneActivityResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tymux_v1_tymux_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetPaneActivityResponse.ProtoReflect.Descriptor instead.
+func (*SetPaneActivityResponse) Descriptor() ([]byte, []int) {
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{45}
+}
+
 type GetPaneStatusRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	PaneId        string                 `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
@@ -3667,7 +3804,7 @@ type GetPaneStatusRequest struct {
 
 func (x *GetPaneStatusRequest) Reset() {
 	*x = GetPaneStatusRequest{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[44]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3679,7 +3816,7 @@ func (x *GetPaneStatusRequest) String() string {
 func (*GetPaneStatusRequest) ProtoMessage() {}
 
 func (x *GetPaneStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[44]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3692,7 +3829,7 @@ func (x *GetPaneStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPaneStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetPaneStatusRequest) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{44}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *GetPaneStatusRequest) GetPaneId() string {
@@ -3715,7 +3852,7 @@ type RestartPaneRequest struct {
 
 func (x *RestartPaneRequest) Reset() {
 	*x = RestartPaneRequest{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[45]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3727,7 +3864,7 @@ func (x *RestartPaneRequest) String() string {
 func (*RestartPaneRequest) ProtoMessage() {}
 
 func (x *RestartPaneRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[45]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3740,7 +3877,7 @@ func (x *RestartPaneRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestartPaneRequest.ProtoReflect.Descriptor instead.
 func (*RestartPaneRequest) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{45}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *RestartPaneRequest) GetPaneId() string {
@@ -3775,7 +3912,7 @@ type StopPaneRequest struct {
 
 func (x *StopPaneRequest) Reset() {
 	*x = StopPaneRequest{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[46]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3787,7 +3924,7 @@ func (x *StopPaneRequest) String() string {
 func (*StopPaneRequest) ProtoMessage() {}
 
 func (x *StopPaneRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[46]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3800,7 +3937,7 @@ func (x *StopPaneRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopPaneRequest.ProtoReflect.Descriptor instead.
 func (*StopPaneRequest) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{46}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *StopPaneRequest) GetPaneId() string {
@@ -3826,7 +3963,7 @@ type StartPaneRequest struct {
 
 func (x *StartPaneRequest) Reset() {
 	*x = StartPaneRequest{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[47]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3838,7 +3975,7 @@ func (x *StartPaneRequest) String() string {
 func (*StartPaneRequest) ProtoMessage() {}
 
 func (x *StartPaneRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[47]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3851,7 +3988,7 @@ func (x *StartPaneRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartPaneRequest.ProtoReflect.Descriptor instead.
 func (*StartPaneRequest) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{47}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *StartPaneRequest) GetPaneId() string {
@@ -3870,7 +4007,7 @@ type ResetRestartBudgetRequest struct {
 
 func (x *ResetRestartBudgetRequest) Reset() {
 	*x = ResetRestartBudgetRequest{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[48]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3882,7 +4019,7 @@ func (x *ResetRestartBudgetRequest) String() string {
 func (*ResetRestartBudgetRequest) ProtoMessage() {}
 
 func (x *ResetRestartBudgetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[48]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3895,7 +4032,7 @@ func (x *ResetRestartBudgetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResetRestartBudgetRequest.ProtoReflect.Descriptor instead.
 func (*ResetRestartBudgetRequest) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{48}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *ResetRestartBudgetRequest) GetPaneId() string {
@@ -3923,7 +4060,7 @@ type LifecycleEvent struct {
 
 func (x *LifecycleEvent) Reset() {
 	*x = LifecycleEvent{}
-	mi := &file_tymux_v1_tymux_proto_msgTypes[49]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3935,7 +4072,7 @@ func (x *LifecycleEvent) String() string {
 func (*LifecycleEvent) ProtoMessage() {}
 
 func (x *LifecycleEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_tymux_v1_tymux_proto_msgTypes[49]
+	mi := &file_tymux_v1_tymux_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3948,7 +4085,7 @@ func (x *LifecycleEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LifecycleEvent.ProtoReflect.Descriptor instead.
 func (*LifecycleEvent) Descriptor() ([]byte, []int) {
-	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{49}
+	return file_tymux_v1_tymux_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *LifecycleEvent) GetKind() LifecycleEventKind {
@@ -4281,7 +4418,11 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x17apply_to_existing_panes\x18\x04 \x01(\bR\x14applyToExistingPanesB\b\n" +
 	"\x06target\"H\n" +
 	"\x18SetRestartPolicyResponse\x12,\n" +
-	"\x06status\x18\x01 \x01(\v2\x14.tymux.v1.PaneStatusR\x06status\"/\n" +
+	"\x06status\x18\x01 \x01(\v2\x14.tymux.v1.PaneStatusR\x06status\"e\n" +
+	"\x16SetPaneActivityRequest\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\x122\n" +
+	"\bactivity\x18\x02 \x01(\x0e2\x16.tymux.v1.PaneActivityR\bactivity\"\x19\n" +
+	"\x17SetPaneActivityResponse\"/\n" +
 	"\x14GetPaneStatusRequest\x12\x17\n" +
 	"\apane_id\x18\x01 \x01(\tR\x06paneId\"\x7f\n" +
 	"\x12RestartPaneRequest\x12\x17\n" +
@@ -4336,15 +4477,18 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x12RESTART_MODE_NEVER\x10\x01\x12\x1b\n" +
 	"\x17RESTART_MODE_ON_FAILURE\x10\x02\x12\x17\n" +
 	"\x13RESTART_MODE_ALWAYS\x10\x03\x12\x1f\n" +
-	"\x1bRESTART_MODE_UNLESS_STOPPED\x10\x04*\xee\x01\n" +
+	"\x1bRESTART_MODE_UNLESS_STOPPED\x10\x04*j\n" +
+	"\fPaneActivity\x12\x1d\n" +
+	"\x19PANE_ACTIVITY_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19PANE_ACTIVITY_INTERACTIVE\x10\x01\x12\x1c\n" +
+	"\x18PANE_ACTIVITY_BACKGROUND\x10\x02*\xee\x01\n" +
 	"\x12LifecycleEventKind\x12$\n" +
 	" LIFECYCLE_EVENT_KIND_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bLIFECYCLE_EVENT_KIND_EXITED\x10\x01\x12*\n" +
 	"&LIFECYCLE_EVENT_KIND_RESTART_SCHEDULED\x10\x02\x12\"\n" +
 	"\x1eLIFECYCLE_EVENT_KIND_RESTARTED\x10\x03\x12\x1f\n" +
 	"\x1bLIFECYCLE_EVENT_KIND_FAILED\x10\x04\x12 \n" +
-	"\x1cLIFECYCLE_EVENT_KIND_STOPPED\x10\x052\xf1\n" +
-	"\n" +
+	"\x1cLIFECYCLE_EVENT_KIND_STOPPED\x10\x052\xc9\v\n" +
 	"\fTymuxService\x12E\n" +
 	"\rGetServerInfo\x12\x1e.tymux.v1.GetServerInfoRequest\x1a\x14.tymux.v1.ServerInfo\x12B\n" +
 	"\rCreateSession\x12\x1e.tymux.v1.CreateSessionRequest\x1a\x11.tymux.v1.Session\x12M\n" +
@@ -4361,7 +4505,8 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\n" +
 	"WriteStdin\x12\x1b.tymux.v1.WriteStdinRequest\x1a\x1c.tymux.v1.WriteStdinResponse(\x01\x12Y\n" +
 	"\x10SetRestartPolicy\x12!.tymux.v1.SetRestartPolicyRequest\x1a\".tymux.v1.SetRestartPolicyResponse\x12E\n" +
-	"\rGetPaneStatus\x12\x1e.tymux.v1.GetPaneStatusRequest\x1a\x14.tymux.v1.PaneStatus\x12A\n" +
+	"\rGetPaneStatus\x12\x1e.tymux.v1.GetPaneStatusRequest\x1a\x14.tymux.v1.PaneStatus\x12V\n" +
+	"\x0fSetPaneActivity\x12 .tymux.v1.SetPaneActivityRequest\x1a!.tymux.v1.SetPaneActivityResponse\x12A\n" +
 	"\vRestartPane\x12\x1c.tymux.v1.RestartPaneRequest\x1a\x14.tymux.v1.PaneStatus\x12;\n" +
 	"\bStopPane\x12\x19.tymux.v1.StopPaneRequest\x1a\x14.tymux.v1.PaneStatus\x12=\n" +
 	"\tStartPane\x12\x1a.tymux.v1.StartPaneRequest\x1a\x14.tymux.v1.PaneStatus\x12O\n" +
@@ -4381,149 +4526,155 @@ func file_tymux_v1_tymux_proto_rawDescGZIP() []byte {
 	return file_tymux_v1_tymux_proto_rawDescData
 }
 
-var file_tymux_v1_tymux_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
+var file_tymux_v1_tymux_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
+var file_tymux_v1_tymux_proto_msgTypes = make([]protoimpl.MessageInfo, 53)
 var file_tymux_v1_tymux_proto_goTypes = []any{
 	(Liveness)(0),                     // 0: tymux.v1.Liveness
 	(Orientation)(0),                  // 1: tymux.v1.Orientation
 	(PaneState)(0),                    // 2: tymux.v1.PaneState
 	(RestartMode)(0),                  // 3: tymux.v1.RestartMode
-	(LifecycleEventKind)(0),           // 4: tymux.v1.LifecycleEventKind
-	(*Session)(nil),                   // 5: tymux.v1.Session
-	(*Window)(nil),                    // 6: tymux.v1.Window
-	(*Layout)(nil),                    // 7: tymux.v1.Layout
-	(*Split)(nil),                     // 8: tymux.v1.Split
-	(*LayoutChild)(nil),               // 9: tymux.v1.LayoutChild
-	(*Pane)(nil),                      // 10: tymux.v1.Pane
-	(*CreateSessionRequest)(nil),      // 11: tymux.v1.CreateSessionRequest
-	(*ArgSpec)(nil),                   // 12: tymux.v1.ArgSpec
-	(*ListSessionsRequest)(nil),       // 13: tymux.v1.ListSessionsRequest
-	(*ListSessionsResponse)(nil),      // 14: tymux.v1.ListSessionsResponse
-	(*KillSessionRequest)(nil),        // 15: tymux.v1.KillSessionRequest
-	(*KillSessionResponse)(nil),       // 16: tymux.v1.KillSessionResponse
-	(*ReviveSessionRequest)(nil),      // 17: tymux.v1.ReviveSessionRequest
-	(*ReviveSessionResponse)(nil),     // 18: tymux.v1.ReviveSessionResponse
-	(*SplitPaneRequest)(nil),          // 19: tymux.v1.SplitPaneRequest
-	(*ClosePaneRequest)(nil),          // 20: tymux.v1.ClosePaneRequest
-	(*ClosePaneResponse)(nil),         // 21: tymux.v1.ClosePaneResponse
-	(*CreateWindowRequest)(nil),       // 22: tymux.v1.CreateWindowRequest
-	(*WatchWindowRequest)(nil),        // 23: tymux.v1.WatchWindowRequest
-	(*WindowLayoutEvent)(nil),         // 24: tymux.v1.WindowLayoutEvent
-	(*CapturePaneRequest)(nil),        // 25: tymux.v1.CapturePaneRequest
-	(*SearchScrollbackRequest)(nil),   // 26: tymux.v1.SearchScrollbackRequest
-	(*SearchScrollbackResponse)(nil),  // 27: tymux.v1.SearchScrollbackResponse
-	(*PaneSnapshot)(nil),              // 28: tymux.v1.PaneSnapshot
-	(*TerminalModes)(nil),             // 29: tymux.v1.TerminalModes
-	(*Charsets)(nil),                  // 30: tymux.v1.Charsets
-	(*Hyperlink)(nil),                 // 31: tymux.v1.Hyperlink
-	(*Row)(nil),                       // 32: tymux.v1.Row
-	(*Cell)(nil),                      // 33: tymux.v1.Cell
-	(*AttachRequest)(nil),             // 34: tymux.v1.AttachRequest
-	(*WriteStdinRequest)(nil),         // 35: tymux.v1.WriteStdinRequest
-	(*WriteStdinResponse)(nil),        // 36: tymux.v1.WriteStdinResponse
-	(*Resize)(nil),                    // 37: tymux.v1.Resize
-	(*ExitStatus)(nil),                // 38: tymux.v1.ExitStatus
-	(*OutputChunk)(nil),               // 39: tymux.v1.OutputChunk
-	(*GapExceeded)(nil),               // 40: tymux.v1.GapExceeded
-	(*Heartbeat)(nil),                 // 41: tymux.v1.Heartbeat
-	(*AttachEvent)(nil),               // 42: tymux.v1.AttachEvent
-	(*GetServerInfoRequest)(nil),      // 43: tymux.v1.GetServerInfoRequest
-	(*ServerInfo)(nil),                // 44: tymux.v1.ServerInfo
-	(*RestartPolicy)(nil),             // 45: tymux.v1.RestartPolicy
-	(*PaneStatus)(nil),                // 46: tymux.v1.PaneStatus
-	(*SetRestartPolicyRequest)(nil),   // 47: tymux.v1.SetRestartPolicyRequest
-	(*SetRestartPolicyResponse)(nil),  // 48: tymux.v1.SetRestartPolicyResponse
-	(*GetPaneStatusRequest)(nil),      // 49: tymux.v1.GetPaneStatusRequest
-	(*RestartPaneRequest)(nil),        // 50: tymux.v1.RestartPaneRequest
-	(*StopPaneRequest)(nil),           // 51: tymux.v1.StopPaneRequest
-	(*StartPaneRequest)(nil),          // 52: tymux.v1.StartPaneRequest
-	(*ResetRestartBudgetRequest)(nil), // 53: tymux.v1.ResetRestartBudgetRequest
-	(*LifecycleEvent)(nil),            // 54: tymux.v1.LifecycleEvent
-	nil,                               // 55: tymux.v1.CreateSessionRequest.EnvEntry
+	(PaneActivity)(0),                 // 4: tymux.v1.PaneActivity
+	(LifecycleEventKind)(0),           // 5: tymux.v1.LifecycleEventKind
+	(*Session)(nil),                   // 6: tymux.v1.Session
+	(*Window)(nil),                    // 7: tymux.v1.Window
+	(*Layout)(nil),                    // 8: tymux.v1.Layout
+	(*Split)(nil),                     // 9: tymux.v1.Split
+	(*LayoutChild)(nil),               // 10: tymux.v1.LayoutChild
+	(*Pane)(nil),                      // 11: tymux.v1.Pane
+	(*CreateSessionRequest)(nil),      // 12: tymux.v1.CreateSessionRequest
+	(*ArgSpec)(nil),                   // 13: tymux.v1.ArgSpec
+	(*ListSessionsRequest)(nil),       // 14: tymux.v1.ListSessionsRequest
+	(*ListSessionsResponse)(nil),      // 15: tymux.v1.ListSessionsResponse
+	(*KillSessionRequest)(nil),        // 16: tymux.v1.KillSessionRequest
+	(*KillSessionResponse)(nil),       // 17: tymux.v1.KillSessionResponse
+	(*ReviveSessionRequest)(nil),      // 18: tymux.v1.ReviveSessionRequest
+	(*ReviveSessionResponse)(nil),     // 19: tymux.v1.ReviveSessionResponse
+	(*SplitPaneRequest)(nil),          // 20: tymux.v1.SplitPaneRequest
+	(*ClosePaneRequest)(nil),          // 21: tymux.v1.ClosePaneRequest
+	(*ClosePaneResponse)(nil),         // 22: tymux.v1.ClosePaneResponse
+	(*CreateWindowRequest)(nil),       // 23: tymux.v1.CreateWindowRequest
+	(*WatchWindowRequest)(nil),        // 24: tymux.v1.WatchWindowRequest
+	(*WindowLayoutEvent)(nil),         // 25: tymux.v1.WindowLayoutEvent
+	(*CapturePaneRequest)(nil),        // 26: tymux.v1.CapturePaneRequest
+	(*SearchScrollbackRequest)(nil),   // 27: tymux.v1.SearchScrollbackRequest
+	(*SearchScrollbackResponse)(nil),  // 28: tymux.v1.SearchScrollbackResponse
+	(*PaneSnapshot)(nil),              // 29: tymux.v1.PaneSnapshot
+	(*TerminalModes)(nil),             // 30: tymux.v1.TerminalModes
+	(*Charsets)(nil),                  // 31: tymux.v1.Charsets
+	(*Hyperlink)(nil),                 // 32: tymux.v1.Hyperlink
+	(*Row)(nil),                       // 33: tymux.v1.Row
+	(*Cell)(nil),                      // 34: tymux.v1.Cell
+	(*AttachRequest)(nil),             // 35: tymux.v1.AttachRequest
+	(*WriteStdinRequest)(nil),         // 36: tymux.v1.WriteStdinRequest
+	(*WriteStdinResponse)(nil),        // 37: tymux.v1.WriteStdinResponse
+	(*Resize)(nil),                    // 38: tymux.v1.Resize
+	(*ExitStatus)(nil),                // 39: tymux.v1.ExitStatus
+	(*OutputChunk)(nil),               // 40: tymux.v1.OutputChunk
+	(*GapExceeded)(nil),               // 41: tymux.v1.GapExceeded
+	(*Heartbeat)(nil),                 // 42: tymux.v1.Heartbeat
+	(*AttachEvent)(nil),               // 43: tymux.v1.AttachEvent
+	(*GetServerInfoRequest)(nil),      // 44: tymux.v1.GetServerInfoRequest
+	(*ServerInfo)(nil),                // 45: tymux.v1.ServerInfo
+	(*RestartPolicy)(nil),             // 46: tymux.v1.RestartPolicy
+	(*PaneStatus)(nil),                // 47: tymux.v1.PaneStatus
+	(*SetRestartPolicyRequest)(nil),   // 48: tymux.v1.SetRestartPolicyRequest
+	(*SetRestartPolicyResponse)(nil),  // 49: tymux.v1.SetRestartPolicyResponse
+	(*SetPaneActivityRequest)(nil),    // 50: tymux.v1.SetPaneActivityRequest
+	(*SetPaneActivityResponse)(nil),   // 51: tymux.v1.SetPaneActivityResponse
+	(*GetPaneStatusRequest)(nil),      // 52: tymux.v1.GetPaneStatusRequest
+	(*RestartPaneRequest)(nil),        // 53: tymux.v1.RestartPaneRequest
+	(*StopPaneRequest)(nil),           // 54: tymux.v1.StopPaneRequest
+	(*StartPaneRequest)(nil),          // 55: tymux.v1.StartPaneRequest
+	(*ResetRestartBudgetRequest)(nil), // 56: tymux.v1.ResetRestartBudgetRequest
+	(*LifecycleEvent)(nil),            // 57: tymux.v1.LifecycleEvent
+	nil,                               // 58: tymux.v1.CreateSessionRequest.EnvEntry
 }
 var file_tymux_v1_tymux_proto_depIdxs = []int32{
-	6,  // 0: tymux.v1.Session.windows:type_name -> tymux.v1.Window
+	7,  // 0: tymux.v1.Session.windows:type_name -> tymux.v1.Window
 	0,  // 1: tymux.v1.Session.liveness:type_name -> tymux.v1.Liveness
-	7,  // 2: tymux.v1.Window.layout:type_name -> tymux.v1.Layout
-	10, // 3: tymux.v1.Layout.pane:type_name -> tymux.v1.Pane
-	8,  // 4: tymux.v1.Layout.split:type_name -> tymux.v1.Split
+	8,  // 2: tymux.v1.Window.layout:type_name -> tymux.v1.Layout
+	11, // 3: tymux.v1.Layout.pane:type_name -> tymux.v1.Pane
+	9,  // 4: tymux.v1.Layout.split:type_name -> tymux.v1.Split
 	1,  // 5: tymux.v1.Split.orientation:type_name -> tymux.v1.Orientation
-	9,  // 6: tymux.v1.Split.children:type_name -> tymux.v1.LayoutChild
-	7,  // 7: tymux.v1.LayoutChild.layout:type_name -> tymux.v1.Layout
+	10, // 6: tymux.v1.Split.children:type_name -> tymux.v1.LayoutChild
+	8,  // 7: tymux.v1.LayoutChild.layout:type_name -> tymux.v1.Layout
 	0,  // 8: tymux.v1.Pane.liveness:type_name -> tymux.v1.Liveness
 	2,  // 9: tymux.v1.Pane.state:type_name -> tymux.v1.PaneState
-	55, // 10: tymux.v1.CreateSessionRequest.env:type_name -> tymux.v1.CreateSessionRequest.EnvEntry
-	12, // 11: tymux.v1.CreateSessionRequest.arg_specs:type_name -> tymux.v1.ArgSpec
-	45, // 12: tymux.v1.CreateSessionRequest.restart_policy:type_name -> tymux.v1.RestartPolicy
-	5,  // 13: tymux.v1.ListSessionsResponse.sessions:type_name -> tymux.v1.Session
-	5,  // 14: tymux.v1.ReviveSessionResponse.session:type_name -> tymux.v1.Session
+	58, // 10: tymux.v1.CreateSessionRequest.env:type_name -> tymux.v1.CreateSessionRequest.EnvEntry
+	13, // 11: tymux.v1.CreateSessionRequest.arg_specs:type_name -> tymux.v1.ArgSpec
+	46, // 12: tymux.v1.CreateSessionRequest.restart_policy:type_name -> tymux.v1.RestartPolicy
+	6,  // 13: tymux.v1.ListSessionsResponse.sessions:type_name -> tymux.v1.Session
+	6,  // 14: tymux.v1.ReviveSessionResponse.session:type_name -> tymux.v1.Session
 	1,  // 15: tymux.v1.SplitPaneRequest.orientation:type_name -> tymux.v1.Orientation
-	5,  // 16: tymux.v1.ClosePaneResponse.session:type_name -> tymux.v1.Session
-	7,  // 17: tymux.v1.WindowLayoutEvent.layout:type_name -> tymux.v1.Layout
-	32, // 18: tymux.v1.PaneSnapshot.grid:type_name -> tymux.v1.Row
+	6,  // 16: tymux.v1.ClosePaneResponse.session:type_name -> tymux.v1.Session
+	8,  // 17: tymux.v1.WindowLayoutEvent.layout:type_name -> tymux.v1.Layout
+	33, // 18: tymux.v1.PaneSnapshot.grid:type_name -> tymux.v1.Row
 	0,  // 19: tymux.v1.PaneSnapshot.liveness:type_name -> tymux.v1.Liveness
-	31, // 20: tymux.v1.PaneSnapshot.hyperlinks:type_name -> tymux.v1.Hyperlink
-	29, // 21: tymux.v1.PaneSnapshot.modes:type_name -> tymux.v1.TerminalModes
-	30, // 22: tymux.v1.PaneSnapshot.charsets:type_name -> tymux.v1.Charsets
+	32, // 20: tymux.v1.PaneSnapshot.hyperlinks:type_name -> tymux.v1.Hyperlink
+	30, // 21: tymux.v1.PaneSnapshot.modes:type_name -> tymux.v1.TerminalModes
+	31, // 22: tymux.v1.PaneSnapshot.charsets:type_name -> tymux.v1.Charsets
 	2,  // 23: tymux.v1.PaneSnapshot.state:type_name -> tymux.v1.PaneState
-	33, // 24: tymux.v1.Row.cells:type_name -> tymux.v1.Cell
-	37, // 25: tymux.v1.AttachRequest.resize:type_name -> tymux.v1.Resize
-	28, // 26: tymux.v1.AttachEvent.snapshot:type_name -> tymux.v1.PaneSnapshot
-	38, // 27: tymux.v1.AttachEvent.exited:type_name -> tymux.v1.ExitStatus
-	40, // 28: tymux.v1.AttachEvent.gap_exceeded:type_name -> tymux.v1.GapExceeded
-	41, // 29: tymux.v1.AttachEvent.heartbeat:type_name -> tymux.v1.Heartbeat
-	39, // 30: tymux.v1.AttachEvent.output_chunk:type_name -> tymux.v1.OutputChunk
-	54, // 31: tymux.v1.AttachEvent.lifecycle:type_name -> tymux.v1.LifecycleEvent
+	34, // 24: tymux.v1.Row.cells:type_name -> tymux.v1.Cell
+	38, // 25: tymux.v1.AttachRequest.resize:type_name -> tymux.v1.Resize
+	29, // 26: tymux.v1.AttachEvent.snapshot:type_name -> tymux.v1.PaneSnapshot
+	39, // 27: tymux.v1.AttachEvent.exited:type_name -> tymux.v1.ExitStatus
+	41, // 28: tymux.v1.AttachEvent.gap_exceeded:type_name -> tymux.v1.GapExceeded
+	42, // 29: tymux.v1.AttachEvent.heartbeat:type_name -> tymux.v1.Heartbeat
+	40, // 30: tymux.v1.AttachEvent.output_chunk:type_name -> tymux.v1.OutputChunk
+	57, // 31: tymux.v1.AttachEvent.lifecycle:type_name -> tymux.v1.LifecycleEvent
 	3,  // 32: tymux.v1.RestartPolicy.mode:type_name -> tymux.v1.RestartMode
 	2,  // 33: tymux.v1.PaneStatus.state:type_name -> tymux.v1.PaneState
-	45, // 34: tymux.v1.PaneStatus.policy:type_name -> tymux.v1.RestartPolicy
-	45, // 35: tymux.v1.SetRestartPolicyRequest.policy:type_name -> tymux.v1.RestartPolicy
-	46, // 36: tymux.v1.SetRestartPolicyResponse.status:type_name -> tymux.v1.PaneStatus
-	4,  // 37: tymux.v1.LifecycleEvent.kind:type_name -> tymux.v1.LifecycleEventKind
-	2,  // 38: tymux.v1.LifecycleEvent.state:type_name -> tymux.v1.PaneState
-	43, // 39: tymux.v1.TymuxService.GetServerInfo:input_type -> tymux.v1.GetServerInfoRequest
-	11, // 40: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
-	13, // 41: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
-	15, // 42: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
-	17, // 43: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
-	25, // 44: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
-	26, // 45: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
-	19, // 46: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
-	20, // 47: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
-	22, // 48: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
-	23, // 49: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
-	34, // 50: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
-	35, // 51: tymux.v1.TymuxService.WriteStdin:input_type -> tymux.v1.WriteStdinRequest
-	47, // 52: tymux.v1.TymuxService.SetRestartPolicy:input_type -> tymux.v1.SetRestartPolicyRequest
-	49, // 53: tymux.v1.TymuxService.GetPaneStatus:input_type -> tymux.v1.GetPaneStatusRequest
-	50, // 54: tymux.v1.TymuxService.RestartPane:input_type -> tymux.v1.RestartPaneRequest
-	51, // 55: tymux.v1.TymuxService.StopPane:input_type -> tymux.v1.StopPaneRequest
-	52, // 56: tymux.v1.TymuxService.StartPane:input_type -> tymux.v1.StartPaneRequest
-	53, // 57: tymux.v1.TymuxService.ResetRestartBudget:input_type -> tymux.v1.ResetRestartBudgetRequest
-	44, // 58: tymux.v1.TymuxService.GetServerInfo:output_type -> tymux.v1.ServerInfo
-	5,  // 59: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
-	14, // 60: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
-	16, // 61: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
-	18, // 62: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
-	28, // 63: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
-	27, // 64: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
-	5,  // 65: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
-	21, // 66: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
-	5,  // 67: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
-	24, // 68: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
-	42, // 69: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
-	36, // 70: tymux.v1.TymuxService.WriteStdin:output_type -> tymux.v1.WriteStdinResponse
-	48, // 71: tymux.v1.TymuxService.SetRestartPolicy:output_type -> tymux.v1.SetRestartPolicyResponse
-	46, // 72: tymux.v1.TymuxService.GetPaneStatus:output_type -> tymux.v1.PaneStatus
-	46, // 73: tymux.v1.TymuxService.RestartPane:output_type -> tymux.v1.PaneStatus
-	46, // 74: tymux.v1.TymuxService.StopPane:output_type -> tymux.v1.PaneStatus
-	46, // 75: tymux.v1.TymuxService.StartPane:output_type -> tymux.v1.PaneStatus
-	46, // 76: tymux.v1.TymuxService.ResetRestartBudget:output_type -> tymux.v1.PaneStatus
-	58, // [58:77] is the sub-list for method output_type
-	39, // [39:58] is the sub-list for method input_type
-	39, // [39:39] is the sub-list for extension type_name
-	39, // [39:39] is the sub-list for extension extendee
-	0,  // [0:39] is the sub-list for field type_name
+	46, // 34: tymux.v1.PaneStatus.policy:type_name -> tymux.v1.RestartPolicy
+	46, // 35: tymux.v1.SetRestartPolicyRequest.policy:type_name -> tymux.v1.RestartPolicy
+	47, // 36: tymux.v1.SetRestartPolicyResponse.status:type_name -> tymux.v1.PaneStatus
+	4,  // 37: tymux.v1.SetPaneActivityRequest.activity:type_name -> tymux.v1.PaneActivity
+	5,  // 38: tymux.v1.LifecycleEvent.kind:type_name -> tymux.v1.LifecycleEventKind
+	2,  // 39: tymux.v1.LifecycleEvent.state:type_name -> tymux.v1.PaneState
+	44, // 40: tymux.v1.TymuxService.GetServerInfo:input_type -> tymux.v1.GetServerInfoRequest
+	12, // 41: tymux.v1.TymuxService.CreateSession:input_type -> tymux.v1.CreateSessionRequest
+	14, // 42: tymux.v1.TymuxService.ListSessions:input_type -> tymux.v1.ListSessionsRequest
+	16, // 43: tymux.v1.TymuxService.KillSession:input_type -> tymux.v1.KillSessionRequest
+	18, // 44: tymux.v1.TymuxService.ReviveSession:input_type -> tymux.v1.ReviveSessionRequest
+	26, // 45: tymux.v1.TymuxService.CapturePane:input_type -> tymux.v1.CapturePaneRequest
+	27, // 46: tymux.v1.TymuxService.SearchScrollback:input_type -> tymux.v1.SearchScrollbackRequest
+	20, // 47: tymux.v1.TymuxService.SplitPane:input_type -> tymux.v1.SplitPaneRequest
+	21, // 48: tymux.v1.TymuxService.ClosePane:input_type -> tymux.v1.ClosePaneRequest
+	23, // 49: tymux.v1.TymuxService.CreateWindow:input_type -> tymux.v1.CreateWindowRequest
+	24, // 50: tymux.v1.TymuxService.WatchWindow:input_type -> tymux.v1.WatchWindowRequest
+	35, // 51: tymux.v1.TymuxService.Attach:input_type -> tymux.v1.AttachRequest
+	36, // 52: tymux.v1.TymuxService.WriteStdin:input_type -> tymux.v1.WriteStdinRequest
+	48, // 53: tymux.v1.TymuxService.SetRestartPolicy:input_type -> tymux.v1.SetRestartPolicyRequest
+	52, // 54: tymux.v1.TymuxService.GetPaneStatus:input_type -> tymux.v1.GetPaneStatusRequest
+	50, // 55: tymux.v1.TymuxService.SetPaneActivity:input_type -> tymux.v1.SetPaneActivityRequest
+	53, // 56: tymux.v1.TymuxService.RestartPane:input_type -> tymux.v1.RestartPaneRequest
+	54, // 57: tymux.v1.TymuxService.StopPane:input_type -> tymux.v1.StopPaneRequest
+	55, // 58: tymux.v1.TymuxService.StartPane:input_type -> tymux.v1.StartPaneRequest
+	56, // 59: tymux.v1.TymuxService.ResetRestartBudget:input_type -> tymux.v1.ResetRestartBudgetRequest
+	45, // 60: tymux.v1.TymuxService.GetServerInfo:output_type -> tymux.v1.ServerInfo
+	6,  // 61: tymux.v1.TymuxService.CreateSession:output_type -> tymux.v1.Session
+	15, // 62: tymux.v1.TymuxService.ListSessions:output_type -> tymux.v1.ListSessionsResponse
+	17, // 63: tymux.v1.TymuxService.KillSession:output_type -> tymux.v1.KillSessionResponse
+	19, // 64: tymux.v1.TymuxService.ReviveSession:output_type -> tymux.v1.ReviveSessionResponse
+	29, // 65: tymux.v1.TymuxService.CapturePane:output_type -> tymux.v1.PaneSnapshot
+	28, // 66: tymux.v1.TymuxService.SearchScrollback:output_type -> tymux.v1.SearchScrollbackResponse
+	6,  // 67: tymux.v1.TymuxService.SplitPane:output_type -> tymux.v1.Session
+	22, // 68: tymux.v1.TymuxService.ClosePane:output_type -> tymux.v1.ClosePaneResponse
+	6,  // 69: tymux.v1.TymuxService.CreateWindow:output_type -> tymux.v1.Session
+	25, // 70: tymux.v1.TymuxService.WatchWindow:output_type -> tymux.v1.WindowLayoutEvent
+	43, // 71: tymux.v1.TymuxService.Attach:output_type -> tymux.v1.AttachEvent
+	37, // 72: tymux.v1.TymuxService.WriteStdin:output_type -> tymux.v1.WriteStdinResponse
+	49, // 73: tymux.v1.TymuxService.SetRestartPolicy:output_type -> tymux.v1.SetRestartPolicyResponse
+	47, // 74: tymux.v1.TymuxService.GetPaneStatus:output_type -> tymux.v1.PaneStatus
+	51, // 75: tymux.v1.TymuxService.SetPaneActivity:output_type -> tymux.v1.SetPaneActivityResponse
+	47, // 76: tymux.v1.TymuxService.RestartPane:output_type -> tymux.v1.PaneStatus
+	47, // 77: tymux.v1.TymuxService.StopPane:output_type -> tymux.v1.PaneStatus
+	47, // 78: tymux.v1.TymuxService.StartPane:output_type -> tymux.v1.PaneStatus
+	47, // 79: tymux.v1.TymuxService.ResetRestartBudget:output_type -> tymux.v1.PaneStatus
+	60, // [60:80] is the sub-list for method output_type
+	40, // [40:60] is the sub-list for method input_type
+	40, // [40:40] is the sub-list for extension type_name
+	40, // [40:40] is the sub-list for extension extendee
+	0,  // [0:40] is the sub-list for field type_name
 }
 
 func init() { file_tymux_v1_tymux_proto_init() }
@@ -4567,16 +4718,16 @@ func file_tymux_v1_tymux_proto_init() {
 		(*SetRestartPolicyRequest_PaneId)(nil),
 		(*SetRestartPolicyRequest_SessionId)(nil),
 	}
-	file_tymux_v1_tymux_proto_msgTypes[45].OneofWrappers = []any{}
-	file_tymux_v1_tymux_proto_msgTypes[46].OneofWrappers = []any{}
-	file_tymux_v1_tymux_proto_msgTypes[49].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[47].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[48].OneofWrappers = []any{}
+	file_tymux_v1_tymux_proto_msgTypes[51].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tymux_v1_tymux_proto_rawDesc), len(file_tymux_v1_tymux_proto_rawDesc)),
-			NumEnums:      5,
-			NumMessages:   51,
+			NumEnums:      6,
+			NumMessages:   53,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
