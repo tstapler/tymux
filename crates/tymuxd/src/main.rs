@@ -998,6 +998,31 @@ fn try_recv_as_recv(
 /// cap keeps typing live when the resize is stuck behind a busy pane's parser lock.
 const RESIZE_BARRIER_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Applies one resize on the resize pool, retrying a panicked or cancelled attempt a few times
+/// (a resize is idempotent). If every attempt fails the error is logged and the caller still
+/// releases the keystroke barrier, so typing is not delayed by 50 ms forever; the pane then keeps
+/// its old size until the client's next resize.
+async fn apply_resize_with_retry<A>(pools: &Pools, apply: &Arc<A>, rows: u16, cols: u16)
+where
+    A: Fn(u16, u16) + Send + Sync + 'static,
+{
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let apply = apply.clone();
+        match pools
+            .run_must_land(Class::Resize, move || apply(rows, cols))
+            .await
+        {
+            Ok(()) => return,
+            Err(e) => tracing::error!(
+                rows, cols, attempt, error = ?e,
+                "resize failed on the pool; retrying"
+            ),
+        }
+    }
+    tracing::error!(rows, cols, "resize abandoned after repeated failures");
+}
+
 /// Applies a stream's resizes off the input path with latest-wins coalescing, and lets the input
 /// path wait for the ones it already sent.
 struct ResizeLane {
@@ -1019,11 +1044,7 @@ impl ResizeLane {
             while request_rx.changed().await.is_ok() {
                 let (generation, size) = *request_rx.borrow_and_update();
                 if let Some((rows, cols)) = size {
-                    let apply = apply.clone();
-                    let apply = apply.clone();
-                    let _ = pools
-                        .run_must_land(Class::Resize, move || apply(rows, cols))
-                        .await;
+                    apply_resize_with_retry(&pools, &apply, rows, cols).await;
                 }
                 applied_tx.send_replace(generation);
             }
@@ -1165,6 +1186,8 @@ impl TymuxService for TymuxDaemon {
                     wait_micros_max: c.wait_micros_max,
                     run_micros_total: c.run_micros_total,
                     run_micros_max: c.run_micros_max,
+                    overflowed: c.overflowed,
+                    running: c.running,
                 })
                 .collect(),
             slow_polls: [
@@ -1534,7 +1557,11 @@ impl TymuxService for TymuxDaemon {
     ) -> Result<Response<SetPaneActivityResponse>, Status> {
         let req = request.into_inner();
         let pane = resolve_attachable_pane(&self.engine, parse_uuid(&req.pane_id)?)?;
-        pane.set_activity(activity_from_proto(req.activity));
+        if !pane.set_activity(activity_from_proto(req.activity)) {
+            return Err(Status::failed_precondition(
+                "SetPaneActivity needs an open Attach stream on the pane",
+            ));
+        }
         Ok(Response::new(SetPaneActivityResponse {}))
     }
 
@@ -4253,6 +4280,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resize_lane_should_retry_a_panicking_resize_and_only_then_release_the_barrier() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (mut lane, _task) = ResizeLane::spawn(shared_pools(), move |_, _| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("first attempt fails");
+            }
+        });
+        lane.request(30, 100);
+        lane.barrier(Duration::from_secs(5)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one panic, then the retry that landed"
+        );
+    }
+
+    #[tokio::test]
     async fn resize_lane_barrier_should_not_wait_when_nothing_was_requested() {
         let (lane, _task) = ResizeLane::spawn(shared_pools(), |_, _| panic!("no resize requested"));
         lane.barrier(Duration::from_millis(1)).await;
@@ -4388,17 +4433,26 @@ mod tests {
             .unwrap()
             .into_inner();
         let pane_id = sole_pane(&session.windows[0]).id.clone();
-        daemon
-            .set_pane_activity(Request::new(SetPaneActivityRequest {
-                pane_id: pane_id.clone(),
-                activity: ProtoPaneActivity::Background as i32,
-            }))
-            .await
-            .unwrap();
         let pane = match daemon.engine.pane_lookup(parse_uuid(&pane_id).unwrap()) {
             PaneLookup::Live(p) => p,
             _ => panic!("pane must be live"),
         };
+        let hint = |activity: ProtoPaneActivity| SetPaneActivityRequest {
+            pane_id: pane_id.clone(),
+            activity: activity as i32,
+        };
+        let no_stream = daemon
+            .set_pane_activity(Request::new(hint(ProtoPaneActivity::Background)))
+            .await
+            .unwrap_err();
+        assert_eq!(no_stream.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(pane.activity(), PaneActivity::Normal);
+
+        let _ticket = pane.begin_attach();
+        daemon
+            .set_pane_activity(Request::new(hint(ProtoPaneActivity::Background)))
+            .await
+            .unwrap();
         assert_eq!(pane.activity(), PaneActivity::Background);
         let err = daemon
             .set_pane_activity(Request::new(SetPaneActivityRequest {
@@ -4408,6 +4462,46 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// A reconnect that overlaps the old stream keeps the new client's hint; only the last
+    /// stream ending, or the first one starting, resets it.
+    #[tokio::test]
+    async fn activity_hint_should_follow_the_open_stream_count_across_overlapping_reconnects() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let pane = match daemon.engine.pane_lookup(parse_uuid(&pane_id).unwrap()) {
+            PaneLookup::Live(p) => p,
+            _ => panic!("pane must be live"),
+        };
+        let old = pane.begin_attach();
+        assert!(pane.set_activity(PaneActivity::Background));
+        // The client reconnects before the daemon notices the old stream died.
+        let new = pane.begin_attach();
+        assert!(pane.set_activity(PaneActivity::Background));
+        drop(old);
+        assert_eq!(
+            pane.activity(),
+            PaneActivity::Background,
+            "the new stream's hint survives"
+        );
+        drop(new);
+        assert_eq!(pane.activity(), PaneActivity::Normal);
+        assert!(
+            !pane.set_activity(PaneActivity::Background),
+            "no stream, no hint"
+        );
+        let _first = pane.begin_attach();
+        assert_eq!(
+            pane.activity(),
+            PaneActivity::Normal,
+            "a first stream starts from Normal"
+        );
     }
 
     /// Story 2.2.1 AC2 / REQ-4 / Task 2.2.1c: a live chunk whose seq is

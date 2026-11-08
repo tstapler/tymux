@@ -59,6 +59,10 @@ pub enum PoolError {
 #[derive(Default)]
 struct ClassStats {
     queue_depth: AtomicUsize,
+    /// Jobs currently executing on a pool thread.
+    running: AtomicUsize,
+    /// Must-land jobs sent to tokio's blocking pool because every pool thread was busy.
+    overflowed: AtomicU64,
     submitted: AtomicU64,
     completed: AtomicU64,
     skipped_cancelled: AtomicU64,
@@ -81,6 +85,8 @@ pub struct ClassSnapshot {
     pub skipped_cancelled: u64,
     pub panicked: u64,
     pub rejected: u64,
+    pub overflowed: u64,
+    pub running: u64,
     pub wait_micros_total: u64,
     pub wait_micros_max: u64,
     pub run_micros_total: u64,
@@ -200,7 +206,14 @@ impl Pools {
         let cp = self.class_pool(class);
         let stats = cp.stats.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let admitted = if stats.queue_depth.fetch_add(1, Ordering::SeqCst) < cp.queue_limit {
+        let limit = cp.queue_limit;
+        let admitted = if stats
+            .queue_depth
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
+                (d < limit).then_some(d + 1)
+            })
+            .is_ok()
+        {
             stats.submitted.fetch_add(1, Ordering::Relaxed);
             let submitted_at = Instant::now();
             cp.pool.spawn(move || {
@@ -215,7 +228,9 @@ impl Pools {
                     submitted_at.elapsed(),
                 );
                 let started = Instant::now();
+                stats.running.fetch_add(1, Ordering::SeqCst);
                 let outcome = catch_unwind(AssertUnwindSafe(job));
+                stats.running.fetch_sub(1, Ordering::SeqCst);
                 record_max(
                     &stats.run_micros_total,
                     &stats.run_micros_max,
@@ -234,7 +249,6 @@ impl Pools {
             });
             true
         } else {
-            stats.queue_depth.fetch_sub(1, Ordering::SeqCst);
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             false
         };
@@ -246,13 +260,25 @@ impl Pools {
         })
     }
 
-    /// Like [`Pools::run`] for work that must not be dropped (keystrokes, resizes): a full queue
-    /// is waited out with a short backoff, which backpressures the caller, instead of rejected.
+    /// Like [`Pools::run`] for work that must not be dropped (keystrokes, resizes). A full queue
+    /// is waited out with a short backoff (backpressure) instead of rejected. When every pool
+    /// thread is busy (stalled panes park threads in uninterruptible writes), the job goes to
+    /// tokio's much larger blocking pool instead of queueing behind them, so a healthy pane is
+    /// never starved by stalled ones.
     pub async fn run_must_land<T, F>(&self, class: Class, job: F) -> Result<T, PoolError>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + Clone + 'static,
     {
+        let cp = self.class_pool(class);
+        let busy =
+            cp.stats.running.load(Ordering::SeqCst) + cp.stats.queue_depth.load(Ordering::SeqCst);
+        if busy >= cp.threads {
+            cp.stats.overflowed.fetch_add(1, Ordering::Relaxed);
+            return tokio::task::spawn_blocking(job)
+                .await
+                .map_err(|_| PoolError::Panicked);
+        }
         loop {
             match self.run(class, job.clone()).await {
                 Err(PoolError::Rejected) => tokio::time::sleep(Duration::from_millis(5)).await,
@@ -276,6 +302,8 @@ impl Pools {
                     skipped_cancelled: s.skipped_cancelled.load(Ordering::Relaxed),
                     panicked: s.panicked.load(Ordering::Relaxed),
                     rejected: s.rejected.load(Ordering::Relaxed),
+                    overflowed: s.overflowed.load(Ordering::Relaxed),
+                    running: s.running.load(Ordering::Relaxed) as u64,
                     wait_micros_total: s.wait_micros_total.load(Ordering::Relaxed),
                     wait_micros_max: s.wait_micros_max.load(Ordering::Relaxed),
                     run_micros_total: s.run_micros_total.load(Ordering::Relaxed),
@@ -498,39 +526,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_must_land_should_wait_out_a_full_queue_instead_of_dropping_the_job() {
+    async fn stalled_panes_should_not_starve_a_healthy_pane_of_input_threads() {
         let pools = Arc::new(Pools::new(PoolConfig {
-            input_threads: 1,
+            input_threads: 2,
             resize_threads: 1,
             work_threads: 1,
-            queue_limit: 1,
+            queue_limit: 64,
         }));
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let release_rx = Mutex::new(release_rx);
-        let blocker = pools.run(Class::Input, move || {
-            let _ = release_rx.lock().unwrap().recv();
-        });
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        // Two stalled panes park both input threads in uninterruptible "writes".
+        let stalled: Vec<_> = (0..2)
+            .map(|_| {
+                let rx = release_rx.clone();
+                pools.run(Class::Input, move || {
+                    let _ = rx.lock().unwrap().recv();
+                })
+            })
+            .collect();
         while pools
             .snapshot()
             .iter()
-            .any(|s| s.class == "input" && s.queue_depth > 0)
+            .any(|s| s.class == "input" && s.running < 2)
         {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let filler = pools.run(Class::Input, || ());
-        let waiting = tokio::spawn({
-            let pools = pools.clone();
-            async move { pools.run_must_land(Class::Input, || 9).await }
-        });
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(
-            !waiting.is_finished(),
-            "the job must wait while the queue is full"
-        );
-        release_tx.send(()).unwrap();
-        blocker.await.unwrap();
-        filler.await.unwrap();
-        assert_eq!(waiting.await.unwrap(), Ok(9));
+        let started = Instant::now();
+        pools.run_must_land(Class::Input, || ()).await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let input = pools
+            .snapshot()
+            .into_iter()
+            .find(|s| s.class == "input")
+            .unwrap();
+        assert_eq!(input.overflowed, 1);
+        drop(release_tx);
+        drop(stalled);
     }
 
     /// The point of the split: input stays fast while slow work is queued, and the negative

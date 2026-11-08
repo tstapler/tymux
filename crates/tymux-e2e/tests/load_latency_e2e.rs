@@ -164,6 +164,9 @@ async fn run_config(p: &Params) {
             &["-c", NOISY_SCRIPTS[i % NOISY_SCRIPTS.len()]],
         )
         .await;
+        // Standing attach with a draining reader, like the squad's standing streams.
+        let (tx, mut rx) = attach(&mut client, &id).await;
+        // The hint applies only while a stream is open, so send it after attaching.
         if p.activity_hint {
             let _ = client
                 .set_pane_activity(SetPaneActivityRequest {
@@ -172,14 +175,13 @@ async fn run_config(p: &Params) {
                 })
                 .await;
         }
-        // Standing attach with a draining reader, like the squad's standing streams.
-        let (tx, mut rx) = attach(&mut client, &id).await;
         _drains.push(tx);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         noisy_ids.push(id);
     }
 
     let probe = create(&mut client, "probe", "/bin/cat", &[]).await;
+    let (probe_tx, mut probe_rx) = attach(&mut client, &probe).await;
     if p.activity_hint {
         let _ = client
             .set_pane_activity(SetPaneActivityRequest {
@@ -188,7 +190,6 @@ async fn run_config(p: &Params) {
             })
             .await;
     }
-    let (probe_tx, mut probe_rx) = attach(&mut client, &probe).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     while probe_rx.try_recv().is_ok() {}
 

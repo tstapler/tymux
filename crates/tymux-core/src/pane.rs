@@ -96,8 +96,12 @@ pub struct AttachTicket(Arc<Pane>);
 
 impl Drop for AttachTicket {
     fn drop(&mut self) {
-        if self.0.attach_count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.set_activity(PaneActivity::Normal);
+        let mut count = self.0.attach_count.lock().unwrap();
+        *count -= 1;
+        if *count == 0 {
+            self.0
+                .activity
+                .store(PaneActivity::Normal as u8, Ordering::Relaxed);
         }
     }
 }
@@ -177,8 +181,9 @@ pub struct Pane {
     cols: AtomicU32,
     /// Client-declared [`PaneActivity`], read by each Attach stream to pick its flush cadence.
     activity: AtomicU8,
-    /// Open Attach streams; the activity hint resets to Normal when the last one ends.
-    attach_count: AtomicUsize,
+    /// Open Attach streams. Guarded together with every write to `activity` so a hint can never
+    /// be applied to, or survive past, a stream count it does not belong to.
+    attach_count: Mutex<usize>,
     /// This pane's granted share of `GLOBAL_SCROLLBACK_BUDGET_LINES` —
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
@@ -504,7 +509,7 @@ impl Pane {
             rows: AtomicU32::new(rows as u32),
             cols: AtomicU32::new(cols as u32),
             activity: AtomicU8::new(PaneActivity::Normal as u8),
-            attach_count: AtomicUsize::new(0),
+            attach_count: Mutex::new(0),
             scrollback_lines,
             replay: Mutex::new(replay_buffer),
             replay_budget_bytes,
@@ -993,11 +998,17 @@ impl Pane {
         Ok(())
     }
 
-    /// Registers one open Attach stream. Dropping the ticket of the last stream clears the
-    /// activity hint, so a client that died after marking a pane Background cannot leave it
-    /// batching; a client must re-assert its hint after reconnecting.
+    /// Registers one open Attach stream. A pane with no open stream is always Normal: the first
+    /// stream starts from Normal and dropping the last ticket resets to it, so a client that died
+    /// after marking a pane Background cannot leave it batching. A client must send its hint after
+    /// its stream is open, and again after reconnecting.
     pub fn begin_attach(self: &Arc<Self>) -> AttachTicket {
-        self.attach_count.fetch_add(1, Ordering::SeqCst);
+        let mut count = self.attach_count.lock().unwrap();
+        if *count == 0 {
+            self.activity
+                .store(PaneActivity::Normal as u8, Ordering::Relaxed);
+        }
+        *count += 1;
         AttachTicket(self.clone())
     }
 
@@ -1008,8 +1019,15 @@ impl Pane {
         self.parser.lock().unwrap()
     }
 
-    pub fn set_activity(&self, activity: PaneActivity) {
+    /// Stores the hint, but only while at least one Attach stream is open (see
+    /// [`Pane::begin_attach`]); with none open it is ignored and returns false.
+    pub fn set_activity(&self, activity: PaneActivity) -> bool {
+        let count = self.attach_count.lock().unwrap();
+        if *count == 0 {
+            return false;
+        }
         self.activity.store(activity as u8, Ordering::Relaxed);
+        true
     }
 
     pub fn activity(&self) -> PaneActivity {

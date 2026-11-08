@@ -145,9 +145,9 @@ service TymuxService {
   // UNSPECIFIED and INTERACTIVE panes flush output immediately (INTERACTIVE is reserved for a
   // future distinction); BACKGROUND panes batch it for a short window, trading a few tens of
   // milliseconds of latency for far fewer frames. The hint is advisory, per pane (not per
-  // client), not persisted, and cleared when the pane's last Attach stream ends, so re-send it
-  // after reconnecting. Unknown
-  // pane: NOT_FOUND.
+  // client), not persisted. It applies only while an Attach stream is open on the pane (none
+  // open: FAILED_PRECONDITION) and resets to normal when the last stream ends, so send it after
+  // attaching and again after reconnecting. Unknown pane: NOT_FOUND.
   rpc SetPaneActivity(SetPaneActivityRequest) returns (SetPaneActivityResponse);
   // Replaces the pane's process now: a running one gets SIGTERM (SIGKILL after grace) and is
   // respawned once it exits; a dead one (any state, including STOPPED and FAILED) is respawned
@@ -658,6 +658,10 @@ message WorkPoolStats {
   uint64 wait_micros_max = 10;
   uint64 run_micros_total = 11;
   uint64 run_micros_max = 12;
+  // Jobs running on a pool thread now, and must-land jobs sent to tokio's blocking pool because
+  // every pool thread was busy (stalled panes).
+  uint64 running = 13;
+  uint64 overflowed = 14;
 }
 
 // Poll-time counters for one async task class. A slow poll (default over 10 ms,

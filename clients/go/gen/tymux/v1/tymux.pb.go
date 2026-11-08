@@ -3358,8 +3358,12 @@ type WorkPoolStats struct {
 	WaitMicrosMax    uint64                 `protobuf:"varint,10,opt,name=wait_micros_max,json=waitMicrosMax,proto3" json:"wait_micros_max,omitempty"`
 	RunMicrosTotal   uint64                 `protobuf:"varint,11,opt,name=run_micros_total,json=runMicrosTotal,proto3" json:"run_micros_total,omitempty"`
 	RunMicrosMax     uint64                 `protobuf:"varint,12,opt,name=run_micros_max,json=runMicrosMax,proto3" json:"run_micros_max,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Jobs running on a pool thread now, and must-land jobs sent to tokio's blocking pool because
+	// every pool thread was busy (stalled panes).
+	Running       uint64 `protobuf:"varint,13,opt,name=running,proto3" json:"running,omitempty"`
+	Overflowed    uint64 `protobuf:"varint,14,opt,name=overflowed,proto3" json:"overflowed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WorkPoolStats) Reset() {
@@ -3472,6 +3476,20 @@ func (x *WorkPoolStats) GetRunMicrosTotal() uint64 {
 func (x *WorkPoolStats) GetRunMicrosMax() uint64 {
 	if x != nil {
 		return x.RunMicrosMax
+	}
+	return 0
+}
+
+func (x *WorkPoolStats) GetRunning() uint64 {
+	if x != nil {
+		return x.Running
+	}
+	return 0
+}
+
+func (x *WorkPoolStats) GetOverflowed() uint64 {
+	if x != nil {
+		return x.Overflowed
 	}
 	return 0
 }
@@ -4642,7 +4660,7 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"work_pools\x18\t \x03(\v2\x17.tymux.v1.WorkPoolStatsR\tworkPools\x126\n" +
 	"\n" +
 	"slow_polls\x18\n" +
-	" \x03(\v2\x17.tymux.v1.SlowPollStatsR\tslowPolls\"\xa5\x03\n" +
+	" \x03(\v2\x17.tymux.v1.SlowPollStatsR\tslowPolls\"\xdf\x03\n" +
 	"\rWorkPoolStats\x12\x14\n" +
 	"\x05class\x18\x01 \x01(\tR\x05class\x12\x18\n" +
 	"\athreads\x18\x02 \x01(\rR\athreads\x12\x1f\n" +
@@ -4657,7 +4675,11 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x0fwait_micros_max\x18\n" +
 	" \x01(\x04R\rwaitMicrosMax\x12(\n" +
 	"\x10run_micros_total\x18\v \x01(\x04R\x0erunMicrosTotal\x12$\n" +
-	"\x0erun_micros_max\x18\f \x01(\x04R\frunMicrosMax\"\xb7\x01\n" +
+	"\x0erun_micros_max\x18\f \x01(\x04R\frunMicrosMax\x12\x18\n" +
+	"\arunning\x18\r \x01(\x04R\arunning\x12\x1e\n" +
+	"\n" +
+	"overflowed\x18\x0e \x01(\x04R\n" +
+	"overflowed\"\xb7\x01\n" +
 	"\rSlowPollStats\x12\x1d\n" +
 	"\n" +
 	"task_class\x18\x01 \x01(\tR\ttaskClass\x12\x14\n" +
