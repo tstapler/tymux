@@ -437,3 +437,19 @@ func TestCancelledReprobeDoesNotClobberNewerSchedule(t *testing.T) {
 		t.Fatal("probe ran inside the newer backoff window: claim restore clobbered it")
 	}
 }
+
+func TestSetPaneActivityGoesThroughTheSelectedTransport(t *testing.T) {
+	t.Parallel()
+	r := newRig(Options{})
+	_, err := r.c.SetPaneActivity(context.Background(), connect.NewRequest(&v1.SetPaneActivityRequest{
+		PaneId: "p", Activity: v1.PaneActivity_PANE_ACTIVITY_BACKGROUND,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.unix.mu.Lock()
+	defer r.unix.mu.Unlock()
+	if len(r.unix.activity) != 1 || r.unix.activity[0] != v1.PaneActivity_PANE_ACTIVITY_BACKGROUND {
+		t.Fatalf("unix transport saw %v", r.unix.activity)
+	}
+}

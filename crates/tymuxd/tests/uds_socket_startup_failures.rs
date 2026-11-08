@@ -5,6 +5,7 @@
 //! spawning either. Mirrors `daemon_startup.rs`'s real-subprocess pattern
 //! (spawn the actual `tymuxd` binary via `CARGO_BIN_EXE_tymuxd`), but
 //! asserts on exit status/stderr rather than a successful `ListSessions`.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::path::Path;
 use std::process::{Command, Output};

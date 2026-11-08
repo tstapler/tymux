@@ -23,6 +23,7 @@ type fakeTransport struct {
 	listCalls  int
 	infoHook   func(ctx context.Context) error // overrides infoErr when set
 	attachWith func(ctx context.Context) AttachStream
+	activity   []v1.PaneActivity
 }
 
 func (f *fakeTransport) GetServerInfo(ctx context.Context, _ *connect.Request[v1.GetServerInfoRequest]) (*connect.Response[v1.ServerInfo], error) {
@@ -48,6 +49,13 @@ func (f *fakeTransport) ListSessions(context.Context, *connect.Request[v1.ListSe
 		return nil, err
 	}
 	return connect.NewResponse(&v1.ListSessionsResponse{}), nil
+}
+
+func (f *fakeTransport) SetPaneActivity(_ context.Context, r *connect.Request[v1.SetPaneActivityRequest]) (*connect.Response[v1.SetPaneActivityResponse], error) {
+	f.mu.Lock()
+	f.activity = append(f.activity, r.Msg.GetActivity())
+	f.mu.Unlock()
+	return connect.NewResponse(&v1.SetPaneActivityResponse{}), nil
 }
 
 func (f *fakeTransport) Attach(ctx context.Context) AttachStream { return f.attachWith(ctx) }

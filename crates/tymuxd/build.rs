@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // a build script may block
 use std::path::Path;
 use std::process::Command;
 

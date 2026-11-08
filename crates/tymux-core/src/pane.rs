@@ -3,7 +3,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 #[cfg(not(unix))]
@@ -70,8 +70,9 @@ fn release_scrollback_budget(lines: usize) {
     GLOBAL_SCROLLBACK_USED_LINES.fetch_sub(lines, Ordering::Relaxed);
 }
 
-/// How urgently a client wants a pane's output: an `Interactive` pane flushes immediately, a
-/// `Background` pane batches output for a short window, `Normal` is the unhinted default.
+/// How urgently a client wants a pane's output: `Normal` and `Interactive` panes flush
+/// immediately (`Interactive` is reserved for a future distinction), a `Background` pane batches
+/// output for a short window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PaneActivity {
@@ -90,10 +91,36 @@ impl PaneActivity {
     }
 }
 
+/// How long a hint sent before any Attach stream is open waits for the stream that follows it.
+const PENDING_HINT_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct AttachState {
+    count: usize,
+    /// A hint that arrived with no stream open, applied if a stream opens within the TTL.
+    pending: Option<(PaneActivity, Instant)>,
+}
+
+/// See [`Pane::begin_attach`].
+pub struct AttachTicket(Arc<Pane>);
+
+impl Drop for AttachTicket {
+    fn drop(&mut self) {
+        let mut state = self.0.attach.lock().unwrap();
+        state.count -= 1;
+        if state.count == 0 {
+            self.0
+                .activity
+                .store(PaneActivity::Normal as u8, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Read chunk size for the pty output thread. Program output (e.g. `ls
 /// -la`, `cat` on a big file) comes in much chunkier bursts than a human's
 /// keystrokes, so this is deliberately larger than tymux-cli's 1024-byte
-/// stdin-forwarding buffer.
+/// stdin-forwarding buffer. It also sets the ring's worst case: `OUTPUT_CHANNEL_CAPACITY` reads
+/// of this size (about 32 MiB per pane) stay retained for a pane that has been flooded.
 const PTY_READ_BUF_SIZE: usize = 32 * 1024;
 /// How long the reader waits for pty data before re-checking for a handoff freeze; bounds the
 /// freeze latency, and idle cost is one `poll` per pane per interval.
@@ -164,6 +191,9 @@ pub struct Pane {
     cols: AtomicU32,
     /// Client-declared [`PaneActivity`], read by each Attach stream to pick its flush cadence.
     activity: AtomicU8,
+    /// Open Attach streams. Guarded together with every write to `activity` so a hint can never
+    /// be applied to, or survive past, a stream count it does not belong to.
+    attach: Mutex<AttachState>,
     /// This pane's granted share of `GLOBAL_SCROLLBACK_BUDGET_LINES` —
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
@@ -489,6 +519,7 @@ impl Pane {
             rows: AtomicU32::new(rows as u32),
             cols: AtomicU32::new(cols as u32),
             activity: AtomicU8::new(PaneActivity::Normal as u8),
+            attach: Mutex::new(AttachState::default()),
             scrollback_lines,
             replay: Mutex::new(replay_buffer),
             replay_budget_bytes,
@@ -977,8 +1008,41 @@ impl Pane {
         Ok(())
     }
 
-    pub fn set_activity(&self, activity: PaneActivity) {
+    /// Registers one open Attach stream. A pane with no open stream is always Normal: the first
+    /// stream starts from Normal (or from a hint sent just before it, see [`Pane::set_activity`])
+    /// and dropping the last ticket resets to Normal, so a client that died after marking a pane
+    /// Background cannot leave it batching. A client re-sends its hint after reconnecting.
+    pub fn begin_attach(self: &Arc<Self>) -> AttachTicket {
+        let mut state = self.attach.lock().unwrap();
+        if state.count == 0 {
+            let start = match state.pending.take() {
+                Some((hint, at)) if at.elapsed() <= PENDING_HINT_TTL => hint,
+                _ => PaneActivity::Normal,
+            };
+            self.activity.store(start as u8, Ordering::Relaxed);
+        }
+        state.count += 1;
+        AttachTicket(self.clone())
+    }
+
+    /// Holds the pane's grid lock until the returned guard drops. Test support for simulating a
+    /// pane whose parser a busy reader keeps locked.
+    #[doc(hidden)]
+    pub fn hold_grid_lock_for_test(&self) -> impl Sized + '_ {
+        self.parser.lock().unwrap()
+    }
+
+    /// Stores the hint. With a stream open it takes effect now; with none it is held for up to
+    /// five seconds and applied when the next stream opens (a client may send it before it has
+    /// seen its attach complete). Returns whether it took effect immediately.
+    pub fn set_activity(&self, activity: PaneActivity) -> bool {
+        let mut state = self.attach.lock().unwrap();
+        if state.count == 0 {
+            state.pending = Some((activity, Instant::now()));
+            return false;
+        }
         self.activity.store(activity as u8, Ordering::Relaxed);
+        true
     }
 
     pub fn activity(&self) -> PaneActivity {
@@ -1099,7 +1163,7 @@ impl Pane {
         self.snapshot_at_offset_with_seq(0)
     }
 
-    fn snapshot_at_offset_with_seq(&self, offset: usize) -> (PaneSnapshot, u64) {
+    pub fn snapshot_at_offset_with_seq(&self, offset: usize) -> (PaneSnapshot, u64) {
         let mut parser = self.parser.lock().unwrap();
         parser.screen_mut().set_scrollback(offset);
         let snapshot = snapshot_from_screen(parser.screen());

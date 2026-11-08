@@ -118,6 +118,7 @@ pub fn nofile_soft_limit() -> u64 {
 }
 
 /// Number of fds this process holds open, or 0 if `/dev/fd` cannot be listed.
+#[allow(clippy::disallowed_methods)] // called through spawn_blocking (read_dir on /dev/fd blocks)
 pub fn open_fd_count() -> u64 {
     // /dev/fd is a directory on macOS and a symlink to /proc/self/fd on Linux.
     match std::fs::read_dir("/dev/fd") {

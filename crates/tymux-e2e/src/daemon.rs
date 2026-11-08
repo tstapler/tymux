@@ -341,6 +341,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -368,6 +369,7 @@ mod tests {
             )),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -389,6 +391,7 @@ mod tests {
                 .unwrap();
             if let Some(AttachEvent {
                 payload: Some(attach_event::Payload::Output(bytes)),
+                ..
             }) = event
             {
                 streamed.extend_from_slice(&bytes);

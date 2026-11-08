@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file tymux/v1/tymux.proto.
  */
 export const file_tymux_v1_tymux: GenFile = /*@__PURE__*/
-  fileDesc("ChR0eW11eC92MS90eW11eC5wcm90bxIIdHltdXgudjEibAoHU2Vzc2lvbhIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiEKB3dpbmRvd3MYAyADKAsyEC50eW11eC52MS5XaW5kb3cSJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcyJECgZXaW5kb3cSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIgCgZsYXlvdXQYAyABKAsyEC50eW11eC52MS5MYXlvdXQiUgoGTGF5b3V0Eh4KBHBhbmUYASABKAsyDi50eW11eC52MS5QYW5lSAASIAoFc3BsaXQYAiABKAsyDy50eW11eC52MS5TcGxpdEgAQgYKBG5vZGUiXAoFU3BsaXQSKgoLb3JpZW50YXRpb24YASABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhInCghjaGlsZHJlbhgCIAMoCzIVLnR5bXV4LnYxLkxheW91dENoaWxkIj4KC0xheW91dENoaWxkEiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBINCgVyYXRpbxgCIAEoAiKFAQoEUGFuZRIKCgJpZBgBIAEoCRIMCgRyb3dzGAIgASgNEgwKBGNvbHMYAyABKA0SJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcxILCgNjd2QYBSABKAkSIgoFc3RhdGUYBiABKA4yEy50eW11eC52MS5QYW5lU3RhdGUiyAIKFENyZWF0ZVNlc3Npb25SZXF1ZXN0EgwKBG5hbWUYASABKAkSDwoHY29tbWFuZBgCIAEoCRILCgNjd2QYAyABKAkSDAoEYXJncxgEIAMoCRI0CgNlbnYYBSADKAsyJy50eW11eC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdC5FbnZFbnRyeRITCgtzdGRlcnJfcGF0aBgGIAEoCRIkCglhcmdfc3BlY3MYByADKAsyES50eW11eC52MS5BcmdTcGVjEhIKCnN0ZGluX3BhdGgYCCABKAkSFAoMc3RkaW5fc3RyZWFtGAkgASgIEi8KDnJlc3RhcnRfcG9saWN5GAogASgLMhcudHltdXgudjEuUmVzdGFydFBvbGljeRoqCghFbnZFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIkQKB0FyZ1NwZWMSEQoHbGl0ZXJhbBgBIAEoCUgAEhwKEmZpbGVfY29udGVudHNfcGF0aBgCIAEoCUgAQggKBnNvdXJjZSIVChNMaXN0U2Vzc2lvbnNSZXF1ZXN0IjsKFExpc3RTZXNzaW9uc1Jlc3BvbnNlEiMKCHNlc3Npb25zGAEgAygLMhEudHltdXgudjEuU2Vzc2lvbiIoChJLaWxsU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSIVChNLaWxsU2Vzc2lvblJlc3BvbnNlIioKFFJldml2ZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiZQoVUmV2aXZlU2Vzc2lvblJlc3BvbnNlEhQKDGFscmVhZHlfbGl2ZRgBIAEoCBISCgpwYW5lX2NvdW50GAIgASgNEiIKB3Nlc3Npb24YAyABKAsyES50eW11eC52MS5TZXNzaW9uImAKEFNwbGl0UGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIqCgtvcmllbnRhdGlvbhgCIAEoDjIVLnR5bXV4LnYxLk9yaWVudGF0aW9uEg8KB2NvbW1hbmQYAyABKAkiIwoQQ2xvc2VQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJIqUBChFDbG9zZVBhbmVSZXNwb25zZRIYChB3aW5kb3dfY2xvc2VkX2lkGAEgASgJEhoKEndpbmRvd19jbG9zZWRfbmFtZRgCIAEoCRIZChFzZXNzaW9uX2Nsb3NlZF9pZBgDIAEoCRIbChNzZXNzaW9uX2Nsb3NlZF9uYW1lGAQgASgJEiIKB3Nlc3Npb24YBSABKAsyES50eW11eC52MS5TZXNzaW9uIjoKE0NyZWF0ZVdpbmRvd1JlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIPCgdjb21tYW5kGAIgASgJIicKEldhdGNoV2luZG93UmVxdWVzdBIRCgl3aW5kb3dfaWQYASABKAkiVAoRV2luZG93TGF5b3V0RXZlbnQSIAoGbGF5b3V0GAEgASgLMhAudHltdXgudjEuTGF5b3V0Eh0KFWF0dGFjaGVkX2NsaWVudF9jb3VudBgCIAEoDSJAChJDYXB0dXJlUGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIZChFzY3JvbGxiYWNrX29mZnNldBgCIAEoDSJRChdTZWFyY2hTY3JvbGxiYWNrUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEg8KB3BhdHRlcm4YAiABKAkSFAoMc3RhcnRfb2Zmc2V0GAMgASgNIkcKGFNlYXJjaFNjcm9sbGJhY2tSZXNwb25zZRINCgVmb3VuZBgBIAEoCBIOCgZvZmZzZXQYAiABKA0SDAoEbGluZRgDIAEoCSKSBAoMUGFuZVNuYXBzaG90Eg8KB3BhbmVfaWQYASABKAkSDAoEcm93cxgCIAEoDRIMCgRjb2xzGAMgASgNEhsKBGdyaWQYBCADKAsyDS50eW11eC52MS5Sb3cSEgoKY3Vyc29yX3JvdxgFIAEoDRISCgpjdXJzb3JfY29sGAYgASgNEiQKCGxpdmVuZXNzGAcgASgOMhIudHltdXgudjEuTGl2ZW5lc3MSJwoKaHlwZXJsaW5rcxgIIAMoCzITLnR5bXV4LnYxLkh5cGVybGluaxINCgV0aXRsZRgJIAEoCRImCgVtb2RlcxgKIAEoCzIXLnR5bXV4LnYxLlRlcm1pbmFsTW9kZXMSFQoNY3Vyc29yX2hpZGRlbhgLIAEoCBIUCgxjdXJzb3Jfc3R5bGUYDCABKA0SEgoKYWx0X3NjcmVlbhgNIAEoCBISCgpzY3JvbGxfdG9wGA4gASgNEhUKDXNjcm9sbF9ib3R0b20YDyABKA0SEQoJdGFiX3N0b3BzGBAgAygNEiQKCGNoYXJzZXRzGBEgASgLMhIudHltdXgudjEuQ2hhcnNldHMSGwoTY3Vyc29yX3BlbmRpbmdfd3JhcBgSIAEoCBIiCgVzdGF0ZRgUIAEoDjITLnR5bXV4LnYxLlBhbmVTdGF0ZRIWCglleGl0X2NvZGUYEyABKAVIAIgBAUIMCgpfZXhpdF9jb2RlIvQBCg1UZXJtaW5hbE1vZGVzEhcKD2FwcF9jdXJzb3Jfa2V5cxgBIAEoCBISCgphcHBfa2V5cGFkGAIgASgIEhcKD2JyYWNrZXRlZF9wYXN0ZRgDIAEoCBIUCgxmb2N1c19ldmVudHMYBCABKAgSEgoKbW91c2VfbW9kZRgFIAEoDRIWCg5tb3VzZV9lbmNvZGluZxgGIAEoDRIVCg1yZXZlcnNlX3ZpZGVvGAcgASgIEg4KBm9yaWdpbhgIIAEoCBITCgtub19hdXRvd3JhcBgJIAEoCBIOCgZpbnNlcnQYCiABKAgSDwoHbmV3bGluZRgLIAEoCCJGCghDaGFyc2V0cxIKCgJnMBgBIAEoDRIKCgJnMRgCIAEoDRIKCgJnMhgDIAEoDRIKCgJnMxgEIAEoDRIKCgJnbBgFIAEoDSIkCglIeXBlcmxpbmsSCwoDdXJpGAEgASgJEgoKAmlkGAIgASgJIiQKA1JvdxIdCgVjZWxscxgBIAMoCzIOLnR5bXV4LnYxLkNlbGwigAEKBENlbGwSDAoEdGV4dBgBIAEoCRIKCgJmZxgCIAEoDRIKCgJiZxgDIAEoDRINCgVhdHRycxgEIAEoDRIXCg91bmRlcmxpbmVfc3R5bGUYBSABKA0SFwoPdW5kZXJsaW5lX2NvbG9yGAYgASgNEhEKCWh5cGVybGluaxgHIAEoDSKxAQoNQXR0YWNoUmVxdWVzdBIRCgdwYW5lX2lkGAEgASgJSAASDwoFaW5wdXQYAiABKAxIABIiCgZyZXNpemUYAyABKAsyEC50eW11eC52MS5SZXNpemVIABIcCg9yZXN1bWVfZnJvbV9zZXEYBCABKARIAYgBARIbChNzdWJzY3JpYmVfbGlmZWN5Y2xlGAUgASgIQgkKB3BheWxvYWRCEgoQX3Jlc3VtZV9mcm9tX3NlcSJSChFXcml0ZVN0ZGluUmVxdWVzdBIRCgdwYW5lX2lkGAEgASgJSAASDgoEZGF0YRgCIAEoDEgAEg8KBWNsb3NlGAMgASgISABCCQoHcGF5bG9hZCIrChJXcml0ZVN0ZGluUmVzcG9uc2USFQoNYnl0ZXNfd3JpdHRlbhgBIAEoBCIkCgZSZXNpemUSDAoEcm93cxgBIAEoDRIMCgRjb2xzGAIgASgNIigKCkV4aXRTdGF0dXMSEQoEY29kZRgBIAEoBUgAiAEBQgcKBV9jb2RlIigKC091dHB1dENodW5rEgsKA3NlcRgBIAEoBBIMCgRkYXRhGAIgASgMIisKC0dhcEV4Y2VlZGVkEhwKFG9sZGVzdF9hdmFpbGFibGVfc2VxGAEgASgEIgsKCUhlYXJ0YmVhdCLLAgoLQXR0YWNoRXZlbnQSEAoGb3V0cHV0GAEgASgMSAASKgoIc25hcHNob3QYAiABKAsyFi50eW11eC52MS5QYW5lU25hcHNob3RIABImCgZleGl0ZWQYAyABKAsyFC50eW11eC52MS5FeGl0U3RhdHVzSAASFAoKb3V0cHV0X2dhcBgEIAEoCEgAEi0KDGdhcF9leGNlZWRlZBgFIAEoCzIVLnR5bXV4LnYxLkdhcEV4Y2VlZGVkSAASKAoJaGVhcnRiZWF0GAYgASgLMhMudHltdXgudjEuSGVhcnRiZWF0SAASLQoMb3V0cHV0X2NodW5rGAcgASgLMhUudHltdXgudjEuT3V0cHV0Q2h1bmtIABItCglsaWZlY3ljbGUYCCABKAsyGC50eW11eC52MS5MaWZlY3ljbGVFdmVudEgAQgkKB3BheWxvYWQiNwoUR2V0U2VydmVySW5mb1JlcXVlc3QSHwoXY2xpZW50X3Byb3RvY29sX3ZlcnNpb24YASABKA0iwAEKClNlcnZlckluZm8SDwoHdmVyc2lvbhgBIAEoCRIYChBwcm90b2NvbF92ZXJzaW9uGAIgASgNEiMKG21pbl9jbGllbnRfcHJvdG9jb2xfdmVyc2lvbhgDIAEoDRIUCgxjYXBhYmlsaXRpZXMYBCADKAkSCwoDcGlkGAUgASgNEhcKD3N0YXJ0ZWRfYXRfdW5peBgGIAEoAxIQCghvcGVuX2ZkcxgHIAEoBBIUCgxtYXhfb3Blbl9mZHMYCCABKAQi4gIKDVJlc3RhcnRQb2xpY3kSIwoEbW9kZRgBIAEoDjIVLnR5bXV4LnYxLlJlc3RhcnRNb2RlEhkKDG1heF9yZXN0YXJ0cxgCIAEoDUgAiAEBEhYKCXdpbmRvd19tcxgDIAEoBEgBiAEBEh0KEGluaXRpYWxfZGVsYXlfbXMYBCABKARIAogBARIXCgptdWx0aXBsaWVyGAUgASgBSAOIAQESGQoMbWF4X2RlbGF5X21zGAYgASgESASIAQESEwoGaml0dGVyGAcgASgBSAWIAQESHQoQaGVhbHRoeV9hZnRlcl9tcxgIIAEoBEgGiAEBQg8KDV9tYXhfcmVzdGFydHNCDAoKX3dpbmRvd19tc0ITChFfaW5pdGlhbF9kZWxheV9tc0INCgtfbXVsdGlwbGllckIPCg1fbWF4X2RlbGF5X21zQgkKB19qaXR0ZXJCEwoRX2hlYWx0aHlfYWZ0ZXJfbXMilwQKClBhbmVTdGF0dXMSDwoHcGFuZV9pZBgBIAEoCRIiCgVzdGF0ZRgCIAEoDjITLnR5bXV4LnYxLlBhbmVTdGF0ZRInCgZwb2xpY3kYAyABKAsyFy50eW11eC52MS5SZXN0YXJ0UG9saWN5EhUKDXJlc3RhcnRfY291bnQYBCABKA0SGgoScmVzdGFydHNfaW5fd2luZG93GAUgASgNEhwKFGNvbnNlY3V0aXZlX2ZhaWx1cmVzGAYgASgNEhsKDmxhc3RfZXhpdF9jb2RlGAcgASgFSACIAQESHQoQbGFzdF9leGl0X3NpZ25hbBgIIAEoBUgBiAEBEiEKFGxhc3RfZXhpdF9hdF91bml4X21zGAkgASgDSAKIAQESJAoXbmV4dF9yZXN0YXJ0X2F0X3VuaXhfbXMYCiABKANIA4gBARIfChJzdGFydGVkX2F0X3VuaXhfbXMYCyABKANIBIgBARIRCgl1cHRpbWVfbXMYDCABKAQSEAoDcGlkGA0gASgNSAWIAQESEwoLbm93X3VuaXhfbXMYDiABKANCEQoPX2xhc3RfZXhpdF9jb2RlQhMKEV9sYXN0X2V4aXRfc2lnbmFsQhcKFV9sYXN0X2V4aXRfYXRfdW5peF9tc0IaChhfbmV4dF9yZXN0YXJ0X2F0X3VuaXhfbXNCFQoTX3N0YXJ0ZWRfYXRfdW5peF9tc0IGCgRfcGlkIpYBChdTZXRSZXN0YXJ0UG9saWN5UmVxdWVzdBIRCgdwYW5lX2lkGAEgASgJSAASFAoKc2Vzc2lvbl9pZBgCIAEoCUgAEicKBnBvbGljeRgDIAEoCzIXLnR5bXV4LnYxLlJlc3RhcnRQb2xpY3kSHwoXYXBwbHlfdG9fZXhpc3RpbmdfcGFuZXMYBCABKAhCCAoGdGFyZ2V0IkAKGFNldFJlc3RhcnRQb2xpY3lSZXNwb25zZRIkCgZzdGF0dXMYASABKAsyFC50eW11eC52MS5QYW5lU3RhdHVzIlMKFlNldFBhbmVBY3Rpdml0eVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIoCghhY3Rpdml0eRgCIAEoDjIWLnR5bXV4LnYxLlBhbmVBY3Rpdml0eSIZChdTZXRQYW5lQWN0aXZpdHlSZXNwb25zZSInChRHZXRQYW5lU3RhdHVzUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJImAKElJlc3RhcnRQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEhUKDXJlc2V0X2JhY2tvZmYYAiABKAgSFQoIZ3JhY2VfbXMYAyABKARIAIgBAUILCglfZ3JhY2VfbXMiRgoPU3RvcFBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSFQoIZ3JhY2VfbXMYAiABKARIAIgBAUILCglfZ3JhY2VfbXMiIwoQU3RhcnRQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJIiwKGVJlc2V0UmVzdGFydEJ1ZGdldFJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCSLbAgoOTGlmZWN5Y2xlRXZlbnQSKgoEa2luZBgBIAEoDjIcLnR5bXV4LnYxLkxpZmVjeWNsZUV2ZW50S2luZBIiCgVzdGF0ZRgCIAEoDjITLnR5bXV4LnYxLlBhbmVTdGF0ZRIWCglleGl0X2NvZGUYAyABKAVIAIgBARIYCgtleGl0X3NpZ25hbBgEIAEoBUgBiAEBEhUKCGRlbGF5X21zGAUgASgESAKIAQESJAoXbmV4dF9yZXN0YXJ0X2F0X3VuaXhfbXMYBiABKANIA4gBARIQCgNwaWQYByABKA1IBIgBARIVCg1yZXN0YXJ0X2NvdW50GAggASgNEhIKCmF0X3VuaXhfbXMYCSABKANCDAoKX2V4aXRfY29kZUIOCgxfZXhpdF9zaWduYWxCCwoJX2RlbGF5X21zQhoKGF9uZXh0X3Jlc3RhcnRfYXRfdW5peF9tc0IGCgRfcGlkKkoKCExpdmVuZXNzEhgKFExJVkVORVNTX1VOU1BFQ0lGSUVEEAASEQoNTElWRU5FU1NfTElWRRABEhEKDUxJVkVORVNTX0RFQUQQAipgCgtPcmllbnRhdGlvbhIbChdPUklFTlRBVElPTl9VTlNQRUNJRklFRBAAEhoKFk9SSUVOVEFUSU9OX0hPUklaT05UQUwQARIYChRPUklFTlRBVElPTl9WRVJUSUNBTBACKrUBCglQYW5lU3RhdGUSGgoWUEFORV9TVEFURV9VTlNQRUNJRklFRBAAEhMKD1BBTkVfU1RBVEVfTElWRRABEhUKEVBBTkVfU1RBVEVfRVhJVEVEEAISFgoSUEFORV9TVEFURV9CQUNLT0ZGEAMSGQoVUEFORV9TVEFURV9SRVNUQVJUSU5HEAQSFQoRUEFORV9TVEFURV9GQUlMRUQQBRIWChJQQU5FX1NUQVRFX1NUT1BQRUQQBiqaAQoLUmVzdGFydE1vZGUSHAoYUkVTVEFSVF9NT0RFX1VOU1BFQ0lGSUVEEAASFgoSUkVTVEFSVF9NT0RFX05FVkVSEAESGwoXUkVTVEFSVF9NT0RFX09OX0ZBSUxVUkUQAhIXChNSRVNUQVJUX01PREVfQUxXQVlTEAMSHwobUkVTVEFSVF9NT0RFX1VOTEVTU19TVE9QUEVEEAQqagoMUGFuZUFjdGl2aXR5Eh0KGVBBTkVfQUNUSVZJVFlfVU5TUEVDSUZJRUQQABIdChlQQU5FX0FDVElWSVRZX0lOVEVSQUNUSVZFEAESHAoYUEFORV9BQ1RJVklUWV9CQUNLR1JPVU5EEAIq7gEKEkxpZmVjeWNsZUV2ZW50S2luZBIkCiBMSUZFQ1lDTEVfRVZFTlRfS0lORF9VTlNQRUNJRklFRBAAEh8KG0xJRkVDWUNMRV9FVkVOVF9LSU5EX0VYSVRFRBABEioKJkxJRkVDWUNMRV9FVkVOVF9LSU5EX1JFU1RBUlRfU0NIRURVTEVEEAISIgoeTElGRUNZQ0xFX0VWRU5UX0tJTkRfUkVTVEFSVEVEEAMSHwobTElGRUNZQ0xFX0VWRU5UX0tJTkRfRkFJTEVEEAQSIAocTElGRUNZQ0xFX0VWRU5UX0tJTkRfU1RPUFBFRBAFMskLCgxUeW11eFNlcnZpY2USRQoNR2V0U2VydmVySW5mbxIeLnR5bXV4LnYxLkdldFNlcnZlckluZm9SZXF1ZXN0GhQudHltdXgudjEuU2VydmVySW5mbxJCCg1DcmVhdGVTZXNzaW9uEh4udHltdXgudjEuQ3JlYXRlU2Vzc2lvblJlcXVlc3QaES50eW11eC52MS5TZXNzaW9uEk0KDExpc3RTZXNzaW9ucxIdLnR5bXV4LnYxLkxpc3RTZXNzaW9uc1JlcXVlc3QaHi50eW11eC52MS5MaXN0U2Vzc2lvbnNSZXNwb25zZRJKCgtLaWxsU2Vzc2lvbhIcLnR5bXV4LnYxLktpbGxTZXNzaW9uUmVxdWVzdBodLnR5bXV4LnYxLktpbGxTZXNzaW9uUmVzcG9uc2USUAoNUmV2aXZlU2Vzc2lvbhIeLnR5bXV4LnYxLlJldml2ZVNlc3Npb25SZXF1ZXN0Gh8udHltdXgudjEuUmV2aXZlU2Vzc2lvblJlc3BvbnNlEkMKC0NhcHR1cmVQYW5lEhwudHltdXgudjEuQ2FwdHVyZVBhbmVSZXF1ZXN0GhYudHltdXgudjEuUGFuZVNuYXBzaG90ElkKEFNlYXJjaFNjcm9sbGJhY2sSIS50eW11eC52MS5TZWFyY2hTY3JvbGxiYWNrUmVxdWVzdBoiLnR5bXV4LnYxLlNlYXJjaFNjcm9sbGJhY2tSZXNwb25zZRI6CglTcGxpdFBhbmUSGi50eW11eC52MS5TcGxpdFBhbmVSZXF1ZXN0GhEudHltdXgudjEuU2Vzc2lvbhJECglDbG9zZVBhbmUSGi50eW11eC52MS5DbG9zZVBhbmVSZXF1ZXN0GhsudHltdXgudjEuQ2xvc2VQYW5lUmVzcG9uc2USQAoMQ3JlYXRlV2luZG93Eh0udHltdXgudjEuQ3JlYXRlV2luZG93UmVxdWVzdBoRLnR5bXV4LnYxLlNlc3Npb24SSgoLV2F0Y2hXaW5kb3cSHC50eW11eC52MS5XYXRjaFdpbmRvd1JlcXVlc3QaGy50eW11eC52MS5XaW5kb3dMYXlvdXRFdmVudDABEjwKBkF0dGFjaBIXLnR5bXV4LnYxLkF0dGFjaFJlcXVlc3QaFS50eW11eC52MS5BdHRhY2hFdmVudCgBMAESSQoKV3JpdGVTdGRpbhIbLnR5bXV4LnYxLldyaXRlU3RkaW5SZXF1ZXN0GhwudHltdXgudjEuV3JpdGVTdGRpblJlc3BvbnNlKAESWQoQU2V0UmVzdGFydFBvbGljeRIhLnR5bXV4LnYxLlNldFJlc3RhcnRQb2xpY3lSZXF1ZXN0GiIudHltdXgudjEuU2V0UmVzdGFydFBvbGljeVJlc3BvbnNlEkUKDUdldFBhbmVTdGF0dXMSHi50eW11eC52MS5HZXRQYW5lU3RhdHVzUmVxdWVzdBoULnR5bXV4LnYxLlBhbmVTdGF0dXMSVgoPU2V0UGFuZUFjdGl2aXR5EiAudHltdXgudjEuU2V0UGFuZUFjdGl2aXR5UmVxdWVzdBohLnR5bXV4LnYxLlNldFBhbmVBY3Rpdml0eVJlc3BvbnNlEkEKC1Jlc3RhcnRQYW5lEhwudHltdXgudjEuUmVzdGFydFBhbmVSZXF1ZXN0GhQudHltdXgudjEuUGFuZVN0YXR1cxI7CghTdG9wUGFuZRIZLnR5bXV4LnYxLlN0b3BQYW5lUmVxdWVzdBoULnR5bXV4LnYxLlBhbmVTdGF0dXMSPQoJU3RhcnRQYW5lEhoudHltdXgudjEuU3RhcnRQYW5lUmVxdWVzdBoULnR5bXV4LnYxLlBhbmVTdGF0dXMSTwoSUmVzZXRSZXN0YXJ0QnVkZ2V0EiMudHltdXgudjEuUmVzZXRSZXN0YXJ0QnVkZ2V0UmVxdWVzdBoULnR5bXV4LnYxLlBhbmVTdGF0dXNClgEKDGNvbS50eW11eC52MUIKVHltdXhQcm90b1ABWjlnaXRodWIuY29tL3RzdGFwbGVyL3R5bXV4L2NsaWVudHMvZ28vZ2VuL3R5bXV4L3YxO3R5bXV4djGiAgNUWFiqAghUeW11eC5WMcoCCFR5bXV4XFYx4gIUVHltdXhcVjFcR1BCTWV0YWRhdGHqAglUeW11eDo6VjFiBnByb3RvMw");
+  fileDesc("ChR0eW11eC92MS90eW11eC5wcm90bxIIdHltdXgudjEibAoHU2Vzc2lvbhIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiEKB3dpbmRvd3MYAyADKAsyEC50eW11eC52MS5XaW5kb3cSJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcyJECgZXaW5kb3cSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIgCgZsYXlvdXQYAyABKAsyEC50eW11eC52MS5MYXlvdXQiUgoGTGF5b3V0Eh4KBHBhbmUYASABKAsyDi50eW11eC52MS5QYW5lSAASIAoFc3BsaXQYAiABKAsyDy50eW11eC52MS5TcGxpdEgAQgYKBG5vZGUiXAoFU3BsaXQSKgoLb3JpZW50YXRpb24YASABKA4yFS50eW11eC52MS5PcmllbnRhdGlvbhInCghjaGlsZHJlbhgCIAMoCzIVLnR5bXV4LnYxLkxheW91dENoaWxkIj4KC0xheW91dENoaWxkEiAKBmxheW91dBgBIAEoCzIQLnR5bXV4LnYxLkxheW91dBINCgVyYXRpbxgCIAEoAiKFAQoEUGFuZRIKCgJpZBgBIAEoCRIMCgRyb3dzGAIgASgNEgwKBGNvbHMYAyABKA0SJAoIbGl2ZW5lc3MYBCABKA4yEi50eW11eC52MS5MaXZlbmVzcxILCgNjd2QYBSABKAkSIgoFc3RhdGUYBiABKA4yEy50eW11eC52MS5QYW5lU3RhdGUiyAIKFENyZWF0ZVNlc3Npb25SZXF1ZXN0EgwKBG5hbWUYASABKAkSDwoHY29tbWFuZBgCIAEoCRILCgNjd2QYAyABKAkSDAoEYXJncxgEIAMoCRI0CgNlbnYYBSADKAsyJy50eW11eC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdC5FbnZFbnRyeRITCgtzdGRlcnJfcGF0aBgGIAEoCRIkCglhcmdfc3BlY3MYByADKAsyES50eW11eC52MS5BcmdTcGVjEhIKCnN0ZGluX3BhdGgYCCABKAkSFAoMc3RkaW5fc3RyZWFtGAkgASgIEi8KDnJlc3RhcnRfcG9saWN5GAogASgLMhcudHltdXgudjEuUmVzdGFydFBvbGljeRoqCghFbnZFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIkQKB0FyZ1NwZWMSEQoHbGl0ZXJhbBgBIAEoCUgAEhwKEmZpbGVfY29udGVudHNfcGF0aBgCIAEoCUgAQggKBnNvdXJjZSIVChNMaXN0U2Vzc2lvbnNSZXF1ZXN0IjsKFExpc3RTZXNzaW9uc1Jlc3BvbnNlEiMKCHNlc3Npb25zGAEgAygLMhEudHltdXgudjEuU2Vzc2lvbiIoChJLaWxsU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSIVChNLaWxsU2Vzc2lvblJlc3BvbnNlIioKFFJldml2ZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiZQoVUmV2aXZlU2Vzc2lvblJlc3BvbnNlEhQKDGFscmVhZHlfbGl2ZRgBIAEoCBISCgpwYW5lX2NvdW50GAIgASgNEiIKB3Nlc3Npb24YAyABKAsyES50eW11eC52MS5TZXNzaW9uImAKEFNwbGl0UGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIqCgtvcmllbnRhdGlvbhgCIAEoDjIVLnR5bXV4LnYxLk9yaWVudGF0aW9uEg8KB2NvbW1hbmQYAyABKAkiIwoQQ2xvc2VQYW5lUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJIqUBChFDbG9zZVBhbmVSZXNwb25zZRIYChB3aW5kb3dfY2xvc2VkX2lkGAEgASgJEhoKEndpbmRvd19jbG9zZWRfbmFtZRgCIAEoCRIZChFzZXNzaW9uX2Nsb3NlZF9pZBgDIAEoCRIbChNzZXNzaW9uX2Nsb3NlZF9uYW1lGAQgASgJEiIKB3Nlc3Npb24YBSABKAsyES50eW11eC52MS5TZXNzaW9uIjoKE0NyZWF0ZVdpbmRvd1JlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIPCgdjb21tYW5kGAIgASgJIicKEldhdGNoV2luZG93UmVxdWVzdBIRCgl3aW5kb3dfaWQYASABKAkiVAoRV2luZG93TGF5b3V0RXZlbnQSIAoGbGF5b3V0GAEgASgLMhAudHltdXgudjEuTGF5b3V0Eh0KFWF0dGFjaGVkX2NsaWVudF9jb3VudBgCIAEoDSJAChJDYXB0dXJlUGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIZChFzY3JvbGxiYWNrX29mZnNldBgCIAEoDSJRChdTZWFyY2hTY3JvbGxiYWNrUmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEg8KB3BhdHRlcm4YAiABKAkSFAoMc3RhcnRfb2Zmc2V0GAMgASgNIkcKGFNlYXJjaFNjcm9sbGJhY2tSZXNwb25zZRINCgVmb3VuZBgBIAEoCBIOCgZvZmZzZXQYAiABKA0SDAoEbGluZRgDIAEoCSKsBAoMUGFuZVNuYXBzaG90Eg8KB3BhbmVfaWQYASABKAkSDAoEcm93cxgCIAEoDRIMCgRjb2xzGAMgASgNEhsKBGdyaWQYBCADKAsyDS50eW11eC52MS5Sb3cSEgoKY3Vyc29yX3JvdxgFIAEoDRISCgpjdXJzb3JfY29sGAYgASgNEiQKCGxpdmVuZXNzGAcgASgOMhIudHltdXgudjEuTGl2ZW5lc3MSJwoKaHlwZXJsaW5rcxgIIAMoCzITLnR5bXV4LnYxLkh5cGVybGluaxINCgV0aXRsZRgJIAEoCRImCgVtb2RlcxgKIAEoCzIXLnR5bXV4LnYxLlRlcm1pbmFsTW9kZXMSFQoNY3Vyc29yX2hpZGRlbhgLIAEoCBIUCgxjdXJzb3Jfc3R5bGUYDCABKA0SEgoKYWx0X3NjcmVlbhgNIAEoCBISCgpzY3JvbGxfdG9wGA4gASgNEhUKDXNjcm9sbF9ib3R0b20YDyABKA0SEQoJdGFiX3N0b3BzGBAgAygNEiQKCGNoYXJzZXRzGBEgASgLMhIudHltdXgudjEuQ2hhcnNldHMSGwoTY3Vyc29yX3BlbmRpbmdfd3JhcBgSIAEoCBIiCgVzdGF0ZRgUIAEoDjITLnR5bXV4LnYxLlBhbmVTdGF0ZRIWCglleGl0X2NvZGUYEyABKAVIAIgBARIQCgNzZXEYFSABKARIAYgBAUIMCgpfZXhpdF9jb2RlQgYKBF9zZXEi9AEKDVRlcm1pbmFsTW9kZXMSFwoPYXBwX2N1cnNvcl9rZXlzGAEgASgIEhIKCmFwcF9rZXlwYWQYAiABKAgSFwoPYnJhY2tldGVkX3Bhc3RlGAMgASgIEhQKDGZvY3VzX2V2ZW50cxgEIAEoCBISCgptb3VzZV9tb2RlGAUgASgNEhYKDm1vdXNlX2VuY29kaW5nGAYgASgNEhUKDXJldmVyc2VfdmlkZW8YByABKAgSDgoGb3JpZ2luGAggASgIEhMKC25vX2F1dG93cmFwGAkgASgIEg4KBmluc2VydBgKIAEoCBIPCgduZXdsaW5lGAsgASgIIkYKCENoYXJzZXRzEgoKAmcwGAEgASgNEgoKAmcxGAIgASgNEgoKAmcyGAMgASgNEgoKAmczGAQgASgNEgoKAmdsGAUgASgNIiQKCUh5cGVybGluaxILCgN1cmkYASABKAkSCgoCaWQYAiABKAkiJAoDUm93Eh0KBWNlbGxzGAEgAygLMg4udHltdXgudjEuQ2VsbCKAAQoEQ2VsbBIMCgR0ZXh0GAEgASgJEgoKAmZnGAIgASgNEgoKAmJnGAMgASgNEg0KBWF0dHJzGAQgASgNEhcKD3VuZGVybGluZV9zdHlsZRgFIAEoDRIXCg91bmRlcmxpbmVfY29sb3IYBiABKA0SEQoJaHlwZXJsaW5rGAcgASgNIsoBCg1BdHRhY2hSZXF1ZXN0EhEKB3BhbmVfaWQYASABKAlIABIPCgVpbnB1dBgCIAEoDEgAEiIKBnJlc2l6ZRgDIAEoCzIQLnR5bXV4LnYxLlJlc2l6ZUgAEhwKD3Jlc3VtZV9mcm9tX3NlcRgEIAEoBEgBiAEBEhsKE3N1YnNjcmliZV9saWZlY3ljbGUYBSABKAgSFwoPd2FudF9vdXRwdXRfc2VxGAYgASgIQgkKB3BheWxvYWRCEgoQX3Jlc3VtZV9mcm9tX3NlcSJSChFXcml0ZVN0ZGluUmVxdWVzdBIRCgdwYW5lX2lkGAEgASgJSAASDgoEZGF0YRgCIAEoDEgAEg8KBWNsb3NlGAMgASgISABCCQoHcGF5bG9hZCIrChJXcml0ZVN0ZGluUmVzcG9uc2USFQoNYnl0ZXNfd3JpdHRlbhgBIAEoBCIkCgZSZXNpemUSDAoEcm93cxgBIAEoDRIMCgRjb2xzGAIgASgNIigKCkV4aXRTdGF0dXMSEQoEY29kZRgBIAEoBUgAiAEBQgcKBV9jb2RlIigKC091dHB1dENodW5rEgsKA3NlcRgBIAEoBBIMCgRkYXRhGAIgASgMIisKC0dhcEV4Y2VlZGVkEhwKFG9sZGVzdF9hdmFpbGFibGVfc2VxGAEgASgEIgsKCUhlYXJ0YmVhdCLoAgoLQXR0YWNoRXZlbnQSEAoGb3V0cHV0GAEgASgMSAASKgoIc25hcHNob3QYAiABKAsyFi50eW11eC52MS5QYW5lU25hcHNob3RIABImCgZleGl0ZWQYAyABKAsyFC50eW11eC52MS5FeGl0U3RhdHVzSAASFAoKb3V0cHV0X2dhcBgEIAEoCEgAEi0KDGdhcF9leGNlZWRlZBgFIAEoCzIVLnR5bXV4LnYxLkdhcEV4Y2VlZGVkSAASKAoJaGVhcnRiZWF0GAYgASgLMhMudHltdXgudjEuSGVhcnRiZWF0SAASLQoMb3V0cHV0X2NodW5rGAcgASgLMhUudHltdXgudjEuT3V0cHV0Q2h1bmtIABItCglsaWZlY3ljbGUYCCABKAsyGC50eW11eC52MS5MaWZlY3ljbGVFdmVudEgAEhsKE3NlbnRfYXRfdW5peF9taWNyb3MYCSABKARCCQoHcGF5bG9hZCI3ChRHZXRTZXJ2ZXJJbmZvUmVxdWVzdBIfChdjbGllbnRfcHJvdG9jb2xfdmVyc2lvbhgBIAEoDSKaAgoKU2VydmVySW5mbxIPCgd2ZXJzaW9uGAEgASgJEhgKEHByb3RvY29sX3ZlcnNpb24YAiABKA0SIwobbWluX2NsaWVudF9wcm90b2NvbF92ZXJzaW9uGAMgASgNEhQKDGNhcGFiaWxpdGllcxgEIAMoCRILCgNwaWQYBSABKA0SFwoPc3RhcnRlZF9hdF91bml4GAYgASgDEhAKCG9wZW5fZmRzGAcgASgEEhQKDG1heF9vcGVuX2ZkcxgIIAEoBBIrCgp3b3JrX3Bvb2xzGAkgAygLMhcudHltdXgudjEuV29ya1Bvb2xTdGF0cxIrCgpzbG93X3BvbGxzGAogAygLMhcudHltdXgudjEuU2xvd1BvbGxTdGF0cyK0AgoNV29ya1Bvb2xTdGF0cxINCgVjbGFzcxgBIAEoCRIPCgd0aHJlYWRzGAIgASgNEhMKC3F1ZXVlX2RlcHRoGAMgASgEEhEKCXN1Ym1pdHRlZBgEIAEoBBIRCgljb21wbGV0ZWQYBSABKAQSGQoRc2tpcHBlZF9jYW5jZWxsZWQYBiABKAQSEAoIcGFuaWNrZWQYByABKAQSEAoIcmVqZWN0ZWQYCCABKAQSGQoRd2FpdF9taWNyb3NfdG90YWwYCSABKAQSFwoPd2FpdF9taWNyb3NfbWF4GAogASgEEhgKEHJ1bl9taWNyb3NfdG90YWwYCyABKAQSFgoOcnVuX21pY3Jvc19tYXgYDCABKAQSDwoHcnVubmluZxgNIAEoBBISCgpvdmVyZmxvd2VkGA4gASgEInoKDVNsb3dQb2xsU3RhdHMSEgoKdGFza19jbGFzcxgBIAEoCRINCgVwb2xscxgCIAEoBBISCgpzbG93X3BvbGxzGAMgASgEEhkKEXRvdGFsX3BvbGxfbWljcm9zGAQgASgEEhcKD21heF9wb2xsX21pY3JvcxgFIAEoBCLiAgoNUmVzdGFydFBvbGljeRIjCgRtb2RlGAEgASgOMhUudHltdXgudjEuUmVzdGFydE1vZGUSGQoMbWF4X3Jlc3RhcnRzGAIgASgNSACIAQESFgoJd2luZG93X21zGAMgASgESAGIAQESHQoQaW5pdGlhbF9kZWxheV9tcxgEIAEoBEgCiAEBEhcKCm11bHRpcGxpZXIYBSABKAFIA4gBARIZCgxtYXhfZGVsYXlfbXMYBiABKARIBIgBARITCgZqaXR0ZXIYByABKAFIBYgBARIdChBoZWFsdGh5X2FmdGVyX21zGAggASgESAaIAQFCDwoNX21heF9yZXN0YXJ0c0IMCgpfd2luZG93X21zQhMKEV9pbml0aWFsX2RlbGF5X21zQg0KC19tdWx0aXBsaWVyQg8KDV9tYXhfZGVsYXlfbXNCCQoHX2ppdHRlckITChFfaGVhbHRoeV9hZnRlcl9tcyKXBAoKUGFuZVN0YXR1cxIPCgdwYW5lX2lkGAEgASgJEiIKBXN0YXRlGAIgASgOMhMudHltdXgudjEuUGFuZVN0YXRlEicKBnBvbGljeRgDIAEoCzIXLnR5bXV4LnYxLlJlc3RhcnRQb2xpY3kSFQoNcmVzdGFydF9jb3VudBgEIAEoDRIaChJyZXN0YXJ0c19pbl93aW5kb3cYBSABKA0SHAoUY29uc2VjdXRpdmVfZmFpbHVyZXMYBiABKA0SGwoObGFzdF9leGl0X2NvZGUYByABKAVIAIgBARIdChBsYXN0X2V4aXRfc2lnbmFsGAggASgFSAGIAQESIQoUbGFzdF9leGl0X2F0X3VuaXhfbXMYCSABKANIAogBARIkChduZXh0X3Jlc3RhcnRfYXRfdW5peF9tcxgKIAEoA0gDiAEBEh8KEnN0YXJ0ZWRfYXRfdW5peF9tcxgLIAEoA0gEiAEBEhEKCXVwdGltZV9tcxgMIAEoBBIQCgNwaWQYDSABKA1IBYgBARITCgtub3dfdW5peF9tcxgOIAEoA0IRCg9fbGFzdF9leGl0X2NvZGVCEwoRX2xhc3RfZXhpdF9zaWduYWxCFwoVX2xhc3RfZXhpdF9hdF91bml4X21zQhoKGF9uZXh0X3Jlc3RhcnRfYXRfdW5peF9tc0IVChNfc3RhcnRlZF9hdF91bml4X21zQgYKBF9waWQilgEKF1NldFJlc3RhcnRQb2xpY3lSZXF1ZXN0EhEKB3BhbmVfaWQYASABKAlIABIUCgpzZXNzaW9uX2lkGAIgASgJSAASJwoGcG9saWN5GAMgASgLMhcudHltdXgudjEuUmVzdGFydFBvbGljeRIfChdhcHBseV90b19leGlzdGluZ19wYW5lcxgEIAEoCEIICgZ0YXJnZXQiQAoYU2V0UmVzdGFydFBvbGljeVJlc3BvbnNlEiQKBnN0YXR1cxgBIAEoCzIULnR5bXV4LnYxLlBhbmVTdGF0dXMiUwoWU2V0UGFuZUFjdGl2aXR5UmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJEigKCGFjdGl2aXR5GAIgASgOMhYudHltdXgudjEuUGFuZUFjdGl2aXR5IhkKF1NldFBhbmVBY3Rpdml0eVJlc3BvbnNlIicKFEdldFBhbmVTdGF0dXNSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkiYAoSUmVzdGFydFBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkSFQoNcmVzZXRfYmFja29mZhgCIAEoCBIVCghncmFjZV9tcxgDIAEoBEgAiAEBQgsKCV9ncmFjZV9tcyJGCg9TdG9wUGFuZVJlcXVlc3QSDwoHcGFuZV9pZBgBIAEoCRIVCghncmFjZV9tcxgCIAEoBEgAiAEBQgsKCV9ncmFjZV9tcyIjChBTdGFydFBhbmVSZXF1ZXN0Eg8KB3BhbmVfaWQYASABKAkiLAoZUmVzZXRSZXN0YXJ0QnVkZ2V0UmVxdWVzdBIPCgdwYW5lX2lkGAEgASgJItsCCg5MaWZlY3ljbGVFdmVudBIqCgRraW5kGAEgASgOMhwudHltdXgudjEuTGlmZWN5Y2xlRXZlbnRLaW5kEiIKBXN0YXRlGAIgASgOMhMudHltdXgudjEuUGFuZVN0YXRlEhYKCWV4aXRfY29kZRgDIAEoBUgAiAEBEhgKC2V4aXRfc2lnbmFsGAQgASgFSAGIAQESFQoIZGVsYXlfbXMYBSABKARIAogBARIkChduZXh0X3Jlc3RhcnRfYXRfdW5peF9tcxgGIAEoA0gDiAEBEhAKA3BpZBgHIAEoDUgEiAEBEhUKDXJlc3RhcnRfY291bnQYCCABKA0SEgoKYXRfdW5peF9tcxgJIAEoA0IMCgpfZXhpdF9jb2RlQg4KDF9leGl0X3NpZ25hbEILCglfZGVsYXlfbXNCGgoYX25leHRfcmVzdGFydF9hdF91bml4X21zQgYKBF9waWQqSgoITGl2ZW5lc3MSGAoUTElWRU5FU1NfVU5TUEVDSUZJRUQQABIRCg1MSVZFTkVTU19MSVZFEAESEQoNTElWRU5FU1NfREVBRBACKmAKC09yaWVudGF0aW9uEhsKF09SSUVOVEFUSU9OX1VOU1BFQ0lGSUVEEAASGgoWT1JJRU5UQVRJT05fSE9SSVpPTlRBTBABEhgKFE9SSUVOVEFUSU9OX1ZFUlRJQ0FMEAIqtQEKCVBhbmVTdGF0ZRIaChZQQU5FX1NUQVRFX1VOU1BFQ0lGSUVEEAASEwoPUEFORV9TVEFURV9MSVZFEAESFQoRUEFORV9TVEFURV9FWElURUQQAhIWChJQQU5FX1NUQVRFX0JBQ0tPRkYQAxIZChVQQU5FX1NUQVRFX1JFU1RBUlRJTkcQBBIVChFQQU5FX1NUQVRFX0ZBSUxFRBAFEhYKElBBTkVfU1RBVEVfU1RPUFBFRBAGKpoBCgtSZXN0YXJ0TW9kZRIcChhSRVNUQVJUX01PREVfVU5TUEVDSUZJRUQQABIWChJSRVNUQVJUX01PREVfTkVWRVIQARIbChdSRVNUQVJUX01PREVfT05fRkFJTFVSRRACEhcKE1JFU1RBUlRfTU9ERV9BTFdBWVMQAxIfChtSRVNUQVJUX01PREVfVU5MRVNTX1NUT1BQRUQQBCpqCgxQYW5lQWN0aXZpdHkSHQoZUEFORV9BQ1RJVklUWV9VTlNQRUNJRklFRBAAEh0KGVBBTkVfQUNUSVZJVFlfSU5URVJBQ1RJVkUQARIcChhQQU5FX0FDVElWSVRZX0JBQ0tHUk9VTkQQAiruAQoSTGlmZWN5Y2xlRXZlbnRLaW5kEiQKIExJRkVDWUNMRV9FVkVOVF9LSU5EX1VOU1BFQ0lGSUVEEAASHwobTElGRUNZQ0xFX0VWRU5UX0tJTkRfRVhJVEVEEAESKgomTElGRUNZQ0xFX0VWRU5UX0tJTkRfUkVTVEFSVF9TQ0hFRFVMRUQQAhIiCh5MSUZFQ1lDTEVfRVZFTlRfS0lORF9SRVNUQVJURUQQAxIfChtMSUZFQ1lDTEVfRVZFTlRfS0lORF9GQUlMRUQQBBIgChxMSUZFQ1lDTEVfRVZFTlRfS0lORF9TVE9QUEVEEAUyyQsKDFR5bXV4U2VydmljZRJFCg1HZXRTZXJ2ZXJJbmZvEh4udHltdXgudjEuR2V0U2VydmVySW5mb1JlcXVlc3QaFC50eW11eC52MS5TZXJ2ZXJJbmZvEkIKDUNyZWF0ZVNlc3Npb24SHi50eW11eC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdBoRLnR5bXV4LnYxLlNlc3Npb24STQoMTGlzdFNlc3Npb25zEh0udHltdXgudjEuTGlzdFNlc3Npb25zUmVxdWVzdBoeLnR5bXV4LnYxLkxpc3RTZXNzaW9uc1Jlc3BvbnNlEkoKC0tpbGxTZXNzaW9uEhwudHltdXgudjEuS2lsbFNlc3Npb25SZXF1ZXN0Gh0udHltdXgudjEuS2lsbFNlc3Npb25SZXNwb25zZRJQCg1SZXZpdmVTZXNzaW9uEh4udHltdXgudjEuUmV2aXZlU2Vzc2lvblJlcXVlc3QaHy50eW11eC52MS5SZXZpdmVTZXNzaW9uUmVzcG9uc2USQwoLQ2FwdHVyZVBhbmUSHC50eW11eC52MS5DYXB0dXJlUGFuZVJlcXVlc3QaFi50eW11eC52MS5QYW5lU25hcHNob3QSWQoQU2VhcmNoU2Nyb2xsYmFjaxIhLnR5bXV4LnYxLlNlYXJjaFNjcm9sbGJhY2tSZXF1ZXN0GiIudHltdXgudjEuU2VhcmNoU2Nyb2xsYmFja1Jlc3BvbnNlEjoKCVNwbGl0UGFuZRIaLnR5bXV4LnYxLlNwbGl0UGFuZVJlcXVlc3QaES50eW11eC52MS5TZXNzaW9uEkQKCUNsb3NlUGFuZRIaLnR5bXV4LnYxLkNsb3NlUGFuZVJlcXVlc3QaGy50eW11eC52MS5DbG9zZVBhbmVSZXNwb25zZRJACgxDcmVhdGVXaW5kb3cSHS50eW11eC52MS5DcmVhdGVXaW5kb3dSZXF1ZXN0GhEudHltdXgudjEuU2Vzc2lvbhJKCgtXYXRjaFdpbmRvdxIcLnR5bXV4LnYxLldhdGNoV2luZG93UmVxdWVzdBobLnR5bXV4LnYxLldpbmRvd0xheW91dEV2ZW50MAESPAoGQXR0YWNoEhcudHltdXgudjEuQXR0YWNoUmVxdWVzdBoVLnR5bXV4LnYxLkF0dGFjaEV2ZW50KAEwARJJCgpXcml0ZVN0ZGluEhsudHltdXgudjEuV3JpdGVTdGRpblJlcXVlc3QaHC50eW11eC52MS5Xcml0ZVN0ZGluUmVzcG9uc2UoARJZChBTZXRSZXN0YXJ0UG9saWN5EiEudHltdXgudjEuU2V0UmVzdGFydFBvbGljeVJlcXVlc3QaIi50eW11eC52MS5TZXRSZXN0YXJ0UG9saWN5UmVzcG9uc2USRQoNR2V0UGFuZVN0YXR1cxIeLnR5bXV4LnYxLkdldFBhbmVTdGF0dXNSZXF1ZXN0GhQudHltdXgudjEuUGFuZVN0YXR1cxJWCg9TZXRQYW5lQWN0aXZpdHkSIC50eW11eC52MS5TZXRQYW5lQWN0aXZpdHlSZXF1ZXN0GiEudHltdXgudjEuU2V0UGFuZUFjdGl2aXR5UmVzcG9uc2USQQoLUmVzdGFydFBhbmUSHC50eW11eC52MS5SZXN0YXJ0UGFuZVJlcXVlc3QaFC50eW11eC52MS5QYW5lU3RhdHVzEjsKCFN0b3BQYW5lEhkudHltdXgudjEuU3RvcFBhbmVSZXF1ZXN0GhQudHltdXgudjEuUGFuZVN0YXR1cxI9CglTdGFydFBhbmUSGi50eW11eC52MS5TdGFydFBhbmVSZXF1ZXN0GhQudHltdXgudjEuUGFuZVN0YXR1cxJPChJSZXNldFJlc3RhcnRCdWRnZXQSIy50eW11eC52MS5SZXNldFJlc3RhcnRCdWRnZXRSZXF1ZXN0GhQudHltdXgudjEuUGFuZVN0YXR1c0KWAQoMY29tLnR5bXV4LnYxQgpUeW11eFByb3RvUAFaOWdpdGh1Yi5jb20vdHN0YXBsZXIvdHltdXgvY2xpZW50cy9nby9nZW4vdHltdXgvdjE7dHltdXh2MaICA1RYWKoCCFR5bXV4LlYxygIIVHltdXhcVjHiAhRUeW11eFxWMVxHUEJNZXRhZGF0YeoCCVR5bXV4OjpWMWIGcHJvdG8z");
 
 /**
  * @generated from message tymux.v1.Session
@@ -854,6 +854,16 @@ export type PaneSnapshot = Message<"tymux.v1.PaneSnapshot"> & {
    * @generated from field: optional int32 exit_code = 19;
    */
   exitCode?: number | undefined;
+
+  /**
+   * The pane's output sequence number this grid reflects, read under the same lock as the grid
+   * (same numbering space as OutputChunk.seq). A client holding an Attach stream opened with
+   * want_output_seq can drop every OutputChunk with seq <= this value, because the grid already
+   * contains it. Unset only for an exited pane served from persisted state.
+   *
+   * @generated from field: optional uint64 seq = 21;
+   */
+  seq?: bigint | undefined;
 };
 
 /**
@@ -1145,6 +1155,15 @@ export type AttachRequest = Message<"tymux.v1.AttachRequest"> & {
    * @generated from field: bool subscribe_lifecycle = 5;
    */
   subscribeLifecycle: boolean;
+
+  /**
+   * First message only: deliver live output as OutputChunk (seq'd) instead of bare `output`,
+   * without resume semantics (a full attach still opens with a priming Snapshot). Lets a client
+   * order the stream against a CapturePane / Snapshot seq. Absent/false: legacy `output` events.
+   *
+   * @generated from field: bool want_output_seq = 6;
+   */
+  wantOutputSeq: boolean;
 };
 
 /**
@@ -1415,6 +1434,18 @@ export type AttachEvent = Message<"tymux.v1.AttachEvent"> & {
     value: LifecycleEvent;
     case: "lifecycle";
   } | { case: undefined; value?: undefined };
+
+  /**
+   * Capability "output.sent_at". Wall-clock microseconds since the Unix epoch, stamped when the
+   * daemon's gRPC layer takes the frame from its send queue (after any wait in that queue).
+   * Receive-minus-stamp on the same host bounds the time a frame spent buffered in the HTTP/2
+   * stack and the client's receive queue; tonic may pull a frame before flow control lets it
+   * out, so this is an upper bound on time in the window, not an exact measure of it. Set on
+   * every frame; 0 means "not stamped" (older daemons).
+   *
+   * @generated from field: uint64 sent_at_unix_micros = 9;
+   */
+  sentAtUnixMicros: bigint;
 };
 
 /**
@@ -1506,6 +1537,19 @@ export type ServerInfo = Message<"tymux.v1.ServerInfo"> & {
    * @generated from field: uint64 max_open_fds = 8;
    */
   maxOpenFds: bigint;
+
+  /**
+   * Capability "daemon.work_pools": counters for the daemon's dedicated blocking-work pools and
+   * for slow async polls. Read-only diagnostics; a client may ignore them.
+   *
+   * @generated from field: repeated tymux.v1.WorkPoolStats work_pools = 9;
+   */
+  workPools: WorkPoolStats[];
+
+  /**
+   * @generated from field: repeated tymux.v1.SlowPollStats slow_polls = 10;
+   */
+  slowPolls: SlowPollStats[];
 };
 
 /**
@@ -1514,6 +1558,134 @@ export type ServerInfo = Message<"tymux.v1.ServerInfo"> & {
  */
 export const ServerInfoSchema: GenMessage<ServerInfo> = /*@__PURE__*/
   messageDesc(file_tymux_v1_tymux, 39);
+
+/**
+ * One latency class's pool: "input" (pty writes), "resize", or "work" (captures, attach
+ * snapshots). Times are microseconds, summed over all jobs since daemon start.
+ *
+ * @generated from message tymux.v1.WorkPoolStats
+ */
+export type WorkPoolStats = Message<"tymux.v1.WorkPoolStats"> & {
+  /**
+   * @generated from field: string class = 1;
+   */
+  class: string;
+
+  /**
+   * @generated from field: uint32 threads = 2;
+   */
+  threads: number;
+
+  /**
+   * @generated from field: uint64 queue_depth = 3;
+   */
+  queueDepth: bigint;
+
+  /**
+   * @generated from field: uint64 submitted = 4;
+   */
+  submitted: bigint;
+
+  /**
+   * @generated from field: uint64 completed = 5;
+   */
+  completed: bigint;
+
+  /**
+   * @generated from field: uint64 skipped_cancelled = 6;
+   */
+  skippedCancelled: bigint;
+
+  /**
+   * @generated from field: uint64 panicked = 7;
+   */
+  panicked: bigint;
+
+  /**
+   * @generated from field: uint64 rejected = 8;
+   */
+  rejected: bigint;
+
+  /**
+   * @generated from field: uint64 wait_micros_total = 9;
+   */
+  waitMicrosTotal: bigint;
+
+  /**
+   * @generated from field: uint64 wait_micros_max = 10;
+   */
+  waitMicrosMax: bigint;
+
+  /**
+   * @generated from field: uint64 run_micros_total = 11;
+   */
+  runMicrosTotal: bigint;
+
+  /**
+   * @generated from field: uint64 run_micros_max = 12;
+   */
+  runMicrosMax: bigint;
+
+  /**
+   * Jobs running on a pool thread now, and must-land jobs sent to tokio's blocking pool because
+   * every pool thread was busy (stalled panes).
+   *
+   * @generated from field: uint64 running = 13;
+   */
+  running: bigint;
+
+  /**
+   * @generated from field: uint64 overflowed = 14;
+   */
+  overflowed: bigint;
+};
+
+/**
+ * Describes the message tymux.v1.WorkPoolStats.
+ * Use `create(WorkPoolStatsSchema)` to create a new message.
+ */
+export const WorkPoolStatsSchema: GenMessage<WorkPoolStats> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 40);
+
+/**
+ * Poll-time counters for one async task class. A slow poll (default over 10 ms,
+ * TYMUXD_SLOW_POLL_MS) means the task held an async worker thread.
+ *
+ * @generated from message tymux.v1.SlowPollStats
+ */
+export type SlowPollStats = Message<"tymux.v1.SlowPollStats"> & {
+  /**
+   * @generated from field: string task_class = 1;
+   */
+  taskClass: string;
+
+  /**
+   * @generated from field: uint64 polls = 2;
+   */
+  polls: bigint;
+
+  /**
+   * @generated from field: uint64 slow_polls = 3;
+   */
+  slowPolls: bigint;
+
+  /**
+   * @generated from field: uint64 total_poll_micros = 4;
+   */
+  totalPollMicros: bigint;
+
+  /**
+   * @generated from field: uint64 max_poll_micros = 5;
+   */
+  maxPollMicros: bigint;
+};
+
+/**
+ * Describes the message tymux.v1.SlowPollStats.
+ * Use `create(SlowPollStatsSchema)` to create a new message.
+ */
+export const SlowPollStatsSchema: GenMessage<SlowPollStats> = /*@__PURE__*/
+  messageDesc(file_tymux_v1_tymux, 41);
 
 /**
  * When and how often the daemon restarts a pane's process. Unset optional fields take the
@@ -1586,7 +1758,7 @@ export type RestartPolicy = Message<"tymux.v1.RestartPolicy"> & {
  * Use `create(RestartPolicySchema)` to create a new message.
  */
 export const RestartPolicySchema: GenMessage<RestartPolicy> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 40);
+  messageDesc(file_tymux_v1_tymux, 42);
 
 /**
  * @generated from message tymux.v1.PaneStatus
@@ -1693,7 +1865,7 @@ export type PaneStatus = Message<"tymux.v1.PaneStatus"> & {
  * Use `create(PaneStatusSchema)` to create a new message.
  */
 export const PaneStatusSchema: GenMessage<PaneStatus> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 41);
+  messageDesc(file_tymux_v1_tymux, 43);
 
 /**
  * @generated from message tymux.v1.SetRestartPolicyRequest
@@ -1736,7 +1908,7 @@ export type SetRestartPolicyRequest = Message<"tymux.v1.SetRestartPolicyRequest"
  * Use `create(SetRestartPolicyRequestSchema)` to create a new message.
  */
 export const SetRestartPolicyRequestSchema: GenMessage<SetRestartPolicyRequest> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 42);
+  messageDesc(file_tymux_v1_tymux, 44);
 
 /**
  * @generated from message tymux.v1.SetRestartPolicyResponse
@@ -1755,7 +1927,7 @@ export type SetRestartPolicyResponse = Message<"tymux.v1.SetRestartPolicyRespons
  * Use `create(SetRestartPolicyResponseSchema)` to create a new message.
  */
 export const SetRestartPolicyResponseSchema: GenMessage<SetRestartPolicyResponse> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 43);
+  messageDesc(file_tymux_v1_tymux, 45);
 
 /**
  * @generated from message tymux.v1.SetPaneActivityRequest
@@ -1777,7 +1949,7 @@ export type SetPaneActivityRequest = Message<"tymux.v1.SetPaneActivityRequest"> 
  * Use `create(SetPaneActivityRequestSchema)` to create a new message.
  */
 export const SetPaneActivityRequestSchema: GenMessage<SetPaneActivityRequest> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 44);
+  messageDesc(file_tymux_v1_tymux, 46);
 
 /**
  * @generated from message tymux.v1.SetPaneActivityResponse
@@ -1790,7 +1962,7 @@ export type SetPaneActivityResponse = Message<"tymux.v1.SetPaneActivityResponse"
  * Use `create(SetPaneActivityResponseSchema)` to create a new message.
  */
 export const SetPaneActivityResponseSchema: GenMessage<SetPaneActivityResponse> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 45);
+  messageDesc(file_tymux_v1_tymux, 47);
 
 /**
  * @generated from message tymux.v1.GetPaneStatusRequest
@@ -1807,7 +1979,7 @@ export type GetPaneStatusRequest = Message<"tymux.v1.GetPaneStatusRequest"> & {
  * Use `create(GetPaneStatusRequestSchema)` to create a new message.
  */
 export const GetPaneStatusRequestSchema: GenMessage<GetPaneStatusRequest> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 46);
+  messageDesc(file_tymux_v1_tymux, 48);
 
 /**
  * @generated from message tymux.v1.RestartPaneRequest
@@ -1838,7 +2010,7 @@ export type RestartPaneRequest = Message<"tymux.v1.RestartPaneRequest"> & {
  * Use `create(RestartPaneRequestSchema)` to create a new message.
  */
 export const RestartPaneRequestSchema: GenMessage<RestartPaneRequest> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 47);
+  messageDesc(file_tymux_v1_tymux, 49);
 
 /**
  * @generated from message tymux.v1.StopPaneRequest
@@ -1862,7 +2034,7 @@ export type StopPaneRequest = Message<"tymux.v1.StopPaneRequest"> & {
  * Use `create(StopPaneRequestSchema)` to create a new message.
  */
 export const StopPaneRequestSchema: GenMessage<StopPaneRequest> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 48);
+  messageDesc(file_tymux_v1_tymux, 50);
 
 /**
  * @generated from message tymux.v1.StartPaneRequest
@@ -1879,7 +2051,7 @@ export type StartPaneRequest = Message<"tymux.v1.StartPaneRequest"> & {
  * Use `create(StartPaneRequestSchema)` to create a new message.
  */
 export const StartPaneRequestSchema: GenMessage<StartPaneRequest> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 49);
+  messageDesc(file_tymux_v1_tymux, 51);
 
 /**
  * @generated from message tymux.v1.ResetRestartBudgetRequest
@@ -1896,7 +2068,7 @@ export type ResetRestartBudgetRequest = Message<"tymux.v1.ResetRestartBudgetRequ
  * Use `create(ResetRestartBudgetRequestSchema)` to create a new message.
  */
 export const ResetRestartBudgetRequestSchema: GenMessage<ResetRestartBudgetRequest> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 50);
+  messageDesc(file_tymux_v1_tymux, 52);
 
 /**
  * @generated from message tymux.v1.LifecycleEvent
@@ -1955,7 +2127,7 @@ export type LifecycleEvent = Message<"tymux.v1.LifecycleEvent"> & {
  * Use `create(LifecycleEventSchema)` to create a new message.
  */
 export const LifecycleEventSchema: GenMessage<LifecycleEvent> = /*@__PURE__*/
-  messageDesc(file_tymux_v1_tymux, 51);
+  messageDesc(file_tymux_v1_tymux, 53);
 
 /**
  * Whether a pane's/session's backing process is still running. proto3
@@ -2452,10 +2624,12 @@ export const TymuxService: GenService<{
   },
   /**
    * Declares how urgently a client wants a pane's output (capability "pane.activity_hint").
-   * INTERACTIVE panes flush output immediately; BACKGROUND panes batch it for a short window,
-   * trading a few tens of milliseconds of latency for far fewer frames. The hint is advisory,
-   * per pane (not per client), and not persisted: the daemon forgets it on restart. Unknown
-   * pane: NOT_FOUND.
+   * UNSPECIFIED and INTERACTIVE panes flush output immediately (INTERACTIVE is reserved for a
+   * future distinction); BACKGROUND panes batch it for a short window, trading a few tens of
+   * milliseconds of latency for far fewer frames. The hint is advisory, per pane (not per
+   * client), not persisted. It resets to normal when the pane's last Attach stream ends, so
+   * send it again after reconnecting. A hint sent while no stream is open is held for 5 seconds
+   * and applied when one opens. Unknown pane: NOT_FOUND.
    *
    * @generated from rpc tymux.v1.TymuxService.SetPaneActivity
    */

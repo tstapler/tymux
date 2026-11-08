@@ -214,10 +214,12 @@ type TymuxServiceClient interface {
 	// The pane's lifecycle state, policy, counters and timestamps.
 	GetPaneStatus(context.Context, *connect.Request[v1.GetPaneStatusRequest]) (*connect.Response[v1.PaneStatus], error)
 	// Declares how urgently a client wants a pane's output (capability "pane.activity_hint").
-	// INTERACTIVE panes flush output immediately; BACKGROUND panes batch it for a short window,
-	// trading a few tens of milliseconds of latency for far fewer frames. The hint is advisory,
-	// per pane (not per client), and not persisted: the daemon forgets it on restart. Unknown
-	// pane: NOT_FOUND.
+	// UNSPECIFIED and INTERACTIVE panes flush output immediately (INTERACTIVE is reserved for a
+	// future distinction); BACKGROUND panes batch it for a short window, trading a few tens of
+	// milliseconds of latency for far fewer frames. The hint is advisory, per pane (not per
+	// client), not persisted. It resets to normal when the pane's last Attach stream ends, so
+	// send it again after reconnecting. A hint sent while no stream is open is held for 5 seconds
+	// and applied when one opens. Unknown pane: NOT_FOUND.
 	SetPaneActivity(context.Context, *connect.Request[v1.SetPaneActivityRequest]) (*connect.Response[v1.SetPaneActivityResponse], error)
 	// Replaces the pane's process now: a running one gets SIGTERM (SIGKILL after grace) and is
 	// respawned once it exits; a dead one (any state, including STOPPED and FAILED) is respawned
@@ -621,10 +623,12 @@ type TymuxServiceHandler interface {
 	// The pane's lifecycle state, policy, counters and timestamps.
 	GetPaneStatus(context.Context, *connect.Request[v1.GetPaneStatusRequest]) (*connect.Response[v1.PaneStatus], error)
 	// Declares how urgently a client wants a pane's output (capability "pane.activity_hint").
-	// INTERACTIVE panes flush output immediately; BACKGROUND panes batch it for a short window,
-	// trading a few tens of milliseconds of latency for far fewer frames. The hint is advisory,
-	// per pane (not per client), and not persisted: the daemon forgets it on restart. Unknown
-	// pane: NOT_FOUND.
+	// UNSPECIFIED and INTERACTIVE panes flush output immediately (INTERACTIVE is reserved for a
+	// future distinction); BACKGROUND panes batch it for a short window, trading a few tens of
+	// milliseconds of latency for far fewer frames. The hint is advisory, per pane (not per
+	// client), not persisted. It resets to normal when the pane's last Attach stream ends, so
+	// send it again after reconnecting. A hint sent while no stream is open is held for 5 seconds
+	// and applied when one opens. Unknown pane: NOT_FOUND.
 	SetPaneActivity(context.Context, *connect.Request[v1.SetPaneActivityRequest]) (*connect.Response[v1.SetPaneActivityResponse], error)
 	// Replaces the pane's process now: a running one gets SIGTERM (SIGKILL after grace) and is
 	// respawned once it exits; a dead one (any state, including STOPPED and FAILED) is respawned

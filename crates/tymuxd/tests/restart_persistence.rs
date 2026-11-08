@@ -5,6 +5,7 @@
 //! as a subprocess (not just an in-process `Engine`/`TymuxDaemon` call),
 //! kills it, restarts it pointed at the same persisted-sessions directory,
 //! and asserts the reloaded session's `Layout` tree shape is identical.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -603,6 +604,7 @@ async fn restart_policy_and_counters_should_survive_a_daemon_restart_and_backoff
             payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
             resume_from_seq: None,
             subscribe_lifecycle: true,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -615,6 +617,7 @@ async fn restart_policy_and_counters_should_survive_a_daemon_restart_and_backoff
             payload: Some(attach_request::Payload::Input(b"go\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();

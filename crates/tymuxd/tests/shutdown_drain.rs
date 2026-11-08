@@ -1,5 +1,6 @@
 //! SIGTERM must exit 0 within the drain bound even while an Attach stream is open, and a
 //! shutdown must log "received SIGTERM" exactly once. Real `tymuxd` subprocess, real gRPC.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};

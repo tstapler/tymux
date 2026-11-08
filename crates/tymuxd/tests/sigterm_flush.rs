@@ -15,6 +15,7 @@
 //! process is still up, waiting for genuine process exit (not a fixed
 //! sleep), then restarting a second daemon against the same state dir and
 //! asserting the persisted structure survived intact.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};

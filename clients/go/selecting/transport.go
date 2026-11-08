@@ -25,6 +25,8 @@ type Transport interface {
 	CreateWindow(context.Context, *connect.Request[v1.CreateWindowRequest]) (*connect.Response[v1.Session], error)
 	SetRestartPolicy(context.Context, *connect.Request[v1.SetRestartPolicyRequest]) (*connect.Response[v1.SetRestartPolicyResponse], error)
 	GetPaneStatus(context.Context, *connect.Request[v1.GetPaneStatusRequest]) (*connect.Response[v1.PaneStatus], error)
+	// SetPaneActivity needs the capabilities.PaneActivityHint capability; an older daemon answers UNIMPLEMENTED.
+	SetPaneActivity(context.Context, *connect.Request[v1.SetPaneActivityRequest]) (*connect.Response[v1.SetPaneActivityResponse], error)
 	RestartPane(context.Context, *connect.Request[v1.RestartPaneRequest]) (*connect.Response[v1.PaneStatus], error)
 	StopPane(context.Context, *connect.Request[v1.StopPaneRequest]) (*connect.Response[v1.PaneStatus], error)
 	StartPane(context.Context, *connect.Request[v1.StartPaneRequest]) (*connect.Response[v1.PaneStatus], error)

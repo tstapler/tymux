@@ -16,12 +16,17 @@ import (
 
 // Capability strings advertised in ServerInfo.capabilities.
 const (
-	ArgsEnv        = "create_session.args_env"        // CreateSessionRequest.args, env
-	StderrRedirect = "create_session.stderr_redirect" // CreateSessionRequest.stderr_path
-	FileArgs       = "create_session.file_args"       // CreateSessionRequest.arg_specs
-	StdinFile      = "create_session.stdin_file"      // CreateSessionRequest.stdin_path
-	StdinStream    = "create_session.stdin_stream"    // CreateSessionRequest.stdin_stream, WriteStdin RPC
-	PaneLifecycle  = "pane.lifecycle"                 // restart_policy, GetPaneStatus, RestartPane, StopPane, StartPane, ResetRestartBudget, AttachRequest.subscribe_lifecycle
+	ArgsEnv             = "create_session.args_env"        // CreateSessionRequest.args, env
+	StderrRedirect      = "create_session.stderr_redirect" // CreateSessionRequest.stderr_path
+	FileArgs            = "create_session.file_args"       // CreateSessionRequest.arg_specs
+	StdinFile           = "create_session.stdin_file"      // CreateSessionRequest.stdin_path
+	StdinStream         = "create_session.stdin_stream"    // CreateSessionRequest.stdin_stream, WriteStdin RPC
+	PaneLifecycle       = "pane.lifecycle"                 // restart_policy, GetPaneStatus, RestartPane, StopPane, StartPane, ResetRestartBudget, AttachRequest.subscribe_lifecycle
+	PaneActivityHint    = "pane.activity_hint"             // SetPaneActivity RPC
+	SnapshotSeq         = "snapshot.seq"                   // PaneSnapshot.seq on CapturePane and the priming Snapshot
+	AttachWantOutputSeq = "attach.want_output_seq"         // AttachRequest.want_output_seq
+	WorkPools           = "daemon.work_pools"              // ServerInfo.work_pools, ServerInfo.slow_polls
+	OutputSentAt        = "output.sent_at"                 // AttachEvent.sent_at_unix_micros
 )
 
 // Set is the capabilities a daemon advertises.

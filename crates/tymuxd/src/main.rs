@@ -1,3 +1,5 @@
+mod pool;
+
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
@@ -10,6 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+use pool::{Class, PollMonitor, PoolError, Pools};
 use tymux_core::{
     Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneActivity, PaneLookup,
     PersistedLayoutNode, PersistenceBackend, ReplayOutcome, SessionSnapshot, WindowSnapshot,
@@ -41,6 +44,7 @@ use tymux_proto::v1::{
 mod auth;
 mod listener_health;
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive real processes and blocking fixtures
 mod listener_recovery_tests;
 
 /// Default window (Task 1.1.2e / pre-mortem P1 #1) within which a pane
@@ -103,10 +107,50 @@ pub struct TymuxDaemon {
     /// Always `DEFAULT_HEARTBEAT_INTERVAL` in production; only
     /// `test_daemon_with_intervals` (test-only) sets it shorter.
     heartbeat_interval: Duration,
+    /// Dedicated pools for blocking pane work (see `pool`); shared process-wide.
+    pools: Arc<Pools>,
+    monitors: Arc<TaskMonitors>,
+}
+
+/// Poll-time monitors per async task class.
+struct TaskMonitors {
+    forward: Arc<PollMonitor>,
+    input: Arc<PollMonitor>,
+    rpc: Arc<PollMonitor>,
+}
+
+impl TaskMonitors {
+    /// `TYMUXD_SLOW_POLL_MS` (default 10) is the poll duration counted as slow.
+    fn from_env() -> Arc<Self> {
+        let ms = std::env::var("TYMUXD_SLOW_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+        let threshold = Duration::from_millis(ms);
+        Arc::new(Self {
+            forward: PollMonitor::new("attach_forward", threshold),
+            input: PollMonitor::new("attach_input", threshold),
+            rpc: PollMonitor::new("rpc", threshold),
+        })
+    }
 }
 
 /// Process start time, pinned the first time a daemon is constructed.
 static STARTED_AT: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
+/// One set of pools per process, so tests that build many daemons do not each spawn threads.
+fn shared_pools() -> Arc<Pools> {
+    static POOLS: std::sync::OnceLock<Arc<Pools>> = std::sync::OnceLock::new();
+    POOLS.get_or_init(|| Arc::new(Pools::from_env())).clone()
+}
+
+fn pool_status(err: PoolError) -> Status {
+    match err {
+        PoolError::Rejected => Status::resource_exhausted("daemon work queue is full"),
+        PoolError::Panicked => Status::internal("pane task panicked"),
+        PoolError::Cancelled => Status::cancelled("request cancelled"),
+    }
+}
 
 impl TymuxDaemon {
     fn new(engine: Arc<Engine>) -> Self {
@@ -129,6 +173,8 @@ impl TymuxDaemon {
             resume_outcome_counters: Arc::new(ResumeOutcomeCounters::new()),
             grace_period_duration,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            pools: shared_pools(),
+            monitors: TaskMonitors::from_env(),
         }
     }
 
@@ -550,6 +596,7 @@ fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot, live: bool) 
         cursor_pending_wrap: snap.cursor_pending_wrap,
         state: PaneState::Unspecified as i32,
         exit_code: None,
+        seq: None,
         grid: snap
             .grid
             .into_iter()
@@ -662,6 +709,7 @@ async fn send_exited_event(
     tracing::info!(pane_id = %pane.id, "pane exited, closing attach stream");
     warn_if_exit_follows_disconnect(pane.id, disconnect_tracker, disconnect_regression_window);
     let event = AttachEvent {
+        sent_at_unix_micros: 0,
         payload: Some(attach_event::Payload::Exited(ExitStatus {
             code: pane.exit_code(),
         })),
@@ -846,6 +894,7 @@ fn forward_step_for_output_result(
                 ForwardStep::Skip
             } else if emit_output_chunk {
                 ForwardStep::Emit(Box::new(AttachEvent {
+                    sent_at_unix_micros: 0,
                     payload: Some(attach_event::Payload::OutputChunk(OutputChunk {
                         seq,
                         data: bytes,
@@ -853,6 +902,7 @@ fn forward_step_for_output_result(
                 }))
             } else {
                 ForwardStep::Emit(Box::new(AttachEvent {
+                    sent_at_unix_micros: 0,
                     payload: Some(attach_event::Payload::Output(bytes)),
                 }))
             }
@@ -860,6 +910,7 @@ fn forward_step_for_output_result(
         Err(RecvError::Lagged(n)) => {
             tracing::warn!(pane_id = %pane_id, skipped = n, "attach consumer lagged, output_gap signaled");
             ForwardStep::Emit(Box::new(AttachEvent {
+                sent_at_unix_micros: 0,
                 payload: Some(attach_event::Payload::OutputGap(true)),
             }))
         }
@@ -867,8 +918,8 @@ fn forward_step_for_output_result(
     }
 }
 
-/// Upper bound on one coalesced output event; keeps a single gRPC message well under the
-/// default 4 MiB limit and bounds how long one pane holds the connection's send path.
+/// Soft cap on one coalesced output event: merging stops once a batch reaches it, so a batch can
+/// overshoot by one pty read (32 KiB). Keeps a gRPC message far under the default 4 MiB limit.
 const MAX_OUTPUT_BATCH_BYTES: usize = 64 * 1024;
 /// How long a `Background` pane gathers output before flushing, so a pane nobody is looking
 /// at costs a few frames per second instead of one per pty read.
@@ -947,6 +998,31 @@ fn try_recv_as_recv(
 /// cap keeps typing live when the resize is stuck behind a busy pane's parser lock.
 const RESIZE_BARRIER_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Applies one resize on the resize pool, retrying a panicked or cancelled attempt a few times
+/// (a resize is idempotent). If every attempt fails the error is logged and the caller still
+/// releases the keystroke barrier, so typing is not delayed by 50 ms forever; the pane then keeps
+/// its old size until the client's next resize.
+async fn apply_resize_with_retry<A>(pools: &Pools, apply: &Arc<A>, rows: u16, cols: u16)
+where
+    A: Fn(u16, u16) + Send + Sync + 'static,
+{
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let apply = apply.clone();
+        match pools
+            .run_must_land(Class::Resize, move || apply(rows, cols))
+            .await
+        {
+            Ok(()) => return,
+            Err(e) => tracing::error!(
+                rows, cols, attempt, error = ?e,
+                "resize failed on the pool; retrying"
+            ),
+        }
+    }
+    tracing::error!(rows, cols, "resize abandoned after repeated failures");
+}
+
 /// Applies a stream's resizes off the input path with latest-wins coalescing, and lets the input
 /// path wait for the ones it already sent.
 struct ResizeLane {
@@ -958,6 +1034,7 @@ struct ResizeLane {
 impl ResizeLane {
     /// Dropping the lane closes it: the worker applies the last pending size, then exits.
     fn spawn(
+        pools: Arc<Pools>,
         apply: impl Fn(u16, u16) + Send + Sync + 'static,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let (request_tx, mut request_rx) = tokio::sync::watch::channel((0u64, None));
@@ -967,8 +1044,7 @@ impl ResizeLane {
             while request_rx.changed().await.is_ok() {
                 let (generation, size) = *request_rx.borrow_and_update();
                 if let Some((rows, cols)) = size {
-                    let apply = apply.clone();
-                    let _ = tokio::task::spawn_blocking(move || apply(rows, cols)).await;
+                    apply_resize_with_retry(&pools, &apply, rows, cols).await;
                 }
                 applied_tx.send_replace(generation);
             }
@@ -1001,20 +1077,46 @@ impl ResizeLane {
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn stamp_item(item: Result<AttachEvent, Status>) -> Result<AttachEvent, Status> {
+    item.map(stamp_sent_at)
+}
+
+/// Records the wall-clock send time on an outgoing Attach frame (`output.sent_at` capability).
+fn stamp_sent_at(mut event: AttachEvent) -> AttachEvent {
+    event.sent_at_unix_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64);
+    event
+}
+
+/// Unspecified and unknown wire values mean `Normal`, so a newer client's new value degrades.
+fn activity_from_proto(value: i32) -> PaneActivity {
+    match ProtoPaneActivity::try_from(value) {
+        Ok(ProtoPaneActivity::Interactive) => PaneActivity::Interactive,
+        Ok(ProtoPaneActivity::Background) => PaneActivity::Background,
+        _ => PaneActivity::Normal,
+    }
+}
+
 /// Builds the priming `Snapshot` `AttachEvent` and its sequence number —
 /// shared by the no-resume path (`attach()`'s `resume_from_seq: None`
 /// arm) and the `GapExceeded` fallback path (Epic 2.2.2), both of which
 /// prime a reattaching client with `pane.snapshot_with_seq()` today.
 #[allow(clippy::result_large_err)]
 async fn snapshot_priming_event(
+    pools: &Pools,
     pane: &Arc<tymux_core::Pane>,
     pane_id_str: &str,
 ) -> Result<(AttachEvent, u64), Status> {
     let pane = pane.clone();
     let id = pane_id_str.to_owned();
-    tokio::task::spawn_blocking(move || snapshot_priming_event_blocking(&pane, &id))
+    pools
+        .run(Class::Work, move || {
+            snapshot_priming_event_blocking(&pane, &id)
+        })
         .await
-        .map_err(|e| Status::internal(format!("attach snapshot task failed: {e}")))
+        .map_err(pool_status)
 }
 
 fn snapshot_priming_event_blocking(
@@ -1022,12 +1124,11 @@ fn snapshot_priming_event_blocking(
     pane_id_str: &str,
 ) -> (AttachEvent, u64) {
     let (pane_snapshot, snapshot_seq) = pane.snapshot_with_seq();
+    let mut proto_snapshot = snapshot_to_proto(pane_id_str, pane_snapshot, true);
+    proto_snapshot.seq = Some(snapshot_seq);
     let event = AttachEvent {
-        payload: Some(attach_event::Payload::Snapshot(snapshot_to_proto(
-            pane_id_str,
-            pane_snapshot,
-            true,
-        ))),
+        sent_at_unix_micros: 0,
+        payload: Some(attach_event::Payload::Snapshot(proto_snapshot)),
     };
     (event, snapshot_seq)
 }
@@ -1068,6 +1169,42 @@ impl TymuxService for TymuxDaemon {
             started_at_unix,
             open_fds,
             max_open_fds: listener_health::nofile_soft_limit(),
+            work_pools: self
+                .pools
+                .snapshot()
+                .into_iter()
+                .map(|c| tymux_proto::v1::WorkPoolStats {
+                    class: c.class.to_string(),
+                    threads: c.threads as u32,
+                    queue_depth: c.queue_depth,
+                    submitted: c.submitted,
+                    completed: c.completed,
+                    skipped_cancelled: c.skipped_cancelled,
+                    panicked: c.panicked,
+                    rejected: c.rejected,
+                    wait_micros_total: c.wait_micros_total,
+                    wait_micros_max: c.wait_micros_max,
+                    run_micros_total: c.run_micros_total,
+                    run_micros_max: c.run_micros_max,
+                    overflowed: c.overflowed,
+                    running: c.running,
+                })
+                .collect(),
+            slow_polls: [
+                &self.monitors.forward,
+                &self.monitors.input,
+                &self.monitors.rpc,
+            ]
+            .iter()
+            .map(|m| m.snapshot())
+            .map(|p| tymux_proto::v1::SlowPollStats {
+                task_class: p.class.to_string(),
+                polls: p.polls,
+                slow_polls: p.slow_polls,
+                total_poll_micros: p.total_poll_micros,
+                max_poll_micros: p.max_poll_micros,
+            })
+            .collect(),
         }))
     }
 
@@ -1206,10 +1343,15 @@ impl TymuxService for TymuxDaemon {
         // Rendering walks the whole grid under the pane's parser lock, which a chatty pane's
         // reader thread holds almost continuously; keep that wait off the async workers.
         let pane_for_render = pane.clone();
-        let grid = tokio::task::spawn_blocking(move || pane_for_render.snapshot_at_offset(offset))
+        let (grid, snapshot_seq) = self
+            .pools
+            .run(Class::Work, move || {
+                pane_for_render.snapshot_at_offset_with_seq(offset)
+            })
             .await
-            .map_err(|e| Status::internal(format!("capture_pane task failed: {e}")))?;
+            .map_err(pool_status)?;
         let mut snapshot = snapshot_to_proto(&req.pane_id, grid, live);
+        snapshot.seq = Some(snapshot_seq);
         if !live {
             snapshot.exit_code = pane.exit_code();
         }
@@ -1414,12 +1556,8 @@ impl TymuxService for TymuxDaemon {
         request: Request<SetPaneActivityRequest>,
     ) -> Result<Response<SetPaneActivityResponse>, Status> {
         let req = request.into_inner();
-        let pane = resolve_live_pane(&self.engine, parse_uuid(&req.pane_id)?)?;
-        pane.set_activity(match ProtoPaneActivity::try_from(req.activity) {
-            Ok(ProtoPaneActivity::Interactive) => PaneActivity::Interactive,
-            Ok(ProtoPaneActivity::Background) => PaneActivity::Background,
-            _ => PaneActivity::Normal,
-        });
+        let pane = resolve_attachable_pane(&self.engine, parse_uuid(&req.pane_id)?)?;
+        pane.set_activity(activity_from_proto(req.activity));
         Ok(Response::new(SetPaneActivityResponse {}))
     }
 
@@ -1578,6 +1716,7 @@ impl TymuxService for TymuxDaemon {
         // `attach_should_reject_before_reading_resume_from_seq_when_first_message_omits_pane_id`).
         let resume_from_seq = first.resume_from_seq;
         let subscribe_lifecycle = first.subscribe_lifecycle;
+        let want_output_seq = first.want_output_seq;
         let pane_id = parse_uuid(&pane_id_str)?;
         let pane = resolve_attachable_pane(&self.engine, pane_id).inspect_err(|status| {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "attach: pane unavailable");
@@ -1594,7 +1733,12 @@ impl TymuxService for TymuxDaemon {
             resume_requested = resume_from_seq.is_some(),
             "attach: gauge incremented"
         );
-        let attached_sessions_gauge = self.attached_sessions_gauge.clone();
+        // Created before the first await below so a cancelled or failed attach still decrements.
+        let gauge_guard = AttachedGaugeGuard {
+            gauge: self.attached_sessions_gauge.clone(),
+            pane_id,
+        };
+        let attach_ticket = pane.begin_attach();
 
         // Resize is window-scoped (ADR-004): track this client's reported
         // viewport against the pane's window and apply the dimension-wise
@@ -1668,12 +1812,13 @@ impl TymuxService for TymuxDaemon {
                     // sending resume_from_seq, so its live tail still
                     // uses the seq'd output_chunk field.
                     let gap_event = AttachEvent {
+                        sent_at_unix_micros: 0,
                         payload: Some(attach_event::Payload::GapExceeded(GapExceeded {
                             oldest_available_seq: oldest_available_seq.unwrap_or(0),
                         })),
                     };
                     let (snapshot_event, snapshot_seq) =
-                        snapshot_priming_event(&pane, &pane_id_str).await?;
+                        snapshot_priming_event(&self.pools, &pane, &pane_id_str).await?;
                     (
                         vec![gap_event, snapshot_event],
                         snapshot_seq,
@@ -1691,8 +1836,13 @@ impl TymuxService for TymuxDaemon {
                 );
                 // Unchanged pre-feature path (Epic 2.4).
                 let (snapshot_event, snapshot_seq) =
-                    snapshot_priming_event(&pane, &pane_id_str).await?;
-                (vec![snapshot_event], snapshot_seq, false, Vec::new())
+                    snapshot_priming_event(&self.pools, &pane, &pane_id_str).await?;
+                (
+                    vec![snapshot_event],
+                    snapshot_seq,
+                    want_output_seq,
+                    Vec::new(),
+                )
             }
         };
         live_client.go_live_after(live_threshold_seq);
@@ -1709,11 +1859,9 @@ impl TymuxService for TymuxDaemon {
         let disconnect_tracker_for_exit = self.disconnect_tracker.clone();
         let disconnect_regression_window = self.disconnect_regression_window;
         let heartbeat_interval_duration = self.heartbeat_interval;
-        let forward_handle = tokio::spawn(async move {
-            let _gauge_guard = AttachedGaugeGuard {
-                gauge: attached_sessions_gauge,
-                pane_id,
-            };
+        let forward_monitor = self.monitors.forward.clone();
+        let forward_handle = tokio::spawn(forward_monitor.instrument(async move {
+            let _gauge_guard = gauge_guard;
 
             // Task 2.3.1a: drain the resume replay backlog (if any) first,
             // racing pane.wait_exit() per chunk with the same `biased`
@@ -1725,25 +1873,26 @@ impl TymuxService for TymuxDaemon {
             // before the exit is ever noticed.
             for (seq, data) in replay_chunks {
                 tokio::select! {
-                    biased;
-                    result = forward_tx.send(Ok(AttachEvent {
-                        payload: Some(attach_event::Payload::OutputChunk(OutputChunk { seq, data })),
-                    })) => {
-                        if result.is_err() {
-                            return;
-                        }
-                    }
-                    _ = pane_for_exit.wait_final_exit() => {
-                        send_exited_event(
-                            &pane_for_exit,
-                            &forward_tx,
-                            &disconnect_tracker_for_exit,
-                            disconnect_regression_window,
-                        )
-                        .await;
-                        return;
-                    }
-                }
+                                   biased;
+                                   result = forward_tx.send(Ok(AttachEvent {
+                sent_at_unix_micros: 0,
+                                       payload: Some(attach_event::Payload::OutputChunk(OutputChunk { seq, data })),
+                                   })) => {
+                                       if result.is_err() {
+                                           return;
+                                       }
+                                   }
+                                   _ = pane_for_exit.wait_final_exit() => {
+                                       send_exited_event(
+                                           &pane_for_exit,
+                                           &forward_tx,
+                                           &disconnect_tracker_for_exit,
+                                           disconnect_regression_window,
+                                       )
+                                       .await;
+                                       return;
+                                   }
+                               }
             }
 
             // Task 3.2.1a: a periodic application-level proof-of-life event
@@ -1766,91 +1915,94 @@ impl TymuxService for TymuxDaemon {
                 // wait_exit() is checked before the heartbeat tick so a
                 // pane exit is never masked by a coincident 15s tick.
                 tokio::select! {
-                    biased;
-                    result = output_rx.recv() => {
-                        // A lagged client skipped output, so the daemon must answer queries
-                        // until it is receiving again.
-                        match &result {
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                live_client.set_lagged(true);
-                            }
-                            Ok(_) => live_client.set_lagged(false),
-                            Err(_) => {}
-                        }
-                        let result = match result {
-                            Ok(first) => {
-                                if pane_for_exit.activity() == PaneActivity::Background {
-                                    tokio::time::sleep(BACKGROUND_FLUSH_WINDOW).await;
-                                }
-                                let batch = coalesce_output(first, live_threshold_seq, &mut || {
-                                    try_recv_as_recv(&mut output_rx)
-                                });
-                                if let Some(data) = batch.data {
-                                    if let ForwardStep::Emit(event) = forward_step_for_output_result(
-                                        Ok(data), pane_for_exit.id, live_threshold_seq, emit_output_chunk,
-                                    ) {
-                                        if forward_tx.send(Ok(*event)).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if batch.closed {
-                                    return;
-                                }
-                                match batch.lagged {
-                                    Some(n) => {
-                                        live_client.set_lagged(true);
-                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n))
-                                    }
-                                    None => continue,
-                                }
-                            }
-                            other => other,
-                        };
-                        match forward_step_for_output_result(result, pane_for_exit.id, live_threshold_seq, emit_output_chunk) {
-                            ForwardStep::Emit(event) => {
-                                if forward_tx.send(Ok(*event)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            ForwardStep::Skip => continue,
-                            ForwardStep::End => return,
-                        }
-                    }
-                    event = next_lifecycle_event(&mut lifecycle_rx) => {
-                        let event = AttachEvent {
-                            payload: Some(attach_event::Payload::Lifecycle(
-                                lifecycle_event_to_proto(&event),
-                            )),
-                        };
-                        if forward_tx.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                    _ = pane_for_exit.wait_final_exit() => {
-                        send_exited_event(
-                            &pane_for_exit,
-                            &forward_tx,
-                            &disconnect_tracker_for_exit,
-                            disconnect_regression_window,
-                        )
-                        .await;
-                        return;
-                    }
-                    _ = heartbeat_interval.tick() => {
-                        if forward_tx.send(Ok(AttachEvent {
-                            payload: Some(attach_event::Payload::Heartbeat(Heartbeat {})),
-                        })).await.is_err() {
-                            return;
-                        }
-                    }
-                }
+                                   biased;
+                                   result = output_rx.recv() => {
+                                       // A lagged client skipped output, so the daemon must answer queries
+                                       // until it is receiving again.
+                                       match &result {
+                                           Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                               live_client.set_lagged(true);
+                                           }
+                                           Ok(_) => live_client.set_lagged(false),
+                                           Err(_) => {}
+                                       }
+                                       let result = match result {
+                                           Ok(first) => {
+                                               if pane_for_exit.activity() == PaneActivity::Background {
+                                                   tokio::time::sleep(BACKGROUND_FLUSH_WINDOW).await;
+                                               }
+                                               let batch = coalesce_output(first, live_threshold_seq, &mut || {
+                                                   try_recv_as_recv(&mut output_rx)
+                                               });
+                                               if let Some(data) = batch.data {
+                                                   if let ForwardStep::Emit(event) = forward_step_for_output_result(
+                                                       Ok(data), pane_for_exit.id, live_threshold_seq, emit_output_chunk,
+                                                   ) {
+                                                       if forward_tx.send(Ok(*event)).await.is_err() {
+                                                           return;
+                                                       }
+                                                   }
+                                               }
+                                               if batch.closed {
+                                                   return;
+                                               }
+                                               match batch.lagged {
+                                                   Some(n) => {
+                                                       live_client.set_lagged(true);
+                                                       Err(tokio::sync::broadcast::error::RecvError::Lagged(n))
+                                                   }
+                                                   None => continue,
+                                               }
+                                           }
+                                           other => other,
+                                       };
+                                       match forward_step_for_output_result(result, pane_for_exit.id, live_threshold_seq, emit_output_chunk) {
+                                           ForwardStep::Emit(event) => {
+                                               if forward_tx.send(Ok(*event)).await.is_err() {
+                                                   return;
+                                               }
+                                           }
+                                           ForwardStep::Skip => continue,
+                                           ForwardStep::End => return,
+                                       }
+                                   }
+                                   event = next_lifecycle_event(&mut lifecycle_rx) => {
+                                       let event = AttachEvent {
+                sent_at_unix_micros: 0,
+                                           payload: Some(attach_event::Payload::Lifecycle(
+                                               lifecycle_event_to_proto(&event),
+                                           )),
+                                       };
+                                       if forward_tx.send(Ok(event)).await.is_err() {
+                                           return;
+                                       }
+                                   }
+                                   _ = pane_for_exit.wait_final_exit() => {
+                                       send_exited_event(
+                                           &pane_for_exit,
+                                           &forward_tx,
+                                           &disconnect_tracker_for_exit,
+                                           disconnect_regression_window,
+                                       )
+                                       .await;
+                                       return;
+                                   }
+                                   _ = heartbeat_interval.tick() => {
+                                       if forward_tx.send(Ok(AttachEvent {
+                sent_at_unix_micros: 0,
+                                           payload: Some(attach_event::Payload::Heartbeat(Heartbeat {})),
+                                       })).await.is_err() {
+                                           return;
+                                       }
+                                   }
+                               }
             }
-        });
+        }));
         // Spawned tasks that panic vanish silently by default — surface it.
         tokio::spawn(supervise(pane_id, "forward", forward_handle));
 
         let pane_for_input = pane.clone();
+        let pools_for_input = self.pools.clone();
         let engine_for_input = self.engine.clone();
         let disconnect_tracker_for_input = self.disconnect_tracker.clone();
         let grace_period_duration = self.grace_period_duration;
@@ -1861,13 +2013,16 @@ impl TymuxService for TymuxDaemon {
         let mut resize_task = None;
         if let Some(window_id) = window_id {
             let engine_for_resize = self.engine.clone();
-            let (lane, task) = ResizeLane::spawn(move |rows, cols| {
+            let (lane, task) = ResizeLane::spawn(self.pools.clone(), move |rows, cols| {
                 engine_for_resize.report_viewport_and_recompute(window_id, client_id, rows, cols);
             });
             resize_lane = Some(lane);
             resize_task = Some(task);
         }
-        let input_handle = tokio::spawn(async move {
+        let input_monitor = self.monitors.input.clone();
+        let input_handle = tokio::spawn(input_monitor.instrument(async move {
+            // Held for the life of the inbound half, which ends promptly when the client leaves.
+            let _attach_ticket = attach_ticket;
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
                     // Typing into a pane whose process is between lives has nowhere to go.
@@ -1879,13 +2034,17 @@ impl TymuxService for TymuxDaemon {
                         // A full pty input queue blocks write_all; awaiting the blocking task
                         // keeps keystroke order without parking an async worker.
                         let pane = pane_for_input.clone();
-                        match tokio::task::spawn_blocking(move || pane.write_input(&bytes)).await {
+                        let bytes = Arc::new(bytes);
+                        match pools_for_input
+                            .run_must_land(Class::Input, move || pane.write_input(&bytes))
+                            .await
+                        {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
                                 tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input failed");
                             }
                             Err(e) => {
-                                tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input task failed");
+                                tracing::warn!(pane_id = %pane_for_input.id, error = ?e, "write_input task failed");
                             }
                         }
                     }
@@ -1970,11 +2129,13 @@ impl TymuxService for TymuxDaemon {
                     );
                 });
             }
-        });
+        }));
         tokio::spawn(supervise(pane_id, "input", input_handle));
 
         Ok(Response::new(
-            Box::pin(ReceiverStream::new(rx)) as Self::AttachStream
+            // Stamped as tonic polls the stream, i.e. after the frame has waited in the send
+            // queue, so receive-minus-stamp covers only flow control and the client's own queue.
+            Box::pin(ReceiverStream::new(rx).map(stamp_item)) as Self::AttachStream,
         ))
     }
 }
@@ -2373,6 +2534,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // runtime teardown blocks. Exiting drops the connections; panes are untouched (no
             // pane Drop kills children, and state is already durable).
             std::thread::spawn(move || {
+                #[allow(clippy::disallowed_methods)] // a dedicated OS thread, not an async worker
                 std::thread::sleep(shutdown_drain);
                 tracing::warn!(
                     drain_secs = shutdown_drain.as_secs_f64(),
@@ -2899,6 +3061,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive real files and blocking fixtures
 mod tests {
     use super::*;
     use futures::FutureExt;
@@ -2934,6 +3097,8 @@ mod tests {
             resume_outcome_counters: Arc::new(ResumeOutcomeCounters::new()),
             grace_period_duration,
             heartbeat_interval,
+            pools: shared_pools(),
+            monitors: TaskMonitors::from_env(),
         }
     }
 
@@ -3109,6 +3274,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -3124,6 +3290,7 @@ mod tests {
             })),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -3534,6 +3701,152 @@ mod tests {
         assert_eq!(snapshot.grid.len(), 24);
     }
 
+    /// CapturePane's seq is read under the grid's lock, so once the pane is quiet it must equal
+    /// the pane's own output_seq — the value a client orders its Attach stream against.
+    #[tokio::test]
+    async fn capture_pane_should_report_the_output_seq_its_grid_reflects() {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane = match engine.pane_lookup(parse_uuid(&pane_id_str).unwrap()) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"echo SEQ-MARKER\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.snapshot_with_seq().1 == 0 {
+            assert!(Instant::now() < deadline, "pane produced no output");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let snapshot = daemon
+            .capture_pane(Request::new(capture_req(pane_id_str)))
+            .await
+            .unwrap()
+            .into_inner();
+        let seq = snapshot.seq.expect("CapturePane must report seq");
+        assert!(seq > 0);
+        assert_eq!(seq, pane.snapshot_with_seq().1);
+    }
+
+    /// Every Attach frame carries the wall-clock send time, between "before attach" and "now".
+    #[tokio::test]
+    async fn attach_frames_should_carry_a_send_timestamp() {
+        let engine = Arc::new(Engine::new());
+        let mut client = spawn_test_server(TymuxDaemon::new(engine.clone())).await;
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let micros = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64
+        };
+        let before = micros();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: None,
+            subscribe_lifecycle: false,
+            want_output_seq: false,
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        let sent_at = first.sent_at_unix_micros;
+        assert!(
+            sent_at >= before && sent_at <= micros(),
+            "stamp {sent_at} must fall within [{before}, now]"
+        );
+    }
+
+    /// With want_output_seq, a full attach still primes with a Snapshot (carrying its seq) but
+    /// live output arrives only as seq'd OutputChunk, strictly after the snapshot's seq.
+    #[tokio::test]
+    async fn attach_should_deliver_output_chunks_after_snapshot_seq_when_want_output_seq() {
+        let engine = Arc::new(Engine::new());
+        let mut client = spawn_test_server(TymuxDaemon::new(engine.clone())).await;
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane = match engine.pane_lookup(parse_uuid(&pane_id_str).unwrap()) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: None,
+            subscribe_lifecycle: false,
+            want_output_seq: true,
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        let snapshot_seq = match first.payload {
+            Some(attach_event::Payload::Snapshot(s)) => {
+                s.seq.expect("priming Snapshot must carry seq")
+            }
+            other => panic!("expected a priming Snapshot, got {other:?}"),
+        };
+
+        pane.write_input(b"echo CHUNK-MARKER\n").unwrap();
+        let mut last = snapshot_seq;
+        let mut saw_chunk = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !saw_chunk {
+            assert!(Instant::now() < deadline, "no OutputChunk arrived");
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("stream stalled")
+                .unwrap()
+                .expect("stream ended");
+            match event.payload {
+                Some(attach_event::Payload::OutputChunk(chunk)) => {
+                    assert!(chunk.seq > last, "seq must increase past the snapshot's");
+                    last = chunk.seq;
+                    saw_chunk = true;
+                }
+                Some(attach_event::Payload::Output(_)) => {
+                    panic!("want_output_seq must not emit legacy Output")
+                }
+                _ => {}
+            }
+        }
+    }
+
     #[tokio::test]
     async fn create_session_should_report_liveness_live_when_pane_freshly_spawned() {
         let daemon = test_daemon();
@@ -3913,7 +4226,7 @@ mod tests {
     async fn resize_lane_barrier_should_return_after_the_requested_resize_is_applied() {
         let applied = Arc::new(Mutex::new(Vec::new()));
         let log = applied.clone();
-        let (mut lane, _task) = ResizeLane::spawn(move |r, c| {
+        let (mut lane, _task) = ResizeLane::spawn(shared_pools(), move |r, c| {
             std::thread::sleep(Duration::from_millis(20));
             log.lock().unwrap().push((r, c));
         });
@@ -3926,7 +4239,7 @@ mod tests {
     async fn resize_lane_barrier_should_give_up_after_the_timeout_when_the_resize_is_stuck() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
-        let (mut lane, _task) = ResizeLane::spawn(move |_, _| {
+        let (mut lane, _task) = ResizeLane::spawn(shared_pools(), move |_, _| {
             let _ = release_rx.lock().unwrap().recv();
         });
         lane.request(30, 100);
@@ -3940,7 +4253,7 @@ mod tests {
     async fn resize_lane_should_collapse_a_burst_to_the_final_size_and_exit_when_dropped() {
         let applied = Arc::new(Mutex::new(Vec::new()));
         let log = applied.clone();
-        let (mut lane, task) = ResizeLane::spawn(move |r, c| {
+        let (mut lane, task) = ResizeLane::spawn(shared_pools(), move |r, c| {
             std::thread::sleep(Duration::from_millis(10));
             log.lock().unwrap().push((r, c));
         });
@@ -3963,9 +4276,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resize_lane_should_retry_a_panicking_resize_and_only_then_release_the_barrier() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (mut lane, _task) = ResizeLane::spawn(shared_pools(), move |_, _| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("first attempt fails");
+            }
+        });
+        lane.request(30, 100);
+        lane.barrier(Duration::from_secs(5)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one panic, then the retry that landed"
+        );
+    }
+
+    #[tokio::test]
     async fn resize_lane_barrier_should_not_wait_when_nothing_was_requested() {
-        let (lane, _task) = ResizeLane::spawn(|_, _| panic!("no resize requested"));
+        let (lane, _task) = ResizeLane::spawn(shared_pools(), |_, _| panic!("no resize requested"));
         lane.barrier(Duration::from_millis(1)).await;
+    }
+
+    #[test]
+    fn activity_from_proto_should_treat_unspecified_and_unknown_values_as_normal() {
+        assert_eq!(
+            activity_from_proto(ProtoPaneActivity::Unspecified as i32),
+            PaneActivity::Normal
+        );
+        assert_eq!(activity_from_proto(99), PaneActivity::Normal);
+        assert_eq!(activity_from_proto(-1), PaneActivity::Normal);
+        assert_eq!(
+            activity_from_proto(ProtoPaneActivity::Background as i32),
+            PaneActivity::Background
+        );
+        assert_eq!(
+            activity_from_proto(ProtoPaneActivity::Interactive as i32),
+            PaneActivity::Interactive
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_should_release_the_gauge_when_cancelled_while_priming() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+        let gauge = daemon.attached_sessions_gauge.clone();
+        let mut client = spawn_test_server(daemon).await;
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let pane = match engine.pane_lookup(parse_uuid(&pane_id).unwrap()) {
+            PaneLookup::Live(p) => p,
+            _ => panic!("pane must be live"),
+        };
+        let hold = pane.hold_grid_lock_for_test();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
+            subscribe_lifecycle: false,
+            want_output_seq: false,
+        })
+        .await
+        .unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.attach(Request::new(ReceiverStream::new(rx))),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "priming must still be blocked on the grid lock"
+        );
+        drop(tx);
+        drop(hold);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while gauge.load(Ordering::SeqCst) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a cancelled attach must not leak the gauge"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_pane_activity_should_work_on_a_pane_in_restart_backoff_and_reset_when_the_last_attach_ends(
+    ) {
+        let (daemon, _clock) = supervised_daemon();
+        let mut client = spawn_test_server(daemon.clone()).await;
+        let session = client
+            .create_session(script_req(
+                "t",
+                "exit 3",
+                Some(policy_req(ProtoRestartMode::Always)),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        // The pane may already be in backoff before we attach, so poll its state, not events.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = client
+                .get_pane_status(GetPaneStatusRequest {
+                    pane_id: pane_id.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            if status.state == PaneState::Backoff as i32 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pane never entered backoff");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (tx, stream) = attach_with_lifecycle(&mut client, &pane_id, true).await;
+        client
+            .set_pane_activity(SetPaneActivityRequest {
+                pane_id: pane_id.clone(),
+                activity: ProtoPaneActivity::Background as i32,
+            })
+            .await
+            .expect("a pane in backoff is still attachable, so it accepts a hint");
+        let pane = match daemon.engine.held_pane(parse_uuid(&pane_id).unwrap()) {
+            Some(p) => p,
+            None => panic!("pane in backoff must be held"),
+        };
+        assert_eq!(pane.activity(), PaneActivity::Background);
+        drop(tx);
+        drop(stream);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.activity() != PaneActivity::Normal {
+            assert!(
+                Instant::now() < deadline,
+                "hint must clear when the last attach ends"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -3977,18 +4429,32 @@ mod tests {
             .unwrap()
             .into_inner();
         let pane_id = sole_pane(&session.windows[0]).id.clone();
-        daemon
-            .set_pane_activity(Request::new(SetPaneActivityRequest {
-                pane_id: pane_id.clone(),
-                activity: ProtoPaneActivity::Background as i32,
-            }))
-            .await
-            .unwrap();
         let pane = match daemon.engine.pane_lookup(parse_uuid(&pane_id).unwrap()) {
             PaneLookup::Live(p) => p,
             _ => panic!("pane must be live"),
         };
-        assert_eq!(pane.activity(), PaneActivity::Background);
+        let hint = |activity: ProtoPaneActivity| SetPaneActivityRequest {
+            pane_id: pane_id.clone(),
+            activity: activity as i32,
+        };
+        // No stream yet: the hint is held, not applied, and a later stream starts from it.
+        daemon
+            .set_pane_activity(Request::new(hint(ProtoPaneActivity::Background)))
+            .await
+            .unwrap();
+        assert_eq!(pane.activity(), PaneActivity::Normal);
+
+        let _ticket = pane.begin_attach();
+        assert_eq!(
+            pane.activity(),
+            PaneActivity::Background,
+            "the pending hint applies"
+        );
+        daemon
+            .set_pane_activity(Request::new(hint(ProtoPaneActivity::Interactive)))
+            .await
+            .unwrap();
+        assert_eq!(pane.activity(), PaneActivity::Interactive);
         let err = daemon
             .set_pane_activity(Request::new(SetPaneActivityRequest {
                 pane_id: Uuid::new_v4().to_string(),
@@ -3997,6 +4463,47 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// A reconnect that overlaps the old stream keeps the new client's hint; only the last
+    /// stream ending, or the first one starting, resets it.
+    #[tokio::test]
+    async fn activity_hint_should_follow_the_open_stream_count_across_overlapping_reconnects() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let pane = match daemon.engine.pane_lookup(parse_uuid(&pane_id).unwrap()) {
+            PaneLookup::Live(p) => p,
+            _ => panic!("pane must be live"),
+        };
+        let old = pane.begin_attach();
+        assert!(pane.set_activity(PaneActivity::Background));
+        // The client reconnects before the daemon notices the old stream died.
+        let new = pane.begin_attach();
+        assert!(pane.set_activity(PaneActivity::Background));
+        drop(old);
+        assert_eq!(
+            pane.activity(),
+            PaneActivity::Background,
+            "the new stream's hint survives"
+        );
+        drop(new);
+        assert_eq!(pane.activity(), PaneActivity::Normal);
+        assert!(
+            !pane.set_activity(PaneActivity::Background),
+            "no stream: held, not applied"
+        );
+        assert_eq!(pane.activity(), PaneActivity::Normal);
+        let _first = pane.begin_attach();
+        assert_eq!(
+            pane.activity(),
+            PaneActivity::Background,
+            "a hint sent just before the stream applies"
+        );
     }
 
     /// Story 2.2.1 AC2 / REQ-4 / Task 2.2.1c: a live chunk whose seq is
@@ -4053,6 +4560,7 @@ mod tests {
     fn attach_event_output_should_roundtrip_seq_and_data_when_encoded_and_decoded_as_output_chunk()
     {
         let event = AttachEvent {
+            sent_at_unix_micros: 0,
             payload: Some(attach_event::Payload::OutputChunk(
                 tymux_proto::v1::OutputChunk {
                     seq: 7,
@@ -4088,6 +4596,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         };
         let encoded = prost::Message::encode_to_vec(&legacy_request);
         let decoded: AttachRequest = prost::Message::decode(encoded.as_slice()).unwrap();
@@ -4099,6 +4608,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: Some(0),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         };
         let encoded = prost::Message::encode_to_vec(&resuming_request);
         let decoded: AttachRequest = prost::Message::decode(encoded.as_slice()).unwrap();
@@ -4202,6 +4712,7 @@ mod tests {
             payload: None,
             resume_from_seq: Some(5),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4323,6 +4834,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4531,6 +5043,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4698,6 +5211,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4792,6 +5306,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4872,6 +5387,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4936,6 +5452,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str.clone())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4981,6 +5498,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str.clone())),
             resume_from_seq: Some(resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5027,6 +5545,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5124,6 +5643,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5166,6 +5686,7 @@ mod tests {
             match event {
                 Some(AttachEvent {
                     payload: Some(attach_event::Payload::Output(bytes)),
+                    ..
                 }) => {
                     streamed.extend_from_slice(&bytes);
                     if String::from_utf8_lossy(&streamed).contains("DONE-MARKER") {
@@ -5232,6 +5753,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5267,6 +5789,7 @@ mod tests {
             )),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5352,6 +5875,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5359,6 +5883,7 @@ mod tests {
             payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5415,6 +5940,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5422,6 +5948,7 @@ mod tests {
             payload: Some(attach_request::Payload::Input(b"exit 7\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5487,6 +6014,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5494,6 +6022,7 @@ mod tests {
             payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5557,6 +6086,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5934,6 +6464,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5992,6 +6523,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -6284,7 +6816,9 @@ mod tests {
         const N: usize = 10;
         let grace_period = Duration::from_millis(1200);
         let gap = Duration::from_millis(75);
-        let daemon = test_daemon_with_intervals(DEFAULT_HEARTBEAT_INTERVAL, grace_period);
+        let mut daemon = test_daemon_with_intervals(DEFAULT_HEARTBEAT_INTERVAL, grace_period);
+        // This test pauses the clock; see Pools::tokio_backed.
+        daemon.pools = Arc::new(Pools::tokio_backed());
         let session = daemon
             .create_session(Request::new(create_req("test")))
             .await
@@ -6685,6 +7219,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(Uuid::new_v4().to_string())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -6729,6 +7264,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -7126,6 +7662,7 @@ mod tests {
             )),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -7539,6 +8076,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
             resume_from_seq: None,
             subscribe_lifecycle,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -7733,6 +8271,7 @@ mod tests {
             payload: Some(attach_request::Payload::Input(b"go\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -7974,6 +8513,9 @@ mod tests {
         assert_eq!((scheduled, restarted), (3, 3));
         let status = engine.pane_status(pane_id).unwrap();
         assert_eq!(status.view.state, tymux_core::LifecycleState::Failed);
-        assert!(pane.wait_final_exit().now_or_never().is_some());
+        // The state flips to Failed just before the final-exit signal; wait for it, don't sample.
+        tokio::time::timeout(Duration::from_secs(10), pane.wait_final_exit())
+            .await
+            .expect("the final exit must be signalled once the pane is FAILED");
     }
 }

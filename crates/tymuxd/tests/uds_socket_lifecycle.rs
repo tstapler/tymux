@@ -14,6 +14,7 @@
 //! - Story 5.2.3 (validation.md Gap 1): a real dual-listener `tymuxd`
 //!   drains concurrent TCP *and* UDS `Attach` streams gracefully on
 //!   SIGTERM — the automated proof Story 4.2.2's own ACs were missing.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -265,6 +266,7 @@ async fn open_attach_with_command(
         payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
         resume_from_seq: None,
         subscribe_lifecycle: false,
+        want_output_seq: false,
     })
     .await
     .expect("send pane_id");
@@ -273,6 +275,7 @@ async fn open_attach_with_command(
             payload: Some(attach_request::Payload::Input(command.as_bytes().to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .expect("send input");
