@@ -943,6 +943,64 @@ fn try_recv_as_recv(
     }
 }
 
+/// Longest a keystroke waits for an earlier resize to reach the pty. Normally microseconds; the
+/// cap keeps typing live when the resize is stuck behind a busy pane's parser lock.
+const RESIZE_BARRIER_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Applies a stream's resizes off the input path with latest-wins coalescing, and lets the input
+/// path wait for the ones it already sent.
+struct ResizeLane {
+    request_tx: tokio::sync::watch::Sender<(u64, Option<(u16, u16)>)>,
+    applied_rx: tokio::sync::watch::Receiver<u64>,
+    requested: u64,
+}
+
+impl ResizeLane {
+    /// Dropping the lane closes it: the worker applies the last pending size, then exits.
+    fn spawn(
+        apply: impl Fn(u16, u16) + Send + Sync + 'static,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        let (request_tx, mut request_rx) = tokio::sync::watch::channel((0u64, None));
+        let (applied_tx, applied_rx) = tokio::sync::watch::channel(0u64);
+        let apply = Arc::new(apply);
+        let task = tokio::spawn(async move {
+            while request_rx.changed().await.is_ok() {
+                let (generation, size) = *request_rx.borrow_and_update();
+                if let Some((rows, cols)) = size {
+                    let apply = apply.clone();
+                    let _ = tokio::task::spawn_blocking(move || apply(rows, cols)).await;
+                }
+                applied_tx.send_replace(generation);
+            }
+        });
+        (
+            Self {
+                request_tx,
+                applied_rx,
+                requested: 0,
+            },
+            task,
+        )
+    }
+
+    fn request(&mut self, rows: u16, cols: u16) {
+        self.requested += 1;
+        self.request_tx
+            .send_replace((self.requested, Some((rows, cols))));
+    }
+
+    /// Returns once every resize requested so far has been applied (or superseded by one that
+    /// has), or after `timeout`.
+    async fn barrier(&self, timeout: Duration) {
+        let target = self.requested;
+        if *self.applied_rx.borrow() >= target {
+            return;
+        }
+        let mut rx = self.applied_rx.clone();
+        let _ = tokio::time::timeout(timeout, rx.wait_for(|applied| *applied >= target)).await;
+    }
+}
+
 /// Builds the priming `Snapshot` `AttachEvent` and its sequence number —
 /// shared by the no-resume path (`attach()`'s `resume_from_seq: None`
 /// arm) and the `GapExceeded` fallback path (Epic 2.2.2), both of which
@@ -1797,24 +1855,17 @@ impl TymuxService for TymuxDaemon {
         let disconnect_tracker_for_input = self.disconnect_tracker.clone();
         let grace_period_duration = self.grace_period_duration;
         // Resizes reflow the grid under the pane's parser lock, which a chatty pane's reader
-        // holds almost continuously. A latest-wins slot drained by its own task keeps that wait
-        // from stalling this stream's keystrokes and collapses a resize storm to the final size.
-        let (resize_tx, mut resize_rx) = tokio::sync::watch::channel(None::<(u16, u16)>);
+        // holds almost continuously, so they run off the input path in a latest-wins lane.
+        // Keystrokes wait (bounded) for a resize sent before them, keeping the order the app sees.
+        let mut resize_lane = None;
         let mut resize_task = None;
         if let Some(window_id) = window_id {
             let engine_for_resize = self.engine.clone();
-            resize_task = Some(tokio::spawn(async move {
-                while resize_rx.changed().await.is_ok() {
-                    let Some((rows, cols)) = *resize_rx.borrow_and_update() else {
-                        continue;
-                    };
-                    let engine = engine_for_resize.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        engine.report_viewport_and_recompute(window_id, client_id, rows, cols)
-                    })
-                    .await;
-                }
-            }));
+            let (lane, task) = ResizeLane::spawn(move |rows, cols| {
+                engine_for_resize.report_viewport_and_recompute(window_id, client_id, rows, cols);
+            });
+            resize_lane = Some(lane);
+            resize_task = Some(task);
         }
         let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
@@ -1822,6 +1873,9 @@ impl TymuxService for TymuxDaemon {
                     // Typing into a pane whose process is between lives has nowhere to go.
                     Some(attach_request::Payload::Input(_)) if pane_for_input.is_exited() => {}
                     Some(attach_request::Payload::Input(bytes)) => {
+                        if let Some(lane) = &resize_lane {
+                            lane.barrier(RESIZE_BARRIER_TIMEOUT).await;
+                        }
                         // A full pty input queue blocks write_all; awaiting the blocking task
                         // keeps keystroke order without parking an async worker.
                         let pane = pane_for_input.clone();
@@ -1836,13 +1890,13 @@ impl TymuxService for TymuxDaemon {
                         }
                     }
                     Some(attach_request::Payload::Resize(r)) => {
-                        if window_id.is_some() {
+                        if let Some(lane) = resize_lane.as_mut() {
                             // saturate rather than wrap (65536 would become 0); Pane::resize
                             // clamps to the supported maximum
-                            resize_tx.send_replace(Some((
+                            lane.request(
                                 u16::try_from(r.rows).unwrap_or(u16::MAX),
                                 u16::try_from(r.cols).unwrap_or(u16::MAX),
-                            )));
+                            );
                         } else {
                             tracing::warn!(pane_id = %pane_for_input.id, "resize: pane's window not found, ignoring");
                         }
@@ -1853,7 +1907,7 @@ impl TymuxService for TymuxDaemon {
             // Closes the resize slot so its task drains the last size and exits; the deferred
             // cleanup below awaits it so a late resize cannot re-register this client's
             // viewport after the cleanup removed it.
-            drop(resize_tx);
+            drop(resize_lane);
             // This Attach stream just ended (client detached, gracefully or
             // abruptly — there is no separate deliberate-close signal in
             // this RPC today). Record when, so a pane exit observed shortly
@@ -3853,6 +3907,65 @@ mod tests {
             Some(Ok((6, b"tail".to_vec()))),
             "the over-cap chunk is not consumed"
         );
+    }
+
+    #[tokio::test]
+    async fn resize_lane_barrier_should_return_after_the_requested_resize_is_applied() {
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let log = applied.clone();
+        let (mut lane, _task) = ResizeLane::spawn(move |r, c| {
+            std::thread::sleep(Duration::from_millis(20));
+            log.lock().unwrap().push((r, c));
+        });
+        lane.request(30, 100);
+        lane.barrier(Duration::from_secs(5)).await;
+        assert_eq!(*applied.lock().unwrap(), vec![(30, 100)]);
+    }
+
+    #[tokio::test]
+    async fn resize_lane_barrier_should_give_up_after_the_timeout_when_the_resize_is_stuck() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (mut lane, _task) = ResizeLane::spawn(move |_, _| {
+            let _ = release_rx.lock().unwrap().recv();
+        });
+        lane.request(30, 100);
+        let started = Instant::now();
+        lane.barrier(Duration::from_millis(30)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(release_tx);
+    }
+
+    #[tokio::test]
+    async fn resize_lane_should_collapse_a_burst_to_the_final_size_and_exit_when_dropped() {
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let log = applied.clone();
+        let (mut lane, task) = ResizeLane::spawn(move |r, c| {
+            std::thread::sleep(Duration::from_millis(10));
+            log.lock().unwrap().push((r, c));
+        });
+        for rows in 10..30u16 {
+            lane.request(rows, 80);
+        }
+        lane.barrier(Duration::from_secs(5)).await;
+        drop(lane);
+        task.await.unwrap();
+        let applied = applied.lock().unwrap();
+        assert_eq!(
+            applied.last(),
+            Some(&(29, 80)),
+            "the final size always lands"
+        );
+        assert!(
+            applied.len() < 20,
+            "intermediate sizes are skipped: {applied:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resize_lane_barrier_should_not_wait_when_nothing_was_requested() {
+        let (lane, _task) = ResizeLane::spawn(|_, _| panic!("no resize requested"));
+        lane.barrier(Duration::from_millis(1)).await;
     }
 
     #[tokio::test]
