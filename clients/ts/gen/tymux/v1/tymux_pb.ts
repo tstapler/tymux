@@ -2627,9 +2627,9 @@ export const TymuxService: GenService<{
    * UNSPECIFIED and INTERACTIVE panes flush output immediately (INTERACTIVE is reserved for a
    * future distinction); BACKGROUND panes batch it for a short window, trading a few tens of
    * milliseconds of latency for far fewer frames. The hint is advisory, per pane (not per
-   * client), not persisted. It applies only while an Attach stream is open on the pane (none
-   * open: FAILED_PRECONDITION) and resets to normal when the last stream ends, so send it after
-   * attaching and again after reconnecting. Unknown pane: NOT_FOUND.
+   * client), not persisted. It resets to normal when the pane's last Attach stream ends, so
+   * send it again after reconnecting. A hint sent while no stream is open is held for 5 seconds
+   * and applied when one opens. Unknown pane: NOT_FOUND.
    *
    * @generated from rpc tymux.v1.TymuxService.SetPaneActivity
    */

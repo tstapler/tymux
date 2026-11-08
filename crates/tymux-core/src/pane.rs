@@ -3,7 +3,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 #[cfg(not(unix))]
@@ -91,14 +91,24 @@ impl PaneActivity {
     }
 }
 
+/// How long a hint sent before any Attach stream is open waits for the stream that follows it.
+const PENDING_HINT_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct AttachState {
+    count: usize,
+    /// A hint that arrived with no stream open, applied if a stream opens within the TTL.
+    pending: Option<(PaneActivity, Instant)>,
+}
+
 /// See [`Pane::begin_attach`].
 pub struct AttachTicket(Arc<Pane>);
 
 impl Drop for AttachTicket {
     fn drop(&mut self) {
-        let mut count = self.0.attach_count.lock().unwrap();
-        *count -= 1;
-        if *count == 0 {
+        let mut state = self.0.attach.lock().unwrap();
+        state.count -= 1;
+        if state.count == 0 {
             self.0
                 .activity
                 .store(PaneActivity::Normal as u8, Ordering::Relaxed);
@@ -183,7 +193,7 @@ pub struct Pane {
     activity: AtomicU8,
     /// Open Attach streams. Guarded together with every write to `activity` so a hint can never
     /// be applied to, or survive past, a stream count it does not belong to.
-    attach_count: Mutex<usize>,
+    attach: Mutex<AttachState>,
     /// This pane's granted share of `GLOBAL_SCROLLBACK_BUDGET_LINES` —
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
@@ -509,7 +519,7 @@ impl Pane {
             rows: AtomicU32::new(rows as u32),
             cols: AtomicU32::new(cols as u32),
             activity: AtomicU8::new(PaneActivity::Normal as u8),
-            attach_count: Mutex::new(0),
+            attach: Mutex::new(AttachState::default()),
             scrollback_lines,
             replay: Mutex::new(replay_buffer),
             replay_budget_bytes,
@@ -999,16 +1009,19 @@ impl Pane {
     }
 
     /// Registers one open Attach stream. A pane with no open stream is always Normal: the first
-    /// stream starts from Normal and dropping the last ticket resets to it, so a client that died
-    /// after marking a pane Background cannot leave it batching. A client must send its hint after
-    /// its stream is open, and again after reconnecting.
+    /// stream starts from Normal (or from a hint sent just before it, see [`Pane::set_activity`])
+    /// and dropping the last ticket resets to Normal, so a client that died after marking a pane
+    /// Background cannot leave it batching. A client re-sends its hint after reconnecting.
     pub fn begin_attach(self: &Arc<Self>) -> AttachTicket {
-        let mut count = self.attach_count.lock().unwrap();
-        if *count == 0 {
-            self.activity
-                .store(PaneActivity::Normal as u8, Ordering::Relaxed);
+        let mut state = self.attach.lock().unwrap();
+        if state.count == 0 {
+            let start = match state.pending.take() {
+                Some((hint, at)) if at.elapsed() <= PENDING_HINT_TTL => hint,
+                _ => PaneActivity::Normal,
+            };
+            self.activity.store(start as u8, Ordering::Relaxed);
         }
-        *count += 1;
+        state.count += 1;
         AttachTicket(self.clone())
     }
 
@@ -1019,11 +1032,13 @@ impl Pane {
         self.parser.lock().unwrap()
     }
 
-    /// Stores the hint, but only while at least one Attach stream is open (see
-    /// [`Pane::begin_attach`]); with none open it is ignored and returns false.
+    /// Stores the hint. With a stream open it takes effect now; with none it is held for up to
+    /// five seconds and applied when the next stream opens (a client may send it before it has
+    /// seen its attach complete). Returns whether it took effect immediately.
     pub fn set_activity(&self, activity: PaneActivity) -> bool {
-        let count = self.attach_count.lock().unwrap();
-        if *count == 0 {
+        let mut state = self.attach.lock().unwrap();
+        if state.count == 0 {
+            state.pending = Some((activity, Instant::now()));
             return false;
         }
         self.activity.store(activity as u8, Ordering::Relaxed);

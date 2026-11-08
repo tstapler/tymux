@@ -207,45 +207,12 @@ impl Pools {
         let stats = cp.stats.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let limit = cp.queue_limit;
-        let admitted = if stats
-            .queue_depth
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
-                (d < limit).then_some(d + 1)
-            })
-            .is_ok()
-        {
+        let admitted = if admit(&stats.queue_depth, limit) {
             stats.submitted.fetch_add(1, Ordering::Relaxed);
             let submitted_at = Instant::now();
             cp.pool.spawn(move || {
                 stats.queue_depth.fetch_sub(1, Ordering::SeqCst);
-                if tx.is_closed() {
-                    stats.skipped_cancelled.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                record_max(
-                    &stats.wait_micros_total,
-                    &stats.wait_micros_max,
-                    submitted_at.elapsed(),
-                );
-                let started = Instant::now();
-                stats.running.fetch_add(1, Ordering::SeqCst);
-                let outcome = catch_unwind(AssertUnwindSafe(job));
-                stats.running.fetch_sub(1, Ordering::SeqCst);
-                record_max(
-                    &stats.run_micros_total,
-                    &stats.run_micros_max,
-                    started.elapsed(),
-                );
-                match outcome {
-                    Ok(value) => {
-                        stats.completed.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(Ok(value));
-                    }
-                    Err(_) => {
-                        stats.panicked.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(Err(PoolError::Panicked));
-                    }
-                }
+                execute(&stats, tx, job, submitted_at);
             });
             true
         } else {
@@ -275,9 +242,11 @@ impl Pools {
             cp.stats.running.load(Ordering::SeqCst) + cp.stats.queue_depth.load(Ordering::SeqCst);
         if busy >= cp.threads {
             cp.stats.overflowed.fetch_add(1, Ordering::Relaxed);
-            return tokio::task::spawn_blocking(job)
-                .await
-                .map_err(|_| PoolError::Panicked);
+            let stats = cp.stats.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let submitted_at = Instant::now();
+            tokio::task::spawn_blocking(move || execute(&stats, tx, job, submitted_at));
+            return rx.await.map_err(|_| PoolError::Cancelled)?;
         }
         loop {
             match self.run(class, job.clone()).await {
@@ -311,6 +280,58 @@ impl Pools {
                 }
             })
             .collect()
+    }
+}
+
+/// Runs one job with the pool's controls: skipped if the caller is gone, timed, panic-contained.
+fn execute<T>(
+    stats: &ClassStats,
+    tx: tokio::sync::oneshot::Sender<Result<T, PoolError>>,
+    job: impl FnOnce() -> T,
+    submitted_at: Instant,
+) {
+    if tx.is_closed() {
+        stats.skipped_cancelled.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    record_max(
+        &stats.wait_micros_total,
+        &stats.wait_micros_max,
+        submitted_at.elapsed(),
+    );
+    let started = Instant::now();
+    stats.running.fetch_add(1, Ordering::SeqCst);
+    let outcome = catch_unwind(AssertUnwindSafe(job));
+    stats.running.fetch_sub(1, Ordering::SeqCst);
+    record_max(
+        &stats.run_micros_total,
+        &stats.run_micros_max,
+        started.elapsed(),
+    );
+    match outcome {
+        Ok(value) => {
+            stats.completed.fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(Ok(value));
+        }
+        Err(_) => {
+            stats.panicked.fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(Err(PoolError::Panicked));
+        }
+    }
+}
+
+/// Increments `depth` unless it has reached `limit`; false means the queue is full.
+fn admit(depth: &AtomicUsize, limit: usize) -> bool {
+    let mut current = depth.load(Ordering::SeqCst);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match depth.compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return true,
+            Err(seen) => current = seen,
+        }
     }
 }
 
@@ -562,6 +583,20 @@ mod tests {
         assert_eq!(input.overflowed, 1);
         drop(release_tx);
         drop(stalled);
+    }
+
+    #[tokio::test]
+    async fn healthy_load_should_not_overflow_the_pool() {
+        let pools = small();
+        for _ in 0..20 {
+            pools.run_must_land(Class::Resize, || ()).await.unwrap();
+        }
+        let resize = pools
+            .snapshot()
+            .into_iter()
+            .find(|s| s.class == "resize")
+            .unwrap();
+        assert_eq!((resize.overflowed, resize.completed), (0, 20));
     }
 
     /// The point of the split: input stays fast while slow work is queued, and the negative

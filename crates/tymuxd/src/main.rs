@@ -1557,11 +1557,7 @@ impl TymuxService for TymuxDaemon {
     ) -> Result<Response<SetPaneActivityResponse>, Status> {
         let req = request.into_inner();
         let pane = resolve_attachable_pane(&self.engine, parse_uuid(&req.pane_id)?)?;
-        if !pane.set_activity(activity_from_proto(req.activity)) {
-            return Err(Status::failed_precondition(
-                "SetPaneActivity needs an open Attach stream on the pane",
-            ));
-        }
+        pane.set_activity(activity_from_proto(req.activity));
         Ok(Response::new(SetPaneActivityResponse {}))
     }
 
@@ -4441,19 +4437,24 @@ mod tests {
             pane_id: pane_id.clone(),
             activity: activity as i32,
         };
-        let no_stream = daemon
-            .set_pane_activity(Request::new(hint(ProtoPaneActivity::Background)))
-            .await
-            .unwrap_err();
-        assert_eq!(no_stream.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(pane.activity(), PaneActivity::Normal);
-
-        let _ticket = pane.begin_attach();
+        // No stream yet: the hint is held, not applied, and a later stream starts from it.
         daemon
             .set_pane_activity(Request::new(hint(ProtoPaneActivity::Background)))
             .await
             .unwrap();
-        assert_eq!(pane.activity(), PaneActivity::Background);
+        assert_eq!(pane.activity(), PaneActivity::Normal);
+
+        let _ticket = pane.begin_attach();
+        assert_eq!(
+            pane.activity(),
+            PaneActivity::Background,
+            "the pending hint applies"
+        );
+        daemon
+            .set_pane_activity(Request::new(hint(ProtoPaneActivity::Interactive)))
+            .await
+            .unwrap();
+        assert_eq!(pane.activity(), PaneActivity::Interactive);
         let err = daemon
             .set_pane_activity(Request::new(SetPaneActivityRequest {
                 pane_id: Uuid::new_v4().to_string(),
@@ -4494,13 +4495,14 @@ mod tests {
         assert_eq!(pane.activity(), PaneActivity::Normal);
         assert!(
             !pane.set_activity(PaneActivity::Background),
-            "no stream, no hint"
+            "no stream: held, not applied"
         );
+        assert_eq!(pane.activity(), PaneActivity::Normal);
         let _first = pane.begin_attach();
         assert_eq!(
             pane.activity(),
-            PaneActivity::Normal,
-            "a first stream starts from Normal"
+            PaneActivity::Background,
+            "a hint sent just before the stream applies"
         );
     }
 
