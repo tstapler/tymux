@@ -11,12 +11,13 @@ use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
 use tymux_core::{
-    Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneLookup,
+    Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneActivity, PaneLookup,
     PersistedLayoutNode, PersistenceBackend, ReplayOutcome, SessionSnapshot, WindowSnapshot,
     RECOMMENDED_SPLIT_MIN_ROWS,
 };
 use tymux_proto::v1::arg_spec;
 use tymux_proto::v1::tymux_service_server::{TymuxService, TymuxServiceServer};
+use tymux_proto::v1::PaneActivity as ProtoPaneActivity;
 use tymux_proto::v1::{
     attach_event, attach_request, write_stdin_request, ArgSpec, AttachEvent, AttachRequest,
     CapturePaneRequest, Cell as ProtoCell, ClosePaneRequest, ClosePaneResponse,
@@ -25,9 +26,9 @@ use tymux_proto::v1::{
     LayoutChild as ProtoLayoutChild, ListSessionsRequest, ListSessionsResponse, Liveness,
     Orientation as ProtoOrientation, OutputChunk, Pane as ProtoPane, PaneSnapshot as ProtoSnapshot,
     ReviveSessionRequest, ReviveSessionResponse, Row as ProtoRow, SearchScrollbackRequest,
-    SearchScrollbackResponse, ServerInfo, Session as ProtoSession, Split as ProtoSplit,
-    SplitPaneRequest, WatchWindowRequest, Window as ProtoWindow, WindowLayoutEvent,
-    WriteStdinRequest, WriteStdinResponse,
+    SearchScrollbackResponse, ServerInfo, Session as ProtoSession, SetPaneActivityRequest,
+    SetPaneActivityResponse, Split as ProtoSplit, SplitPaneRequest, WatchWindowRequest,
+    Window as ProtoWindow, WindowLayoutEvent, WriteStdinRequest, WriteStdinResponse,
 };
 use tymux_proto::v1::{
     GetPaneStatusRequest, LifecycleEvent as ProtoLifecycleEvent,
@@ -866,11 +867,102 @@ fn forward_step_for_output_result(
     }
 }
 
+/// Upper bound on one coalesced output event; keeps a single gRPC message well under the
+/// default 4 MiB limit and bounds how long one pane holds the connection's send path.
+const MAX_OUTPUT_BATCH_BYTES: usize = 64 * 1024;
+/// How long a `Background` pane gathers output before flushing, so a pane nobody is looking
+/// at costs a few frames per second instead of one per pty read.
+const BACKGROUND_FLUSH_WINDOW: Duration = Duration::from_millis(25);
+
+type OutputItem = Result<(u64, Vec<u8>), tokio::sync::broadcast::error::RecvError>;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CoalescedOutput {
+    /// Concatenated bytes and the seq of the last chunk merged (the highest seq the client
+    /// then has, which is all a resume token needs).
+    data: Option<(u64, Vec<u8>)>,
+    /// Chunks the receiver dropped right after `data`; the client must be told of the gap.
+    lagged: Option<u64>,
+    /// The channel closed right after `data`.
+    closed: bool,
+}
+
+/// Merges `first` with whatever `next` yields until it returns `None`, `MAX_OUTPUT_BATCH_BYTES`
+/// is reached, or the channel reports a gap or closure. Chunks at or below `threshold_seq` are
+/// already covered by the priming snapshot or replay and are dropped.
+fn coalesce_output(
+    first: (u64, Vec<u8>),
+    threshold_seq: u64,
+    next: &mut dyn FnMut() -> Option<OutputItem>,
+) -> CoalescedOutput {
+    use tokio::sync::broadcast::error::RecvError;
+    let mut out = CoalescedOutput::default();
+    let push = |out: &mut CoalescedOutput, (seq, bytes): (u64, Vec<u8>)| {
+        if seq <= threshold_seq {
+            return;
+        }
+        match &mut out.data {
+            Some((last, buf)) => {
+                *last = seq;
+                buf.extend_from_slice(&bytes);
+            }
+            None => out.data = Some((seq, bytes)),
+        }
+    };
+    push(&mut out, first);
+    while out
+        .data
+        .as_ref()
+        .is_none_or(|(_, b)| b.len() < MAX_OUTPUT_BATCH_BYTES)
+    {
+        match next() {
+            None => break,
+            Some(Ok(chunk)) => push(&mut out, chunk),
+            Some(Err(RecvError::Lagged(n))) => {
+                out.lagged = Some(n);
+                break;
+            }
+            Some(Err(RecvError::Closed)) => {
+                out.closed = true;
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn try_recv_as_recv(
+    rx: &mut tokio::sync::broadcast::Receiver<(u64, Vec<u8>)>,
+) -> Option<OutputItem> {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    match rx.try_recv() {
+        Ok(chunk) => Some(Ok(chunk)),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Lagged(n)) => Some(Err(RecvError::Lagged(n))),
+        Err(TryRecvError::Closed) => Some(Err(RecvError::Closed)),
+    }
+}
+
 /// Builds the priming `Snapshot` `AttachEvent` and its sequence number —
 /// shared by the no-resume path (`attach()`'s `resume_from_seq: None`
 /// arm) and the `GapExceeded` fallback path (Epic 2.2.2), both of which
 /// prime a reattaching client with `pane.snapshot_with_seq()` today.
-fn snapshot_priming_event(pane: &tymux_core::Pane, pane_id_str: &str) -> (AttachEvent, u64) {
+#[allow(clippy::result_large_err)]
+async fn snapshot_priming_event(
+    pane: &Arc<tymux_core::Pane>,
+    pane_id_str: &str,
+) -> Result<(AttachEvent, u64), Status> {
+    let pane = pane.clone();
+    let id = pane_id_str.to_owned();
+    tokio::task::spawn_blocking(move || snapshot_priming_event_blocking(&pane, &id))
+        .await
+        .map_err(|e| Status::internal(format!("attach snapshot task failed: {e}")))
+}
+
+fn snapshot_priming_event_blocking(
+    pane: &tymux_core::Pane,
+    pane_id_str: &str,
+) -> (AttachEvent, u64) {
     let (pane_snapshot, snapshot_seq) = pane.snapshot_with_seq();
     let event = AttachEvent {
         payload: Some(attach_event::Payload::Snapshot(snapshot_to_proto(
@@ -1052,11 +1144,14 @@ impl TymuxService for TymuxDaemon {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "capture_pane: pane unavailable");
         })?;
         let live = !pane.is_exited();
-        let mut snapshot = snapshot_to_proto(
-            &req.pane_id,
-            pane.snapshot_at_offset(req.scrollback_offset as usize),
-            live,
-        );
+        let offset = req.scrollback_offset as usize;
+        // Rendering walks the whole grid under the pane's parser lock, which a chatty pane's
+        // reader thread holds almost continuously; keep that wait off the async workers.
+        let pane_for_render = pane.clone();
+        let grid = tokio::task::spawn_blocking(move || pane_for_render.snapshot_at_offset(offset))
+            .await
+            .map_err(|e| Status::internal(format!("capture_pane task failed: {e}")))?;
+        let mut snapshot = snapshot_to_proto(&req.pane_id, grid, live);
         if !live {
             snapshot.exit_code = pane.exit_code();
         }
@@ -1254,6 +1349,20 @@ impl TymuxService for TymuxDaemon {
             }
         };
         Ok(Response::new(SetRestartPolicyResponse { status }))
+    }
+
+    async fn set_pane_activity(
+        &self,
+        request: Request<SetPaneActivityRequest>,
+    ) -> Result<Response<SetPaneActivityResponse>, Status> {
+        let req = request.into_inner();
+        let pane = resolve_live_pane(&self.engine, parse_uuid(&req.pane_id)?)?;
+        pane.set_activity(match ProtoPaneActivity::try_from(req.activity) {
+            Ok(ProtoPaneActivity::Interactive) => PaneActivity::Interactive,
+            Ok(ProtoPaneActivity::Background) => PaneActivity::Background,
+            _ => PaneActivity::Normal,
+        });
+        Ok(Response::new(SetPaneActivityResponse {}))
     }
 
     async fn get_pane_status(
@@ -1506,7 +1615,7 @@ impl TymuxService for TymuxDaemon {
                         })),
                     };
                     let (snapshot_event, snapshot_seq) =
-                        snapshot_priming_event(&pane, &pane_id_str);
+                        snapshot_priming_event(&pane, &pane_id_str).await?;
                     (
                         vec![gap_event, snapshot_event],
                         snapshot_seq,
@@ -1523,7 +1632,8 @@ impl TymuxService for TymuxDaemon {
                     ResumeOutcome::NoResumeTokenFullAttach,
                 );
                 // Unchanged pre-feature path (Epic 2.4).
-                let (snapshot_event, snapshot_seq) = snapshot_priming_event(&pane, &pane_id_str);
+                let (snapshot_event, snapshot_seq) =
+                    snapshot_priming_event(&pane, &pane_id_str).await?;
                 (vec![snapshot_event], snapshot_seq, false, Vec::new())
             }
         };
@@ -1609,6 +1719,36 @@ impl TymuxService for TymuxDaemon {
                             Ok(_) => live_client.set_lagged(false),
                             Err(_) => {}
                         }
+                        let result = match result {
+                            Ok(first) => {
+                                if pane_for_exit.activity() == PaneActivity::Background {
+                                    tokio::time::sleep(BACKGROUND_FLUSH_WINDOW).await;
+                                }
+                                let batch = coalesce_output(first, live_threshold_seq, &mut || {
+                                    try_recv_as_recv(&mut output_rx)
+                                });
+                                if let Some(data) = batch.data {
+                                    if let ForwardStep::Emit(event) = forward_step_for_output_result(
+                                        Ok(data), pane_for_exit.id, live_threshold_seq, emit_output_chunk,
+                                    ) {
+                                        if forward_tx.send(Ok(*event)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if batch.closed {
+                                    return;
+                                }
+                                match batch.lagged {
+                                    Some(n) => {
+                                        live_client.set_lagged(true);
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n))
+                                    }
+                                    None => continue,
+                                }
+                            }
+                            other => other,
+                        };
                         match forward_step_for_output_result(result, pane_for_exit.id, live_threshold_seq, emit_output_chunk) {
                             ForwardStep::Emit(event) => {
                                 if forward_tx.send(Ok(*event)).await.is_err() {
@@ -1656,26 +1796,52 @@ impl TymuxService for TymuxDaemon {
         let engine_for_input = self.engine.clone();
         let disconnect_tracker_for_input = self.disconnect_tracker.clone();
         let grace_period_duration = self.grace_period_duration;
+        // Resizes reflow the grid under the pane's parser lock, which a chatty pane's reader
+        // holds almost continuously. A latest-wins slot drained by its own task keeps that wait
+        // from stalling this stream's keystrokes and collapses a resize storm to the final size.
+        let (resize_tx, mut resize_rx) = tokio::sync::watch::channel(None::<(u16, u16)>);
+        if let Some(window_id) = window_id {
+            let engine_for_resize = self.engine.clone();
+            tokio::spawn(async move {
+                while resize_rx.changed().await.is_ok() {
+                    let Some((rows, cols)) = *resize_rx.borrow_and_update() else {
+                        continue;
+                    };
+                    let engine = engine_for_resize.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        engine.report_viewport_and_recompute(window_id, client_id, rows, cols)
+                    })
+                    .await;
+                }
+            });
+        }
         let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
                     // Typing into a pane whose process is between lives has nowhere to go.
                     Some(attach_request::Payload::Input(_)) if pane_for_input.is_exited() => {}
                     Some(attach_request::Payload::Input(bytes)) => {
-                        if let Err(e) = pane_for_input.write_input(&bytes) {
-                            tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input failed");
+                        // A full pty input queue blocks write_all; awaiting the blocking task
+                        // keeps keystroke order without parking an async worker.
+                        let pane = pane_for_input.clone();
+                        match tokio::task::spawn_blocking(move || pane.write_input(&bytes)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input failed");
+                            }
+                            Err(e) => {
+                                tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input task failed");
+                            }
                         }
                     }
                     Some(attach_request::Payload::Resize(r)) => {
-                        if let Some(window_id) = window_id {
-                            engine_for_input.report_viewport_and_recompute(
-                                window_id,
-                                client_id,
-                                // saturate rather than wrap (65536 would become 0); Pane::resize
-                                // clamps to the supported maximum
+                        if window_id.is_some() {
+                            // saturate rather than wrap (65536 would become 0); Pane::resize
+                            // clamps to the supported maximum
+                            resize_tx.send_replace(Some((
                                 u16::try_from(r.rows).unwrap_or(u16::MAX),
                                 u16::try_from(r.cols).unwrap_or(u16::MAX),
-                            );
+                            )));
                         } else {
                             tracing::warn!(pane_id = %pane_for_input.id, "resize: pane's window not found, ignoring");
                         }
@@ -3345,6 +3511,7 @@ mod tests {
             "create_session.stdin_stream",
             "pane.lifecycle",
             "server_info.fd_usage",
+            "pane.activity_hint",
         ] {
             assert!(
                 info.capabilities.iter().any(|c| c == feature),
@@ -3624,6 +3791,91 @@ mod tests {
             ),
             ForwardStep::End
         );
+    }
+
+    fn chunks(
+        items: Vec<Result<(u64, Vec<u8>), tokio::sync::broadcast::error::RecvError>>,
+    ) -> impl FnMut() -> Option<Result<(u64, Vec<u8>), tokio::sync::broadcast::error::RecvError>>
+    {
+        let mut it = items.into_iter();
+        move || it.next()
+    }
+
+    #[test]
+    fn coalesce_output_should_concatenate_queued_chunks_and_report_the_last_seq() {
+        let mut next = chunks(vec![Ok((6, b"b".to_vec())), Ok((7, b"c".to_vec()))]);
+        let out = coalesce_output((5, b"a".to_vec()), 0, &mut next);
+        assert_eq!(out.data, Some((7, b"abc".to_vec())));
+        assert_eq!((out.lagged, out.closed), (None, false));
+    }
+
+    #[test]
+    fn coalesce_output_should_drop_chunks_covered_by_the_threshold() {
+        let mut next = chunks(vec![Ok((6, b"b".to_vec())), Ok((7, b"c".to_vec()))]);
+        let out = coalesce_output((5, b"a".to_vec()), 6, &mut next);
+        assert_eq!(out.data, Some((7, b"c".to_vec())));
+    }
+
+    #[test]
+    fn coalesce_output_should_stop_at_a_gap_and_surface_it_after_the_data() {
+        use tokio::sync::broadcast::error::RecvError;
+        let mut next = chunks(vec![
+            Ok((6, b"b".to_vec())),
+            Err(RecvError::Lagged(3)),
+            Ok((9, b"z".to_vec())),
+        ]);
+        let out = coalesce_output((5, b"a".to_vec()), 0, &mut next);
+        assert_eq!(out.data, Some((6, b"ab".to_vec())));
+        assert_eq!(out.lagged, Some(3));
+        assert_eq!(
+            next(),
+            Some(Ok((9, b"z".to_vec()))),
+            "later chunks stay queued"
+        );
+    }
+
+    #[test]
+    fn coalesce_output_should_stop_at_the_batch_cap() {
+        let big = vec![b'x'; MAX_OUTPUT_BATCH_BYTES];
+        let mut next = chunks(vec![Ok((6, b"tail".to_vec()))]);
+        let out = coalesce_output((5, big.clone()), 0, &mut next);
+        assert_eq!(out.data, Some((5, big)));
+        assert_eq!(
+            next(),
+            Some(Ok((6, b"tail".to_vec()))),
+            "the over-cap chunk is not consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pane_activity_should_store_the_hint_and_reject_unknown_panes() {
+        let daemon = test_daemon();
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        daemon
+            .set_pane_activity(Request::new(SetPaneActivityRequest {
+                pane_id: pane_id.clone(),
+                activity: ProtoPaneActivity::Background as i32,
+            }))
+            .await
+            .unwrap();
+        let pane = match daemon.engine.pane_lookup(parse_uuid(&pane_id).unwrap()) {
+            PaneLookup::Live(p) => p,
+            _ => panic!("pane must be live"),
+        };
+        assert_eq!(pane.activity(), PaneActivity::Background);
+        let err = daemon
+            .set_pane_activity(Request::new(SetPaneActivityRequest {
+                pane_id: Uuid::new_v4().to_string(),
+                activity: ProtoPaneActivity::Interactive as i32,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     /// Story 2.2.1 AC2 / REQ-4 / Task 2.2.1c: a live chunk whose seq is
