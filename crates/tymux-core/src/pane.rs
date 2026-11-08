@@ -70,8 +70,9 @@ fn release_scrollback_budget(lines: usize) {
     GLOBAL_SCROLLBACK_USED_LINES.fetch_sub(lines, Ordering::Relaxed);
 }
 
-/// How urgently a client wants a pane's output: an `Interactive` pane flushes immediately, a
-/// `Background` pane batches output for a short window, `Normal` is the unhinted default.
+/// How urgently a client wants a pane's output: `Normal` and `Interactive` panes flush
+/// immediately (`Interactive` is reserved for a future distinction), a `Background` pane batches
+/// output for a short window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PaneActivity {
@@ -90,10 +91,22 @@ impl PaneActivity {
     }
 }
 
+/// See [`Pane::begin_attach`].
+pub struct AttachTicket(Arc<Pane>);
+
+impl Drop for AttachTicket {
+    fn drop(&mut self) {
+        if self.0.attach_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.set_activity(PaneActivity::Normal);
+        }
+    }
+}
+
 /// Read chunk size for the pty output thread. Program output (e.g. `ls
 /// -la`, `cat` on a big file) comes in much chunkier bursts than a human's
 /// keystrokes, so this is deliberately larger than tymux-cli's 1024-byte
-/// stdin-forwarding buffer.
+/// stdin-forwarding buffer. It also sets the ring's worst case: `OUTPUT_CHANNEL_CAPACITY` reads
+/// of this size (about 32 MiB per pane) stay retained for a pane that has been flooded.
 const PTY_READ_BUF_SIZE: usize = 32 * 1024;
 /// How long the reader waits for pty data before re-checking for a handoff freeze; bounds the
 /// freeze latency, and idle cost is one `poll` per pane per interval.
@@ -164,6 +177,8 @@ pub struct Pane {
     cols: AtomicU32,
     /// Client-declared [`PaneActivity`], read by each Attach stream to pick its flush cadence.
     activity: AtomicU8,
+    /// Open Attach streams; the activity hint resets to Normal when the last one ends.
+    attach_count: AtomicUsize,
     /// This pane's granted share of `GLOBAL_SCROLLBACK_BUDGET_LINES` —
     /// released back to the budget on `Drop`.
     scrollback_lines: usize,
@@ -489,6 +504,7 @@ impl Pane {
             rows: AtomicU32::new(rows as u32),
             cols: AtomicU32::new(cols as u32),
             activity: AtomicU8::new(PaneActivity::Normal as u8),
+            attach_count: AtomicUsize::new(0),
             scrollback_lines,
             replay: Mutex::new(replay_buffer),
             replay_budget_bytes,
@@ -975,6 +991,21 @@ impl Pane {
         }
         self.stdin_writer.lock().unwrap().take();
         Ok(())
+    }
+
+    /// Registers one open Attach stream. Dropping the ticket of the last stream clears the
+    /// activity hint, so a client that died after marking a pane Background cannot leave it
+    /// batching; a client must re-assert its hint after reconnecting.
+    pub fn begin_attach(self: &Arc<Self>) -> AttachTicket {
+        self.attach_count.fetch_add(1, Ordering::SeqCst);
+        AttachTicket(self.clone())
+    }
+
+    /// Holds the pane's grid lock until the returned guard drops. Test support for simulating a
+    /// pane whose parser a busy reader keeps locked.
+    #[doc(hidden)]
+    pub fn hold_grid_lock_for_test(&self) -> impl Sized + '_ {
+        self.parser.lock().unwrap()
     }
 
     pub fn set_activity(&self, activity: PaneActivity) {

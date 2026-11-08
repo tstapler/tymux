@@ -867,8 +867,8 @@ fn forward_step_for_output_result(
     }
 }
 
-/// Upper bound on one coalesced output event; keeps a single gRPC message well under the
-/// default 4 MiB limit and bounds how long one pane holds the connection's send path.
+/// Soft cap on one coalesced output event: merging stops once a batch reaches it, so a batch can
+/// overshoot by one pty read (32 KiB). Keeps a gRPC message far under the default 4 MiB limit.
 const MAX_OUTPUT_BATCH_BYTES: usize = 64 * 1024;
 /// How long a `Background` pane gathers output before flushing, so a pane nobody is looking
 /// at costs a few frames per second instead of one per pty read.
@@ -998,6 +998,15 @@ impl ResizeLane {
         }
         let mut rx = self.applied_rx.clone();
         let _ = tokio::time::timeout(timeout, rx.wait_for(|applied| *applied >= target)).await;
+    }
+}
+
+/// Unspecified and unknown wire values mean `Normal`, so a newer client's new value degrades.
+fn activity_from_proto(value: i32) -> PaneActivity {
+    match ProtoPaneActivity::try_from(value) {
+        Ok(ProtoPaneActivity::Interactive) => PaneActivity::Interactive,
+        Ok(ProtoPaneActivity::Background) => PaneActivity::Background,
+        _ => PaneActivity::Normal,
     }
 }
 
@@ -1414,12 +1423,8 @@ impl TymuxService for TymuxDaemon {
         request: Request<SetPaneActivityRequest>,
     ) -> Result<Response<SetPaneActivityResponse>, Status> {
         let req = request.into_inner();
-        let pane = resolve_live_pane(&self.engine, parse_uuid(&req.pane_id)?)?;
-        pane.set_activity(match ProtoPaneActivity::try_from(req.activity) {
-            Ok(ProtoPaneActivity::Interactive) => PaneActivity::Interactive,
-            Ok(ProtoPaneActivity::Background) => PaneActivity::Background,
-            _ => PaneActivity::Normal,
-        });
+        let pane = resolve_attachable_pane(&self.engine, parse_uuid(&req.pane_id)?)?;
+        pane.set_activity(activity_from_proto(req.activity));
         Ok(Response::new(SetPaneActivityResponse {}))
     }
 
@@ -1594,7 +1599,12 @@ impl TymuxService for TymuxDaemon {
             resume_requested = resume_from_seq.is_some(),
             "attach: gauge incremented"
         );
-        let attached_sessions_gauge = self.attached_sessions_gauge.clone();
+        // Created before the first await below so a cancelled or failed attach still decrements.
+        let gauge_guard = AttachedGaugeGuard {
+            gauge: self.attached_sessions_gauge.clone(),
+            pane_id,
+        };
+        let attach_ticket = pane.begin_attach();
 
         // Resize is window-scoped (ADR-004): track this client's reported
         // viewport against the pane's window and apply the dimension-wise
@@ -1710,10 +1720,7 @@ impl TymuxService for TymuxDaemon {
         let disconnect_regression_window = self.disconnect_regression_window;
         let heartbeat_interval_duration = self.heartbeat_interval;
         let forward_handle = tokio::spawn(async move {
-            let _gauge_guard = AttachedGaugeGuard {
-                gauge: attached_sessions_gauge,
-                pane_id,
-            };
+            let _gauge_guard = gauge_guard;
 
             // Task 2.3.1a: drain the resume replay backlog (if any) first,
             // racing pane.wait_exit() per chunk with the same `biased`
@@ -1868,6 +1875,8 @@ impl TymuxService for TymuxDaemon {
             resize_task = Some(task);
         }
         let input_handle = tokio::spawn(async move {
+            // Held for the life of the inbound half, which ends promptly when the client leaves.
+            let _attach_ticket = attach_ticket;
             while let Some(Ok(msg)) = inbound.next().await {
                 match msg.payload {
                     // Typing into a pane whose process is between lives has nowhere to go.
@@ -3966,6 +3975,116 @@ mod tests {
     async fn resize_lane_barrier_should_not_wait_when_nothing_was_requested() {
         let (lane, _task) = ResizeLane::spawn(|_, _| panic!("no resize requested"));
         lane.barrier(Duration::from_millis(1)).await;
+    }
+
+    #[test]
+    fn activity_from_proto_should_treat_unspecified_and_unknown_values_as_normal() {
+        assert_eq!(
+            activity_from_proto(ProtoPaneActivity::Unspecified as i32),
+            PaneActivity::Normal
+        );
+        assert_eq!(activity_from_proto(99), PaneActivity::Normal);
+        assert_eq!(activity_from_proto(-1), PaneActivity::Normal);
+        assert_eq!(
+            activity_from_proto(ProtoPaneActivity::Background as i32),
+            PaneActivity::Background
+        );
+        assert_eq!(
+            activity_from_proto(ProtoPaneActivity::Interactive as i32),
+            PaneActivity::Interactive
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_should_release_the_gauge_when_cancelled_while_priming() {
+        let daemon = test_daemon();
+        let engine = daemon.engine.clone();
+        let gauge = daemon.attached_sessions_gauge.clone();
+        let mut client = spawn_test_server(daemon).await;
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let pane = match engine.pane_lookup(parse_uuid(&pane_id).unwrap()) {
+            PaneLookup::Live(p) => p,
+            _ => panic!("pane must be live"),
+        };
+        let hold = pane.hold_grid_lock_for_test();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+            resume_from_seq: None,
+            subscribe_lifecycle: false,
+        })
+        .await
+        .unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.attach(Request::new(ReceiverStream::new(rx))),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "priming must still be blocked on the grid lock"
+        );
+        drop(tx);
+        drop(hold);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gauge.load(Ordering::SeqCst) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a cancelled attach must not leak the gauge"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_pane_activity_should_work_on_a_pane_in_restart_backoff_and_reset_when_the_last_attach_ends(
+    ) {
+        let (daemon, _clock) = supervised_daemon();
+        let mut client = spawn_test_server(daemon.clone()).await;
+        let session = client
+            .create_session(script_req(
+                "t",
+                "exit 3",
+                Some(policy_req(ProtoRestartMode::Always)),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id = sole_pane(&session.windows[0]).id.clone();
+        let (tx, mut stream) = attach_with_lifecycle(&mut client, &pane_id, true).await;
+        loop {
+            let event = next_lifecycle(&mut stream).await;
+            if event.kind == ProtoLifecycleEventKind::RestartScheduled as i32 {
+                break;
+            }
+        }
+        client
+            .set_pane_activity(SetPaneActivityRequest {
+                pane_id: pane_id.clone(),
+                activity: ProtoPaneActivity::Background as i32,
+            })
+            .await
+            .expect("a pane in backoff is still attachable, so it accepts a hint");
+        let pane = match daemon.engine.held_pane(parse_uuid(&pane_id).unwrap()) {
+            Some(p) => p,
+            None => panic!("pane in backoff must be held"),
+        };
+        assert_eq!(pane.activity(), PaneActivity::Background);
+        drop(tx);
+        drop(stream);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.activity() != PaneActivity::Normal {
+            assert!(
+                Instant::now() < deadline,
+                "hint must clear when the last attach ends"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

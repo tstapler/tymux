@@ -2452,9 +2452,11 @@ export const TymuxService: GenService<{
   },
   /**
    * Declares how urgently a client wants a pane's output (capability "pane.activity_hint").
-   * INTERACTIVE panes flush output immediately; BACKGROUND panes batch it for a short window,
-   * trading a few tens of milliseconds of latency for far fewer frames. The hint is advisory,
-   * per pane (not per client), and not persisted: the daemon forgets it on restart. Unknown
+   * UNSPECIFIED and INTERACTIVE panes flush output immediately (INTERACTIVE is reserved for a
+   * future distinction); BACKGROUND panes batch it for a short window, trading a few tens of
+   * milliseconds of latency for far fewer frames. The hint is advisory, per pane (not per
+   * client), not persisted, and cleared when the pane's last Attach stream ends, so re-send it
+   * after reconnecting. Unknown
    * pane: NOT_FOUND.
    *
    * @generated from rpc tymux.v1.TymuxService.SetPaneActivity
