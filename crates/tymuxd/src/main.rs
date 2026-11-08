@@ -1800,9 +1800,10 @@ impl TymuxService for TymuxDaemon {
         // holds almost continuously. A latest-wins slot drained by its own task keeps that wait
         // from stalling this stream's keystrokes and collapses a resize storm to the final size.
         let (resize_tx, mut resize_rx) = tokio::sync::watch::channel(None::<(u16, u16)>);
+        let mut resize_task = None;
         if let Some(window_id) = window_id {
             let engine_for_resize = self.engine.clone();
-            tokio::spawn(async move {
+            resize_task = Some(tokio::spawn(async move {
                 while resize_rx.changed().await.is_ok() {
                     let Some((rows, cols)) = *resize_rx.borrow_and_update() else {
                         continue;
@@ -1813,7 +1814,7 @@ impl TymuxService for TymuxDaemon {
                     })
                     .await;
                 }
-            });
+            }));
         }
         let input_handle = tokio::spawn(async move {
             while let Some(Ok(msg)) = inbound.next().await {
@@ -1849,6 +1850,10 @@ impl TymuxService for TymuxDaemon {
                     _ => {}
                 }
             }
+            // Closes the resize slot so its task drains the last size and exits; the deferred
+            // cleanup below awaits it so a late resize cannot re-register this client's
+            // viewport after the cleanup removed it.
+            drop(resize_tx);
             // This Attach stream just ended (client detached, gracefully or
             // abruptly — there is no separate deliberate-close signal in
             // this RPC today). Record when, so a pane exit observed shortly
@@ -1882,6 +1887,9 @@ impl TymuxService for TymuxDaemon {
                 let engine_for_deferred = engine_for_input.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(grace_period_duration).await;
+                    if let Some(task) = resize_task {
+                        let _ = task.await;
+                    }
                     // Task 3.2.2b: the window may have closed entirely
                     // while this task slept (e.g. the pane's session was
                     // killed) — that path already tears down its own
