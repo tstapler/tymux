@@ -549,6 +549,7 @@ fn snapshot_to_proto(pane_id: &str, snap: tymux_core::PaneSnapshot, live: bool) 
         cursor_pending_wrap: snap.cursor_pending_wrap,
         state: PaneState::Unspecified as i32,
         exit_code: None,
+        seq: None,
         grid: snap
             .grid
             .into_iter()
@@ -872,12 +873,10 @@ fn forward_step_for_output_result(
 /// prime a reattaching client with `pane.snapshot_with_seq()` today.
 fn snapshot_priming_event(pane: &tymux_core::Pane, pane_id_str: &str) -> (AttachEvent, u64) {
     let (pane_snapshot, snapshot_seq) = pane.snapshot_with_seq();
+    let mut proto_snapshot = snapshot_to_proto(pane_id_str, pane_snapshot, true);
+    proto_snapshot.seq = Some(snapshot_seq);
     let event = AttachEvent {
-        payload: Some(attach_event::Payload::Snapshot(snapshot_to_proto(
-            pane_id_str,
-            pane_snapshot,
-            true,
-        ))),
+        payload: Some(attach_event::Payload::Snapshot(proto_snapshot)),
     };
     (event, snapshot_seq)
 }
@@ -1052,11 +1051,10 @@ impl TymuxService for TymuxDaemon {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "capture_pane: pane unavailable");
         })?;
         let live = !pane.is_exited();
-        let mut snapshot = snapshot_to_proto(
-            &req.pane_id,
-            pane.snapshot_at_offset(req.scrollback_offset as usize),
-            live,
-        );
+        let (pane_snapshot, snapshot_seq) =
+            pane.snapshot_at_offset_with_seq(req.scrollback_offset as usize);
+        let mut snapshot = snapshot_to_proto(&req.pane_id, pane_snapshot, live);
+        snapshot.seq = Some(snapshot_seq);
         if !live {
             snapshot.exit_code = pane.exit_code();
         }
@@ -1411,6 +1409,7 @@ impl TymuxService for TymuxDaemon {
         // `attach_should_reject_before_reading_resume_from_seq_when_first_message_omits_pane_id`).
         let resume_from_seq = first.resume_from_seq;
         let subscribe_lifecycle = first.subscribe_lifecycle;
+        let want_output_seq = first.want_output_seq;
         let pane_id = parse_uuid(&pane_id_str)?;
         let pane = resolve_attachable_pane(&self.engine, pane_id).inspect_err(|status| {
             tracing::warn!(pane_id = %pane_id, code = ?status.code(), "attach: pane unavailable");
@@ -1524,7 +1523,12 @@ impl TymuxService for TymuxDaemon {
                 );
                 // Unchanged pre-feature path (Epic 2.4).
                 let (snapshot_event, snapshot_seq) = snapshot_priming_event(&pane, &pane_id_str);
-                (vec![snapshot_event], snapshot_seq, false, Vec::new())
+                (
+                    vec![snapshot_event],
+                    snapshot_seq,
+                    want_output_seq,
+                    Vec::new(),
+                )
             }
         };
         live_client.go_live_after(live_threshold_seq);
@@ -2881,6 +2885,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -2896,6 +2901,7 @@ mod tests {
             })),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -3304,6 +3310,108 @@ mod tests {
         assert_eq!(snapshot.rows, 24);
         assert_eq!(snapshot.cols, 80);
         assert_eq!(snapshot.grid.len(), 24);
+    }
+
+    /// CapturePane's seq is read under the grid's lock, so once the pane is quiet it must equal
+    /// the pane's own output_seq — the value a client orders its Attach stream against.
+    #[tokio::test]
+    async fn capture_pane_should_report_the_output_seq_its_grid_reflects() {
+        let engine = Arc::new(Engine::new());
+        let daemon = TymuxDaemon::new(engine.clone());
+        let session = daemon
+            .create_session(Request::new(create_req("test")))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane = match engine.pane_lookup(parse_uuid(&pane_id_str).unwrap()) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+        pane.write_input(b"echo SEQ-MARKER\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.snapshot_with_seq().1 == 0 {
+            assert!(Instant::now() < deadline, "pane produced no output");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let snapshot = daemon
+            .capture_pane(Request::new(capture_req(pane_id_str)))
+            .await
+            .unwrap()
+            .into_inner();
+        let seq = snapshot.seq.expect("CapturePane must report seq");
+        assert!(seq > 0);
+        assert_eq!(seq, pane.snapshot_with_seq().1);
+    }
+
+    /// With want_output_seq, a full attach still primes with a Snapshot (carrying its seq) but
+    /// live output arrives only as seq'd OutputChunk, strictly after the snapshot's seq.
+    #[tokio::test]
+    async fn attach_should_deliver_output_chunks_after_snapshot_seq_when_want_output_seq() {
+        let engine = Arc::new(Engine::new());
+        let mut client = spawn_test_server(TymuxDaemon::new(engine.clone())).await;
+        let session = client
+            .create_session(create_req("test"))
+            .await
+            .unwrap()
+            .into_inner();
+        let pane_id_str = sole_pane(&session.windows[0]).id.clone();
+        let pane = match engine.pane_lookup(parse_uuid(&pane_id_str).unwrap()) {
+            PaneLookup::Live(pane) => pane,
+            _ => panic!("expected freshly created pane to be Live"),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id_str)),
+            resume_from_seq: None,
+            subscribe_lifecycle: false,
+            want_output_seq: true,
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .attach(Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("attach must respond within 5s")
+            .unwrap()
+            .expect("stream ended before any event");
+        let snapshot_seq = match first.payload {
+            Some(attach_event::Payload::Snapshot(s)) => {
+                s.seq.expect("priming Snapshot must carry seq")
+            }
+            other => panic!("expected a priming Snapshot, got {other:?}"),
+        };
+
+        pane.write_input(b"echo CHUNK-MARKER\n").unwrap();
+        let mut last = snapshot_seq;
+        let mut saw_chunk = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !saw_chunk {
+            assert!(Instant::now() < deadline, "no OutputChunk arrived");
+            let event = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+                .await
+                .expect("stream stalled")
+                .unwrap()
+                .expect("stream ended");
+            match event.payload {
+                Some(attach_event::Payload::OutputChunk(chunk)) => {
+                    assert!(chunk.seq > last, "seq must increase past the snapshot's");
+                    last = chunk.seq;
+                    saw_chunk = true;
+                }
+                Some(attach_event::Payload::Output(_)) => {
+                    panic!("want_output_seq must not emit legacy Output")
+                }
+                _ => {}
+            }
+        }
     }
 
     #[tokio::test]
@@ -3715,6 +3823,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         };
         let encoded = prost::Message::encode_to_vec(&legacy_request);
         let decoded: AttachRequest = prost::Message::decode(encoded.as_slice()).unwrap();
@@ -3726,6 +3835,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: Some(0),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         };
         let encoded = prost::Message::encode_to_vec(&resuming_request);
         let decoded: AttachRequest = prost::Message::decode(encoded.as_slice()).unwrap();
@@ -3829,6 +3939,7 @@ mod tests {
             payload: None,
             resume_from_seq: Some(5),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -3950,6 +4061,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4158,6 +4270,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4325,6 +4438,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4419,6 +4533,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4499,6 +4614,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4563,6 +4679,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str.clone())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4608,6 +4725,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str.clone())),
             resume_from_seq: Some(resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4654,6 +4772,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: Some(stale_resume_from_seq),
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4751,6 +4870,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id_str)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4859,6 +4979,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4894,6 +5015,7 @@ mod tests {
             )),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4979,6 +5101,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -4986,6 +5109,7 @@ mod tests {
             payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5042,6 +5166,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5049,6 +5174,7 @@ mod tests {
             payload: Some(attach_request::Payload::Input(b"exit 7\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5114,6 +5240,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5121,6 +5248,7 @@ mod tests {
             payload: Some(attach_request::Payload::Input(b"exit\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5184,6 +5312,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5561,6 +5690,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -5619,6 +5749,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -6312,6 +6443,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(Uuid::new_v4().to_string())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -6356,6 +6488,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -6753,6 +6886,7 @@ mod tests {
             )),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -7166,6 +7300,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
             resume_from_seq: None,
             subscribe_lifecycle,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -7360,6 +7495,7 @@ mod tests {
             payload: Some(attach_request::Payload::Input(b"go\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();

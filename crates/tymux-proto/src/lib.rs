@@ -28,4 +28,6 @@ pub const CAPABILITIES: &[&str] = &[
     "uds_auth",
     "pane.lifecycle",
     "server_info.fd_usage",
+    "snapshot.seq",
+    "attach.want_output_seq",
 ];

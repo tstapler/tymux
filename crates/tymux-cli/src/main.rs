@@ -1062,6 +1062,7 @@ async fn attach(
         // behaves identically to a pre-feature client's request.
         resume_from_seq: None,
         subscribe_lifecycle: false,
+        want_output_seq: false,
     })
     .await?;
 
@@ -1220,6 +1221,7 @@ async fn attach(
                                 // has meaning on the first message; not used here.
                                 resume_from_seq: None,
                                 subscribe_lifecycle: false,
+                                want_output_seq: false,
                             }).await?;
                         }
                         ReassembledOutput::Action(action) => match action {
@@ -1422,6 +1424,7 @@ async fn send_resize_and_repaint(
         // first message; not used here.
         resume_from_seq: None,
         subscribe_lifecycle: false,
+        want_output_seq: false,
     })
     .await?;
 
@@ -1907,6 +1910,7 @@ mod tests {
             payload: Some(attach_request::Payload::PaneId(pane_id)),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -1949,6 +1953,7 @@ mod tests {
             )),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();

@@ -1796,7 +1796,12 @@ type PaneSnapshot struct {
 	State PaneState `protobuf:"varint,20,opt,name=state,proto3,enum=tymux.v1.PaneState" json:"state,omitempty"`
 	// Set only when liveness is DEAD: the exited child's exit code, if it was captured. A child
 	// killed by a signal reports 1, not 128+signal (portable-pty 0.8.1 collapses signal deaths).
-	ExitCode      *int32 `protobuf:"varint,19,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
+	ExitCode *int32 `protobuf:"varint,19,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
+	// The pane's output sequence number this grid reflects, read under the same lock as the grid
+	// (same numbering space as OutputChunk.seq). A client holding an Attach stream opened with
+	// want_output_seq can drop every OutputChunk with seq <= this value, because the grid already
+	// contains it. Unset only for an exited pane served from persisted state.
+	Seq           *uint64 `protobuf:"varint,21,opt,name=seq,proto3,oneof" json:"seq,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1967,6 +1972,13 @@ func (x *PaneSnapshot) GetState() PaneState {
 func (x *PaneSnapshot) GetExitCode() int32 {
 	if x != nil && x.ExitCode != nil {
 		return *x.ExitCode
+	}
+	return 0
+}
+
+func (x *PaneSnapshot) GetSeq() uint64 {
+	if x != nil && x.Seq != nil {
+		return *x.Seq
 	}
 	return 0
 }
@@ -2385,8 +2397,12 @@ type AttachRequest struct {
 	// for a pane with no restart policy; a client that does not set it never receives a
 	// `lifecycle` event, but still stays attached across restarts.
 	SubscribeLifecycle bool `protobuf:"varint,5,opt,name=subscribe_lifecycle,json=subscribeLifecycle,proto3" json:"subscribe_lifecycle,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// First message only: deliver live output as OutputChunk (seq'd) instead of bare `output`,
+	// without resume semantics (a full attach still opens with a priming Snapshot). Lets a client
+	// order the stream against a CapturePane / Snapshot seq. Absent/false: legacy `output` events.
+	WantOutputSeq bool `protobuf:"varint,6,opt,name=want_output_seq,json=wantOutputSeq,proto3" json:"want_output_seq,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AttachRequest) Reset() {
@@ -2463,6 +2479,13 @@ func (x *AttachRequest) GetResumeFromSeq() uint64 {
 func (x *AttachRequest) GetSubscribeLifecycle() bool {
 	if x != nil {
 		return x.SubscribeLifecycle
+	}
+	return false
+}
+
+func (x *AttachRequest) GetWantOutputSeq() bool {
+	if x != nil {
+		return x.WantOutputSeq
 	}
 	return false
 }
@@ -4112,7 +4135,7 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x18SearchScrollbackResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\rR\x06offset\x12\x12\n" +
-	"\x04line\x18\x03 \x01(\tR\x04line\"\xdd\x05\n" +
+	"\x04line\x18\x03 \x01(\tR\x04line\"\xfc\x05\n" +
 	"\fPaneSnapshot\x12\x17\n" +
 	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12\x12\n" +
 	"\x04rows\x18\x02 \x01(\rR\x04rows\x12\x12\n" +
@@ -4140,9 +4163,11 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\bcharsets\x18\x11 \x01(\v2\x12.tymux.v1.CharsetsR\bcharsets\x12.\n" +
 	"\x13cursor_pending_wrap\x18\x12 \x01(\bR\x11cursorPendingWrap\x12)\n" +
 	"\x05state\x18\x14 \x01(\x0e2\x13.tymux.v1.PaneStateR\x05state\x12 \n" +
-	"\texit_code\x18\x13 \x01(\x05H\x00R\bexitCode\x88\x01\x01B\f\n" +
+	"\texit_code\x18\x13 \x01(\x05H\x00R\bexitCode\x88\x01\x01\x12\x15\n" +
+	"\x03seq\x18\x15 \x01(\x04H\x01R\x03seq\x88\x01\x01B\f\n" +
 	"\n" +
-	"_exit_code\"\xf8\x02\n" +
+	"_exit_codeB\x06\n" +
+	"\x04_seq\"\xf8\x02\n" +
 	"\rTerminalModes\x12&\n" +
 	"\x0fapp_cursor_keys\x18\x01 \x01(\bR\rappCursorKeys\x12\x1d\n" +
 	"\n" +
@@ -4177,13 +4202,14 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x05attrs\x18\x04 \x01(\rR\x05attrs\x12'\n" +
 	"\x0funderline_style\x18\x05 \x01(\rR\x0eunderlineStyle\x12'\n" +
 	"\x0funderline_color\x18\x06 \x01(\rR\x0eunderlineColor\x12\x1c\n" +
-	"\thyperlink\x18\a \x01(\rR\thyperlink\"\xeb\x01\n" +
+	"\thyperlink\x18\a \x01(\rR\thyperlink\"\x93\x02\n" +
 	"\rAttachRequest\x12\x19\n" +
 	"\apane_id\x18\x01 \x01(\tH\x00R\x06paneId\x12\x16\n" +
 	"\x05input\x18\x02 \x01(\fH\x00R\x05input\x12*\n" +
 	"\x06resize\x18\x03 \x01(\v2\x10.tymux.v1.ResizeH\x00R\x06resize\x12+\n" +
 	"\x0fresume_from_seq\x18\x04 \x01(\x04H\x01R\rresumeFromSeq\x88\x01\x01\x12/\n" +
-	"\x13subscribe_lifecycle\x18\x05 \x01(\bR\x12subscribeLifecycleB\t\n" +
+	"\x13subscribe_lifecycle\x18\x05 \x01(\bR\x12subscribeLifecycle\x12&\n" +
+	"\x0fwant_output_seq\x18\x06 \x01(\bR\rwantOutputSeqB\t\n" +
 	"\apayloadB\x12\n" +
 	"\x10_resume_from_seq\"g\n" +
 	"\x11WriteStdinRequest\x12\x19\n" +

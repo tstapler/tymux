@@ -265,6 +265,7 @@ async fn open_attach_with_command(
         payload: Some(attach_request::Payload::PaneId(pane_id.to_string())),
         resume_from_seq: None,
         subscribe_lifecycle: false,
+        want_output_seq: false,
     })
     .await
     .expect("send pane_id");
@@ -273,6 +274,7 @@ async fn open_attach_with_command(
             payload: Some(attach_request::Payload::Input(command.as_bytes().to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .expect("send input");

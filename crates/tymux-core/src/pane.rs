@@ -1063,7 +1063,7 @@ impl Pane {
         self.snapshot_at_offset_with_seq(0)
     }
 
-    fn snapshot_at_offset_with_seq(&self, offset: usize) -> (PaneSnapshot, u64) {
+    pub fn snapshot_at_offset_with_seq(&self, offset: usize) -> (PaneSnapshot, u64) {
         let mut parser = self.parser.lock().unwrap();
         parser.screen_mut().set_scrollback(offset);
         let snapshot = snapshot_from_screen(parser.screen());

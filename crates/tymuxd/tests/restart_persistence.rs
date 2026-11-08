@@ -603,6 +603,7 @@ async fn restart_policy_and_counters_should_survive_a_daemon_restart_and_backoff
             payload: Some(attach_request::Payload::PaneId(pane_id.clone())),
             resume_from_seq: None,
             subscribe_lifecycle: true,
+            want_output_seq: false,
         })
         .await
         .unwrap();
@@ -615,6 +616,7 @@ async fn restart_policy_and_counters_should_survive_a_daemon_restart_and_backoff
             payload: Some(attach_request::Payload::Input(b"go\n".to_vec())),
             resume_from_seq: None,
             subscribe_lifecycle: false,
+            want_output_seq: false,
         })
         .await
         .unwrap();
