@@ -141,6 +141,12 @@ service TymuxService {
   rpc SetRestartPolicy(SetRestartPolicyRequest) returns (SetRestartPolicyResponse);
   // The pane's lifecycle state, policy, counters and timestamps.
   rpc GetPaneStatus(GetPaneStatusRequest) returns (PaneStatus);
+  // Declares how urgently a client wants a pane's output (capability "pane.activity_hint").
+  // INTERACTIVE panes flush output immediately; BACKGROUND panes batch it for a short window,
+  // trading a few tens of milliseconds of latency for far fewer frames. The hint is advisory,
+  // per pane (not per client), and not persisted: the daemon forgets it on restart. Unknown
+  // pane: NOT_FOUND.
+  rpc SetPaneActivity(SetPaneActivityRequest) returns (SetPaneActivityResponse);
   // Replaces the pane's process now: a running one gets SIGTERM (SIGKILL after grace) and is
   // respawned once it exits; a dead one (any state, including STOPPED and FAILED) is respawned
   // immediately. Not charged to the restart budget and not delayed. With reset_backoff the
@@ -593,6 +599,11 @@ message AttachEvent {
     // lifecycle event once the pane will not restart.
     LifecycleEvent lifecycle = 8;
   }
+  // Capability "output.sent_at". Wall-clock microseconds since the Unix epoch, stamped just
+  // before the frame is handed to the gRPC stream (after any wait in the daemon's send queue).
+  // A same-host client computes receive-minus-stamp to see time spent in HTTP/2 flow control
+  // and its own receive queue. Set on every frame; 0 means "not stamped" (older daemons).
+  uint64 sent_at_unix_micros = 9;
 }
 
 message GetServerInfoRequest {
@@ -728,6 +739,19 @@ message SetRestartPolicyResponse {
   // The pane's status; unset when the target was a session.
   PaneStatus status = 1;
 }
+
+enum PaneActivity {
+  PANE_ACTIVITY_UNSPECIFIED = 0; // treated as NORMAL: the unhinted default
+  PANE_ACTIVITY_INTERACTIVE = 1;
+  PANE_ACTIVITY_BACKGROUND = 2;
+}
+
+message SetPaneActivityRequest {
+  string pane_id = 1;
+  PaneActivity activity = 2;
+}
+
+message SetPaneActivityResponse {}
 
 message GetPaneStatusRequest {
   string pane_id = 1;

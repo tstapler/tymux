@@ -387,6 +387,12 @@ func (c *Client) GetPaneStatus(ctx context.Context, r *connect.Request[v1.GetPan
 	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.GetPaneStatus(ctx, r) })
 }
 
+func (c *Client) SetPaneActivity(ctx context.Context, r *connect.Request[v1.SetPaneActivityRequest]) (*connect.Response[v1.SetPaneActivityResponse], error) {
+	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.SetPaneActivityResponse], error) {
+		return t.SetPaneActivity(ctx, r)
+	})
+}
+
 func (c *Client) RestartPane(ctx context.Context, r *connect.Request[v1.RestartPaneRequest]) (*connect.Response[v1.PaneStatus], error) {
 	return invoke(ctx, c, r.Header(), func(t Transport) (*connect.Response[v1.PaneStatus], error) { return t.RestartPane(ctx, r) })
 }

@@ -1300,16 +1300,17 @@ impl Engine {
 
         // Compute the new geometry under `sessions`, then release before
         // calling into any blocking Pane::resize() syscalls.
-        let rects = {
+        let (rects, window_dims_changed) = {
             let mut sessions = self.sessions.lock().unwrap();
             let window = sessions
                 .get_mut(&session_id)?
                 .windows
                 .iter_mut()
                 .find(|w| w.id == window_id)?;
+            let changed = (window.rows, window.cols) != (rows, cols);
             window.rows = rows;
             window.cols = cols;
-            window.layout.compute_geometry(rows, cols)
+            (window.layout.compute_geometry(rows, cols), changed)
         };
 
         // Pair each live pane with *its own* computed rect by pane id — not
@@ -1331,15 +1332,23 @@ impl Engine {
             .collect();
         drop(panes);
 
+        let mut any_pane_resized = false;
         for (pane, rect) in &live_pane_rects {
+            if pane.size() == (rect.rows as u32, rect.cols as u32) {
+                continue;
+            }
+            any_pane_resized = true;
             if let Err(e) = pane.resize(rect.rows, rect.cols) {
                 tracing::warn!(pane_id = %pane.id, error = %e, "window geometry recompute: pane resize failed");
             }
         }
         tracing::debug!(window_id = %window_id, rows, cols, "window geometry recomputed");
         self.notify_window_changed(window_id);
-
-        self.persist_session(session_id);
+        // A repeated viewport report (a client re-sending its unchanged size) must not cost a
+        // session-file rewrite; watchers are still woken, as a viewport registration is observable.
+        if window_dims_changed || any_pane_resized {
+            self.persist_session(session_id);
+        }
 
         Some((rows, cols))
     }

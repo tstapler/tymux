@@ -30,4 +30,6 @@ pub const CAPABILITIES: &[&str] = &[
     "server_info.fd_usage",
     "snapshot.seq",
     "attach.want_output_seq",
+    "pane.activity_hint",
+    "output.sent_at",
 ];
