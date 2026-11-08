@@ -253,11 +253,12 @@ test("attach resumes byte-identically after disconnect and reattach with recorde
   );
 
   const combined = [...firstChunks, ...secondChunks];
+  // Strictly increasing, not contiguous: the daemon merges queued pty reads into one chunk
+  // carrying the last seq, so seqs may skip. Byte-identity below is the real resume guarantee.
   for (let i = 1; i < combined.length; i++) {
-    assert.equal(
-      combined[i].seq,
-      combined[i - 1].seq + 1n,
-      `OutputChunk seq must be contiguous across the reconnect: ${combined[i - 1].seq} -> ${combined[i].seq}`,
+    assert.ok(
+      combined[i].seq > combined[i - 1].seq,
+      `OutputChunk seq must increase across the reconnect: ${combined[i - 1].seq} -> ${combined[i].seq}`,
     );
   }
 

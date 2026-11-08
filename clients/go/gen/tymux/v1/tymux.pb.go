@@ -258,7 +258,7 @@ func (RestartMode) EnumDescriptor() ([]byte, []int) {
 type PaneActivity int32
 
 const (
-	PaneActivity_PANE_ACTIVITY_NORMAL      PaneActivity = 0
+	PaneActivity_PANE_ACTIVITY_UNSPECIFIED PaneActivity = 0 // treated as NORMAL: the unhinted default
 	PaneActivity_PANE_ACTIVITY_INTERACTIVE PaneActivity = 1
 	PaneActivity_PANE_ACTIVITY_BACKGROUND  PaneActivity = 2
 )
@@ -266,12 +266,12 @@ const (
 // Enum value maps for PaneActivity.
 var (
 	PaneActivity_name = map[int32]string{
-		0: "PANE_ACTIVITY_NORMAL",
+		0: "PANE_ACTIVITY_UNSPECIFIED",
 		1: "PANE_ACTIVITY_INTERACTIVE",
 		2: "PANE_ACTIVITY_BACKGROUND",
 	}
 	PaneActivity_value = map[string]int32{
-		"PANE_ACTIVITY_NORMAL":      0,
+		"PANE_ACTIVITY_UNSPECIFIED": 0,
 		"PANE_ACTIVITY_INTERACTIVE": 1,
 		"PANE_ACTIVITY_BACKGROUND":  2,
 	}
@@ -3756,7 +3756,7 @@ func (x *SetPaneActivityRequest) GetActivity() PaneActivity {
 	if x != nil {
 		return x.Activity
 	}
-	return PaneActivity_PANE_ACTIVITY_NORMAL
+	return PaneActivity_PANE_ACTIVITY_UNSPECIFIED
 }
 
 type SetPaneActivityResponse struct {
@@ -4477,9 +4477,9 @@ const file_tymux_v1_tymux_proto_rawDesc = "" +
 	"\x12RESTART_MODE_NEVER\x10\x01\x12\x1b\n" +
 	"\x17RESTART_MODE_ON_FAILURE\x10\x02\x12\x17\n" +
 	"\x13RESTART_MODE_ALWAYS\x10\x03\x12\x1f\n" +
-	"\x1bRESTART_MODE_UNLESS_STOPPED\x10\x04*e\n" +
-	"\fPaneActivity\x12\x18\n" +
-	"\x14PANE_ACTIVITY_NORMAL\x10\x00\x12\x1d\n" +
+	"\x1bRESTART_MODE_UNLESS_STOPPED\x10\x04*j\n" +
+	"\fPaneActivity\x12\x1d\n" +
+	"\x19PANE_ACTIVITY_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19PANE_ACTIVITY_INTERACTIVE\x10\x01\x12\x1c\n" +
 	"\x18PANE_ACTIVITY_BACKGROUND\x10\x02*\xee\x01\n" +
 	"\x12LifecycleEventKind\x12$\n" +

@@ -726,7 +726,7 @@ message SetRestartPolicyResponse {
 }
 
 enum PaneActivity {
-  PANE_ACTIVITY_NORMAL = 0;
+  PANE_ACTIVITY_UNSPECIFIED = 0; // treated as NORMAL: the unhinted default
   PANE_ACTIVITY_INTERACTIVE = 1;
   PANE_ACTIVITY_BACKGROUND = 2;
 }
