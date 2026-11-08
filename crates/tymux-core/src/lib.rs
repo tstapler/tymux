@@ -21,7 +21,8 @@ pub use layout::{
 };
 pub use pane::handoff::{clear_cloexec, set_cloexec, PaneHandoff, ScreenState, HANDOFF_SCHEMA};
 pub use pane::{
-    CellSnapshot, Charsets, Pane, PaneActivity, PaneSnapshot, StdinError, TerminalModes,
+    AttachTicket, CellSnapshot, Charsets, Pane, PaneActivity, PaneSnapshot, StdinError,
+    TerminalModes,
 };
 pub use persistence::{
     default_sessions_dir, FsPersistenceBackend, NullPersistenceBackend, PersistedLayoutNode,

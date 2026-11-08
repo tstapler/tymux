@@ -391,6 +391,7 @@ mod tests {
                 .unwrap();
             if let Some(AttachEvent {
                 payload: Some(attach_event::Payload::Output(bytes)),
+                ..
             }) = event
             {
                 streamed.extend_from_slice(&bytes);
