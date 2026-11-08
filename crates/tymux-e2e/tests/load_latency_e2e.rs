@@ -1,6 +1,6 @@
 //! Manual load probe (ignored by default): input-echo and CapturePane latency of one
 //! interactive pane while N chatty panes run, with an optional resize storm.
-//! `LOAD_NOISY=40 LOAD_STORM=1 cargo test -p tymux-e2e --release --test load_latency_e2e -- --ignored --nocapture`
+//! `LOAD_BIN=/path/to/tymuxd LOAD_NOISY=0,10,40 cargo test -p tymux-e2e --release --test load_latency_e2e -- --ignored --nocapture`
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -9,7 +9,8 @@ use tonic::transport::Channel;
 use tymux_e2e::{daemon, workspace_bin};
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
-    attach_event, attach_request, AttachRequest, CapturePaneRequest, CreateSessionRequest, Resize,
+    attach_event, attach_request, AttachRequest, CapturePaneRequest, CreateSessionRequest,
+    ListSessionsRequest, PaneActivity, Resize, SetPaneActivityRequest,
 };
 
 type Client = TymuxServiceClient<Channel>;
@@ -83,15 +84,40 @@ async fn attach(
     (req_tx, out_rx)
 }
 
+/// Opens a fresh Attach stream and returns (call returned, first event received) in ms: the
+/// priming snapshot cost a reconnecting or newly loaded client waits for.
+async fn attach_open_ms(mut client: Client, pane_id: String) -> (f64, f64) {
+    let (req_tx, req_rx) = mpsc::channel(8);
+    req_tx
+        .send(AttachRequest {
+            payload: Some(attach_request::Payload::PaneId(pane_id)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let start = Instant::now();
+    let mut events = client
+        .attach(ReceiverStream::new(req_rx))
+        .await
+        .unwrap()
+        .into_inner();
+    let returned = start.elapsed().as_secs_f64() * 1000.0;
+    let _ = events.message().await;
+    (returned, start.elapsed().as_secs_f64() * 1000.0)
+}
+
 fn pct(v: &mut [f64], p: f64) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[((v.len() as f64 - 1.0) * p) as usize]
 }
 
-fn report(label: &str, mut ms: Vec<f64>) {
-    let n = ms.len();
+/// One latency series, summarised as a single greppable line:
+/// `RESULT bin=<label> noisy=<n> storm=<0|1> metric=<name> n=<count> p50=.. p95=.. p99=.. max=..` (ms).
+fn report(label: &str, noisy: usize, storm: bool, metric: &str, mut ms: Vec<f64>) {
     println!(
-        "RESULT {label}: n={n} p50={:.1}ms p95={:.1}ms p99={:.1}ms max={:.1}ms",
+        "RESULT bin={label} noisy={noisy} storm={} metric={metric} n={} p50={:.2} p95={:.2} p99={:.2} max={:.2}",
+        u8::from(storm),
+        ms.len(),
         pct(&mut ms, 0.5),
         pct(&mut ms, 0.95),
         pct(&mut ms, 0.99),
@@ -99,47 +125,74 @@ fn report(label: &str, mut ms: Vec<f64>) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "manual load probe; set LOAD_NOISY / LOAD_STORM"]
-async fn echo_and_capture_latency_under_load() {
-    let noisy = env_usize("LOAD_NOISY", 0);
-    let storm = env_usize("LOAD_STORM", 0) > 0;
-    let samples = env_usize("LOAD_SAMPLES", 150);
-    let d = daemon::spawn(&workspace_bin("tymuxd"));
+const NOISY_SCRIPTS: [&str; 3] = [
+    "yes",
+    "while :; do printf '\\033[31mred\\033[0m \\033[1;32mgreen bold line with some text to fill the row padding padding\\033[0m\\n'; done",
+    "while :; do printf '\\033[2J\\033[H'; i=0; while [ $i -lt 30 ]; do printf '\\033[%d;1H\\033[36mredraw row %d\\033[0m\\033[K' $i $i; i=$((i+1)); done; done",
+];
+
+/// Everything one probe configuration needs; every knob is pinned by `LOAD_*` env defaults so
+/// two runs of the same binary differ only by host noise.
+struct Params {
+    label: String,
+    bin: std::path::PathBuf,
+    noisy: usize,
+    storm: bool,
+    warmup: usize,
+    samples: usize,
+    captures: usize,
+    echo_gap_ms: u64,
+    /// Mark noisy panes Background and the probe Interactive (`SetPaneActivity`); daemons without
+    /// the RPC ignore it, so the same run is a valid baseline for them.
+    activity_hint: bool,
+}
+
+/// Spawns a fresh isolated daemon, runs `noisy` chatty panes (round-robin over `NOISY_SCRIPTS`),
+/// optionally a resize storm over them, then measures echo and CapturePane latency on a quiet
+/// `cat` probe pane.
+async fn run_config(p: &Params) {
+    let d = daemon::spawn(&p.bin);
     let mut client = d.wait_ready().await;
 
     let mut noisy_ids = Vec::new();
     let mut _drains = Vec::new();
-    for i in 0..noisy {
-        let script = match i % 3 {
-            0 => "yes",
-            1 => "while :; do printf '\\033[31mred\\033[0m \\033[1;32mgreen bold line with some text to fill the row padding padding\\033[0m\\n'; done",
-            _ => "while :; do printf '\\033[2J\\033[H'; i=0; while [ $i -lt 30 ]; do printf '\\033[%d;1H\\033[36mredraw row %d\\033[0m\\033[K' $i $i; i=$((i+1)); done; done",
-        };
+    for i in 0..p.noisy {
         let id = create(
             &mut client,
             &format!("noisy-{i}"),
             "/bin/sh",
-            &["-c", script],
+            &["-c", NOISY_SCRIPTS[i % NOISY_SCRIPTS.len()]],
         )
         .await;
+        if p.activity_hint {
+            let _ = client
+                .set_pane_activity(SetPaneActivityRequest {
+                    pane_id: id.clone(),
+                    activity: PaneActivity::Background as i32,
+                })
+                .await;
+        }
         // Standing attach with a draining reader, like the squad's standing streams.
         let (tx, mut rx) = attach(&mut client, &id).await;
         _drains.push(tx);
-        _drains.push({
-            let (t2, _r2) = mpsc::channel(1);
-            tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            t2
-        });
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
         noisy_ids.push(id);
     }
 
     let probe = create(&mut client, "probe", "/bin/cat", &[]).await;
+    if p.activity_hint {
+        let _ = client
+            .set_pane_activity(SetPaneActivityRequest {
+                pane_id: probe.clone(),
+                activity: PaneActivity::Interactive as i32,
+            })
+            .await;
+    }
     let (probe_tx, mut probe_rx) = attach(&mut client, &probe).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     while probe_rx.try_recv().is_ok() {}
 
-    let storm_handle = if storm {
+    let storm_handle = if p.storm {
         let mut c = client.clone();
         let ids = noisy_ids.clone();
         Some(tokio::spawn(async move {
@@ -168,7 +221,7 @@ async fn echo_and_capture_latency_under_load() {
 
     let mut echo = Vec::new();
     let mut lost = 0;
-    for i in 0..samples {
+    for i in 0..(p.warmup + p.samples) {
         let ch = b'a' + (i % 26) as u8;
         let start = Instant::now();
         probe_tx
@@ -184,24 +237,31 @@ async fn echo_and_capture_latency_under_load() {
             tokio::time::timeout_at(deadline.into(), probe_rx.recv()).await
         {
             if bytes.contains(&ch) {
-                echo.push(at.duration_since(start).as_secs_f64() * 1000.0);
+                if i >= p.warmup {
+                    echo.push(at.duration_since(start).as_secs_f64() * 1000.0);
+                }
                 got = true;
                 break;
             }
         }
-        if !got {
+        if !got && i >= p.warmup {
             lost += 1;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(p.echo_gap_ms)).await;
     }
-    println!("RESULT noisy={noisy} storm={storm} echo_lost={lost}");
+    println!(
+        "RESULT bin={} noisy={} storm={} metric=echo_lost n={lost}",
+        p.label,
+        p.noisy,
+        u8::from(p.storm)
+    );
     if !echo.is_empty() {
-        report("echo", echo);
+        report(&p.label, p.noisy, p.storm, "echo", echo);
     }
 
     let mut cap_probe = Vec::new();
     let mut cap_noisy = Vec::new();
-    for i in 0..60 {
+    for i in 0..p.captures {
         let t = Instant::now();
         let _ = client
             .capture_pane(CapturePaneRequest {
@@ -221,11 +281,89 @@ async fn echo_and_capture_latency_under_load() {
             cap_noisy.push(t.elapsed().as_secs_f64() * 1000.0);
         }
     }
-    report("capture_probe", cap_probe);
+    report(&p.label, p.noisy, p.storm, "capture_probe", cap_probe);
     if !cap_noisy.is_empty() {
-        report("capture_noisy", cap_noisy);
+        report(&p.label, p.noisy, p.storm, "capture_noisy", cap_noisy);
     }
+    // Attach-open and ListSessions: what squad's AdoptForViewing waits on (3 s budget there).
+    let targets: Vec<String> = if noisy_ids.is_empty() {
+        vec![probe.clone()]
+    } else {
+        noisy_ids.clone()
+    };
+    let (mut open_ret, mut open_first, mut list) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..30 {
+        let (r, f) = attach_open_ms(client.clone(), targets[i % targets.len()].clone()).await;
+        open_ret.push(r);
+        open_first.push(f);
+        let t = Instant::now();
+        let _ = client.list_sessions(ListSessionsRequest {}).await;
+        list.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    report(&p.label, p.noisy, p.storm, "attach_open_returned", open_ret);
+    report(
+        &p.label,
+        p.noisy,
+        p.storm,
+        "attach_open_first_event",
+        open_first,
+    );
+    report(&p.label, p.noisy, p.storm, "list_sessions", list);
+    // A page reload opens ten at once.
+    let mut burst = Vec::new();
+    for round in 0..5 {
+        let opens: Vec<_> = (0..10)
+            .map(|k| {
+                tokio::spawn(attach_open_ms(
+                    client.clone(),
+                    targets[(round * 10 + k) % targets.len()].clone(),
+                ))
+            })
+            .collect();
+        for open in opens {
+            burst.push(open.await.unwrap().1);
+        }
+    }
+    report(
+        &p.label,
+        p.noisy,
+        p.storm,
+        "attach_open_x10_first_event",
+        burst,
+    );
     if let Some(h) = storm_handle {
         h.abort();
+    }
+}
+
+/// Defaults: noisy panes `0,10,40`, no storm, 20 warmup + 200 echo samples at a 20 ms gap, 60
+/// captures. Knobs: `LOAD_BIN` (tymuxd to measure; default the workspace build), `LOAD_LABEL`,
+/// `LOAD_NOISY` (comma list), `LOAD_STORM=1`, `LOAD_ACTIVITY=1` (activity hints), `LOAD_WARMUP`, `LOAD_SAMPLES`, `LOAD_CAPTURES`,
+/// `LOAD_ECHO_GAP_MS`. Compare daemons with `scripts/load-ab.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual load probe; see scripts/load-ab.sh"]
+async fn echo_and_capture_latency_under_load() {
+    let bin = std::env::var_os("LOAD_BIN")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace_bin("tymuxd"));
+    let label = std::env::var("LOAD_LABEL").unwrap_or_else(|_| "workspace".into());
+    let noisy_list: Vec<usize> = std::env::var("LOAD_NOISY")
+        .unwrap_or_else(|_| "0,10,40".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    for noisy in noisy_list {
+        run_config(&Params {
+            label: label.clone(),
+            bin: bin.clone(),
+            noisy,
+            storm: env_usize("LOAD_STORM", 0) > 0,
+            warmup: env_usize("LOAD_WARMUP", 20),
+            samples: env_usize("LOAD_SAMPLES", 200),
+            captures: env_usize("LOAD_CAPTURES", 60),
+            echo_gap_ms: env_usize("LOAD_ECHO_GAP_MS", 20) as u64,
+            activity_hint: env_usize("LOAD_ACTIVITY", 0) > 0,
+        })
+        .await;
     }
 }
