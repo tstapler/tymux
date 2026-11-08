@@ -1,5 +1,6 @@
 //! Informational commands must exit before state access or listener startup.
 //! An invalid address makes an accidental daemon launch fail instead of bind.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::process::{Command, Output};
 use std::time::Duration;

@@ -5,6 +5,7 @@
 //! as a subprocess (not just an in-process `Engine`/`TymuxDaemon` call),
 //! kills it, restarts it pointed at the same persisted-sessions directory,
 //! and asserts the reloaded session's `Layout` tree shape is identical.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;

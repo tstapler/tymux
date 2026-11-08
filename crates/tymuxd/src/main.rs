@@ -1,3 +1,5 @@
+mod pool;
+
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
@@ -10,6 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+use pool::{Class, PollMonitor, PoolError, Pools};
 use tymux_core::{
     Engine, LayoutSnapshot as CoreLayout, Orientation as CoreOrientation, PaneActivity, PaneLookup,
     PersistedLayoutNode, PersistenceBackend, ReplayOutcome, SessionSnapshot, WindowSnapshot,
@@ -41,6 +44,7 @@ use tymux_proto::v1::{
 mod auth;
 mod listener_health;
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive real processes and blocking fixtures
 mod listener_recovery_tests;
 
 /// Default window (Task 1.1.2e / pre-mortem P1 #1) within which a pane
@@ -103,10 +107,50 @@ pub struct TymuxDaemon {
     /// Always `DEFAULT_HEARTBEAT_INTERVAL` in production; only
     /// `test_daemon_with_intervals` (test-only) sets it shorter.
     heartbeat_interval: Duration,
+    /// Dedicated pools for blocking pane work (see `pool`); shared process-wide.
+    pools: Arc<Pools>,
+    monitors: Arc<TaskMonitors>,
+}
+
+/// Poll-time monitors per async task class.
+struct TaskMonitors {
+    forward: Arc<PollMonitor>,
+    input: Arc<PollMonitor>,
+    rpc: Arc<PollMonitor>,
+}
+
+impl TaskMonitors {
+    /// `TYMUXD_SLOW_POLL_MS` (default 10) is the poll duration counted as slow.
+    fn from_env() -> Arc<Self> {
+        let ms = std::env::var("TYMUXD_SLOW_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+        let threshold = Duration::from_millis(ms);
+        Arc::new(Self {
+            forward: PollMonitor::new("attach_forward", threshold),
+            input: PollMonitor::new("attach_input", threshold),
+            rpc: PollMonitor::new("rpc", threshold),
+        })
+    }
 }
 
 /// Process start time, pinned the first time a daemon is constructed.
 static STARTED_AT: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
+/// One set of pools per process, so tests that build many daemons do not each spawn threads.
+fn shared_pools() -> Arc<Pools> {
+    static POOLS: std::sync::OnceLock<Arc<Pools>> = std::sync::OnceLock::new();
+    POOLS.get_or_init(|| Arc::new(Pools::from_env())).clone()
+}
+
+fn pool_status(err: PoolError) -> Status {
+    match err {
+        PoolError::Rejected => Status::resource_exhausted("daemon work queue is full"),
+        PoolError::Panicked => Status::internal("pane task panicked"),
+        PoolError::Cancelled => Status::cancelled("request cancelled"),
+    }
+}
 
 impl TymuxDaemon {
     fn new(engine: Arc<Engine>) -> Self {
@@ -129,6 +173,8 @@ impl TymuxDaemon {
             resume_outcome_counters: Arc::new(ResumeOutcomeCounters::new()),
             grace_period_duration,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            pools: shared_pools(),
+            monitors: TaskMonitors::from_env(),
         }
     }
 
@@ -963,6 +1009,7 @@ struct ResizeLane {
 impl ResizeLane {
     /// Dropping the lane closes it: the worker applies the last pending size, then exits.
     fn spawn(
+        pools: Arc<Pools>,
         apply: impl Fn(u16, u16) + Send + Sync + 'static,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let (request_tx, mut request_rx) = tokio::sync::watch::channel((0u64, None));
@@ -973,7 +1020,7 @@ impl ResizeLane {
                 let (generation, size) = *request_rx.borrow_and_update();
                 if let Some((rows, cols)) = size {
                     let apply = apply.clone();
-                    let _ = tokio::task::spawn_blocking(move || apply(rows, cols)).await;
+                    let _ = pools.run(Class::Resize, move || apply(rows, cols)).await;
                 }
                 applied_tx.send_replace(generation);
             }
@@ -1034,14 +1081,18 @@ fn activity_from_proto(value: i32) -> PaneActivity {
 /// prime a reattaching client with `pane.snapshot_with_seq()` today.
 #[allow(clippy::result_large_err)]
 async fn snapshot_priming_event(
+    pools: &Pools,
     pane: &Arc<tymux_core::Pane>,
     pane_id_str: &str,
 ) -> Result<(AttachEvent, u64), Status> {
     let pane = pane.clone();
     let id = pane_id_str.to_owned();
-    tokio::task::spawn_blocking(move || snapshot_priming_event_blocking(&pane, &id))
+    pools
+        .run(Class::Work, move || {
+            snapshot_priming_event_blocking(&pane, &id)
+        })
         .await
-        .map_err(|e| Status::internal(format!("attach snapshot task failed: {e}")))
+        .map_err(pool_status)
 }
 
 fn snapshot_priming_event_blocking(
@@ -1094,6 +1145,40 @@ impl TymuxService for TymuxDaemon {
             started_at_unix,
             open_fds,
             max_open_fds: listener_health::nofile_soft_limit(),
+            work_pools: self
+                .pools
+                .snapshot()
+                .into_iter()
+                .map(|c| tymux_proto::v1::WorkPoolStats {
+                    class: c.class.to_string(),
+                    threads: c.threads as u32,
+                    queue_depth: c.queue_depth,
+                    submitted: c.submitted,
+                    completed: c.completed,
+                    skipped_cancelled: c.skipped_cancelled,
+                    panicked: c.panicked,
+                    rejected: c.rejected,
+                    wait_micros_total: c.wait_micros_total,
+                    wait_micros_max: c.wait_micros_max,
+                    run_micros_total: c.run_micros_total,
+                    run_micros_max: c.run_micros_max,
+                })
+                .collect(),
+            slow_polls: [
+                &self.monitors.forward,
+                &self.monitors.input,
+                &self.monitors.rpc,
+            ]
+            .iter()
+            .map(|m| m.snapshot())
+            .map(|p| tymux_proto::v1::SlowPollStats {
+                task_class: p.class.to_string(),
+                polls: p.polls,
+                slow_polls: p.slow_polls,
+                total_poll_micros: p.total_poll_micros,
+                max_poll_micros: p.max_poll_micros,
+            })
+            .collect(),
         }))
     }
 
@@ -1232,11 +1317,13 @@ impl TymuxService for TymuxDaemon {
         // Rendering walks the whole grid under the pane's parser lock, which a chatty pane's
         // reader thread holds almost continuously; keep that wait off the async workers.
         let pane_for_render = pane.clone();
-        let (grid, snapshot_seq) = tokio::task::spawn_blocking(move || {
-            pane_for_render.snapshot_at_offset_with_seq(offset)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("capture_pane task failed: {e}")))?;
+        let (grid, snapshot_seq) = self
+            .pools
+            .run(Class::Work, move || {
+                pane_for_render.snapshot_at_offset_with_seq(offset)
+            })
+            .await
+            .map_err(pool_status)?;
         let mut snapshot = snapshot_to_proto(&req.pane_id, grid, live);
         snapshot.seq = Some(snapshot_seq);
         if !live {
@@ -1705,7 +1792,7 @@ impl TymuxService for TymuxDaemon {
                         })),
                     };
                     let (snapshot_event, snapshot_seq) =
-                        snapshot_priming_event(&pane, &pane_id_str).await?;
+                        snapshot_priming_event(&self.pools, &pane, &pane_id_str).await?;
                     (
                         vec![gap_event, snapshot_event],
                         snapshot_seq,
@@ -1723,7 +1810,7 @@ impl TymuxService for TymuxDaemon {
                 );
                 // Unchanged pre-feature path (Epic 2.4).
                 let (snapshot_event, snapshot_seq) =
-                    snapshot_priming_event(&pane, &pane_id_str).await?;
+                    snapshot_priming_event(&self.pools, &pane, &pane_id_str).await?;
                 (
                     vec![snapshot_event],
                     snapshot_seq,
@@ -1746,7 +1833,8 @@ impl TymuxService for TymuxDaemon {
         let disconnect_tracker_for_exit = self.disconnect_tracker.clone();
         let disconnect_regression_window = self.disconnect_regression_window;
         let heartbeat_interval_duration = self.heartbeat_interval;
-        let forward_handle = tokio::spawn(async move {
+        let forward_monitor = self.monitors.forward.clone();
+        let forward_handle = tokio::spawn(forward_monitor.instrument(async move {
             let _gauge_guard = gauge_guard;
 
             // Task 2.3.1a: drain the resume replay backlog (if any) first,
@@ -1883,11 +1971,12 @@ impl TymuxService for TymuxDaemon {
                                    }
                                }
             }
-        });
+        }));
         // Spawned tasks that panic vanish silently by default — surface it.
         tokio::spawn(supervise(pane_id, "forward", forward_handle));
 
         let pane_for_input = pane.clone();
+        let pools_for_input = self.pools.clone();
         let engine_for_input = self.engine.clone();
         let disconnect_tracker_for_input = self.disconnect_tracker.clone();
         let grace_period_duration = self.grace_period_duration;
@@ -1898,13 +1987,14 @@ impl TymuxService for TymuxDaemon {
         let mut resize_task = None;
         if let Some(window_id) = window_id {
             let engine_for_resize = self.engine.clone();
-            let (lane, task) = ResizeLane::spawn(move |rows, cols| {
+            let (lane, task) = ResizeLane::spawn(self.pools.clone(), move |rows, cols| {
                 engine_for_resize.report_viewport_and_recompute(window_id, client_id, rows, cols);
             });
             resize_lane = Some(lane);
             resize_task = Some(task);
         }
-        let input_handle = tokio::spawn(async move {
+        let input_monitor = self.monitors.input.clone();
+        let input_handle = tokio::spawn(input_monitor.instrument(async move {
             // Held for the life of the inbound half, which ends promptly when the client leaves.
             let _attach_ticket = attach_ticket;
             while let Some(Ok(msg)) = inbound.next().await {
@@ -1918,13 +2008,16 @@ impl TymuxService for TymuxDaemon {
                         // A full pty input queue blocks write_all; awaiting the blocking task
                         // keeps keystroke order without parking an async worker.
                         let pane = pane_for_input.clone();
-                        match tokio::task::spawn_blocking(move || pane.write_input(&bytes)).await {
+                        match pools_for_input
+                            .run(Class::Input, move || pane.write_input(&bytes))
+                            .await
+                        {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
                                 tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input failed");
                             }
                             Err(e) => {
-                                tracing::warn!(pane_id = %pane_for_input.id, error = %e, "write_input task failed");
+                                tracing::warn!(pane_id = %pane_for_input.id, error = ?e, "write_input task failed");
                             }
                         }
                     }
@@ -2009,7 +2102,7 @@ impl TymuxService for TymuxDaemon {
                     );
                 });
             }
-        });
+        }));
         tokio::spawn(supervise(pane_id, "input", input_handle));
 
         Ok(Response::new(
@@ -2414,6 +2507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // runtime teardown blocks. Exiting drops the connections; panes are untouched (no
             // pane Drop kills children, and state is already durable).
             std::thread::spawn(move || {
+                #[allow(clippy::disallowed_methods)] // a dedicated OS thread, not an async worker
                 std::thread::sleep(shutdown_drain);
                 tracing::warn!(
                     drain_secs = shutdown_drain.as_secs_f64(),
@@ -2940,6 +3034,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive real files and blocking fixtures
 mod tests {
     use super::*;
     use futures::FutureExt;
@@ -2975,6 +3070,8 @@ mod tests {
             resume_outcome_counters: Arc::new(ResumeOutcomeCounters::new()),
             grace_period_duration,
             heartbeat_interval,
+            pools: shared_pools(),
+            monitors: TaskMonitors::from_env(),
         }
     }
 
@@ -4102,7 +4199,7 @@ mod tests {
     async fn resize_lane_barrier_should_return_after_the_requested_resize_is_applied() {
         let applied = Arc::new(Mutex::new(Vec::new()));
         let log = applied.clone();
-        let (mut lane, _task) = ResizeLane::spawn(move |r, c| {
+        let (mut lane, _task) = ResizeLane::spawn(shared_pools(), move |r, c| {
             std::thread::sleep(Duration::from_millis(20));
             log.lock().unwrap().push((r, c));
         });
@@ -4115,7 +4212,7 @@ mod tests {
     async fn resize_lane_barrier_should_give_up_after_the_timeout_when_the_resize_is_stuck() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
-        let (mut lane, _task) = ResizeLane::spawn(move |_, _| {
+        let (mut lane, _task) = ResizeLane::spawn(shared_pools(), move |_, _| {
             let _ = release_rx.lock().unwrap().recv();
         });
         lane.request(30, 100);
@@ -4129,7 +4226,7 @@ mod tests {
     async fn resize_lane_should_collapse_a_burst_to_the_final_size_and_exit_when_dropped() {
         let applied = Arc::new(Mutex::new(Vec::new()));
         let log = applied.clone();
-        let (mut lane, task) = ResizeLane::spawn(move |r, c| {
+        let (mut lane, task) = ResizeLane::spawn(shared_pools(), move |r, c| {
             std::thread::sleep(Duration::from_millis(10));
             log.lock().unwrap().push((r, c));
         });
@@ -4153,7 +4250,7 @@ mod tests {
 
     #[tokio::test]
     async fn resize_lane_barrier_should_not_wait_when_nothing_was_requested() {
-        let (lane, _task) = ResizeLane::spawn(|_, _| panic!("no resize requested"));
+        let (lane, _task) = ResizeLane::spawn(shared_pools(), |_, _| panic!("no resize requested"));
         lane.barrier(Duration::from_millis(1)).await;
     }
 
@@ -4237,13 +4334,23 @@ mod tests {
             .unwrap()
             .into_inner();
         let pane_id = sole_pane(&session.windows[0]).id.clone();
-        let (tx, mut stream) = attach_with_lifecycle(&mut client, &pane_id, true).await;
+        // The pane may already be in backoff before we attach, so poll its state, not events.
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let event = next_lifecycle(&mut stream).await;
-            if event.kind == ProtoLifecycleEventKind::RestartScheduled as i32 {
+            let status = client
+                .get_pane_status(GetPaneStatusRequest {
+                    pane_id: pane_id.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            if status.state == PaneState::Backoff as i32 {
                 break;
             }
+            assert!(Instant::now() < deadline, "pane never entered backoff");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let (tx, stream) = attach_with_lifecycle(&mut client, &pane_id, true).await;
         client
             .set_pane_activity(SetPaneActivityRequest {
                 pane_id: pane_id.clone(),
@@ -6609,7 +6716,9 @@ mod tests {
         const N: usize = 10;
         let grace_period = Duration::from_millis(1200);
         let gap = Duration::from_millis(75);
-        let daemon = test_daemon_with_intervals(DEFAULT_HEARTBEAT_INTERVAL, grace_period);
+        let mut daemon = test_daemon_with_intervals(DEFAULT_HEARTBEAT_INTERVAL, grace_period);
+        // This test pauses the clock; see Pools::tokio_backed.
+        daemon.pools = Arc::new(Pools::tokio_backed());
         let session = daemon
             .create_session(Request::new(create_req("test")))
             .await

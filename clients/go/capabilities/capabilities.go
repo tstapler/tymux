@@ -25,6 +25,7 @@ const (
 	PaneActivityHint    = "pane.activity_hint"             // SetPaneActivity RPC
 	SnapshotSeq         = "snapshot.seq"                   // PaneSnapshot.seq on CapturePane and the priming Snapshot
 	AttachWantOutputSeq = "attach.want_output_seq"         // AttachRequest.want_output_seq
+	WorkPools           = "daemon.work_pools"              // ServerInfo.work_pools, ServerInfo.slow_polls
 	OutputSentAt        = "output.sent_at"                 // AttachEvent.sent_at_unix_micros
 )
 

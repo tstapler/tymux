@@ -14,6 +14,7 @@
 //! - Story 5.2.3 (validation.md Gap 1): a real dual-listener `tymuxd`
 //!   drains concurrent TCP *and* UDS `Attach` streams gracefully on
 //!   SIGTERM — the automated proof Story 4.2.2's own ACs were missing.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

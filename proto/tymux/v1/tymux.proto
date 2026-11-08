@@ -635,6 +635,37 @@ message ServerInfo {
   // 0 when the daemon could not read the value (e.g. an older daemon omits both).
   uint64 open_fds = 7;
   uint64 max_open_fds = 8;
+  // Capability "daemon.work_pools": counters for the daemon's dedicated blocking-work pools and
+  // for slow async polls. Read-only diagnostics; a client may ignore them.
+  repeated WorkPoolStats work_pools = 9;
+  repeated SlowPollStats slow_polls = 10;
+}
+
+// One latency class's pool: "input" (pty writes), "resize", or "work" (captures, attach
+// snapshots). Times are microseconds, summed over all jobs since daemon start.
+message WorkPoolStats {
+  string class = 1;
+  uint32 threads = 2;
+  uint64 queue_depth = 3;
+  uint64 submitted = 4;
+  uint64 completed = 5;
+  uint64 skipped_cancelled = 6;
+  uint64 panicked = 7;
+  uint64 rejected = 8;
+  uint64 wait_micros_total = 9;
+  uint64 wait_micros_max = 10;
+  uint64 run_micros_total = 11;
+  uint64 run_micros_max = 12;
+}
+
+// Poll-time counters for one async task class. A slow poll (default over 10 ms,
+// TYMUXD_SLOW_POLL_MS) means the task held an async worker thread.
+message SlowPollStats {
+  string task_class = 1;
+  uint64 polls = 2;
+  uint64 slow_polls = 3;
+  uint64 total_poll_micros = 4;
+  uint64 max_poll_micros = 5;
 }
 
 // ---- Pane lifecycle (ADR-0007) ----

@@ -32,4 +32,5 @@ pub const CAPABILITIES: &[&str] = &[
     "attach.want_output_seq",
     "pane.activity_hint",
     "output.sent_at",
+    "daemon.work_pools",
 ];

@@ -6,6 +6,7 @@
 //! fixture directory, spawn the real `tymuxd` binary against it (matching
 //! `restart_persistence.rs`'s hard-merge-gate pattern — real subprocess, real
 //! gRPC, not a mocked harness), and assert on `ListSessions` after boot.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and files
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};

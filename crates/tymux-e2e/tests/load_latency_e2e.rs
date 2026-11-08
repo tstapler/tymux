@@ -10,7 +10,7 @@ use tymux_e2e::{daemon, workspace_bin};
 use tymux_proto::v1::tymux_service_client::TymuxServiceClient;
 use tymux_proto::v1::{
     attach_event, attach_request, AttachRequest, CapturePaneRequest, CreateSessionRequest,
-    ListSessionsRequest, PaneActivity, Resize, SetPaneActivityRequest,
+    GetServerInfoRequest, ListSessionsRequest, PaneActivity, Resize, SetPaneActivityRequest,
 };
 
 type Client = TymuxServiceClient<Channel>;
@@ -331,6 +331,39 @@ async fn run_config(p: &Params) {
         "attach_open_x10_first_event",
         burst,
     );
+    // Daemon-reported pool and slow-poll counters; absent on daemons that predate them.
+    if let Ok(info) = client
+        .get_server_info(GetServerInfoRequest::default())
+        .await
+    {
+        let info = info.into_inner();
+        for slow in &info.slow_polls {
+            println!(
+                "RESULT bin={} noisy={} storm={} metric=slow_polls task={} polls={} slow={} max_poll_ms={:.2}",
+                p.label,
+                p.noisy,
+                u8::from(p.storm),
+                slow.task_class,
+                slow.polls,
+                slow.slow_polls,
+                slow.max_poll_micros as f64 / 1000.0
+            );
+        }
+        for pool in &info.work_pools {
+            println!(
+                "RESULT bin={} noisy={} storm={} metric=pool class={} submitted={} skipped={} rejected={} wait_max_ms={:.2} run_max_ms={:.2}",
+                p.label,
+                p.noisy,
+                u8::from(p.storm),
+                pool.class,
+                pool.submitted,
+                pool.skipped_cancelled,
+                pool.rejected,
+                pool.wait_micros_max as f64 / 1000.0,
+                pool.run_micros_max as f64 / 1000.0
+            );
+        }
+    }
     if let Some(h) = storm_handle {
         h.abort();
     }

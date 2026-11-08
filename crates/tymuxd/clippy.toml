@@ -1,0 +1,10 @@
+# Blocking calls belong behind the pool boundary (src/pool.rs), not in async handlers.
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "blocks an async worker; use tokio::time::sleep, or run it on a pool" },
+    { path = "std::fs::read", reason = "blocking file I/O; use tokio::fs or a pool" },
+    { path = "std::fs::read_to_string", reason = "blocking file I/O; use tokio::fs or a pool" },
+    { path = "std::fs::write", reason = "blocking file I/O; use tokio::fs or a pool" },
+    { path = "std::fs::read_dir", reason = "blocking file I/O; use tokio::fs or a pool" },
+    { path = "std::process::Command::output", reason = "blocks until the child exits" },
+    { path = "std::process::Command::status", reason = "blocks until the child exits" },
+]
