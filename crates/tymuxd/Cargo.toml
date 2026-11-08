@@ -22,6 +22,7 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 constant_time_eq = "0.5"
 rayon = "1"
+pin-project-lite = "0.2"
 tonic-types = { workspace = true }
 serde_json = { workspace = true }
 

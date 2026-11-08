@@ -1020,7 +1020,10 @@ impl ResizeLane {
                 let (generation, size) = *request_rx.borrow_and_update();
                 if let Some((rows, cols)) = size {
                     let apply = apply.clone();
-                    let _ = pools.run(Class::Resize, move || apply(rows, cols)).await;
+                    let apply = apply.clone();
+                    let _ = pools
+                        .run_must_land(Class::Resize, move || apply(rows, cols))
+                        .await;
                 }
                 applied_tx.send_replace(generation);
             }
@@ -2008,8 +2011,9 @@ impl TymuxService for TymuxDaemon {
                         // A full pty input queue blocks write_all; awaiting the blocking task
                         // keeps keystroke order without parking an async worker.
                         let pane = pane_for_input.clone();
+                        let bytes = Arc::new(bytes);
                         match pools_for_input
-                            .run(Class::Input, move || pane.write_input(&bytes))
+                            .run_must_land(Class::Input, move || pane.write_input(&bytes))
                             .await
                         {
                             Ok(Ok(())) => {}

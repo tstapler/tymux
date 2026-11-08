@@ -2964,10 +2964,12 @@ type AttachEvent struct {
 	//	*AttachEvent_OutputChunk
 	//	*AttachEvent_Lifecycle
 	Payload isAttachEvent_Payload `protobuf_oneof:"payload"`
-	// Capability "output.sent_at". Wall-clock microseconds since the Unix epoch, stamped just
-	// before the frame is handed to the gRPC stream (after any wait in the daemon's send queue).
-	// A same-host client computes receive-minus-stamp to see time spent in HTTP/2 flow control
-	// and its own receive queue. Set on every frame; 0 means "not stamped" (older daemons).
+	// Capability "output.sent_at". Wall-clock microseconds since the Unix epoch, stamped when the
+	// daemon's gRPC layer takes the frame from its send queue (after any wait in that queue).
+	// Receive-minus-stamp on the same host bounds the time a frame spent buffered in the HTTP/2
+	// stack and the client's receive queue; tonic may pull a frame before flow control lets it
+	// out, so this is an upper bound on time in the window, not an exact measure of it. Set on
+	// every frame; 0 means "not stamped" (older daemons).
 	SentAtUnixMicros uint64 `protobuf:"varint,9,opt,name=sent_at_unix_micros,json=sentAtUnixMicros,proto3" json:"sent_at_unix_micros,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache

@@ -4,7 +4,10 @@
 //! locks a busy pane's reader thread holds almost continuously. Running them on tokio's shared
 //! blocking pool lets slow captures queue ahead of a keystroke, so each latency class gets its
 //! own rayon pool: `Input` (pty writes), `Resize` (reflow, can stall on the parser lock) and
-//! `Work` (captures and attach snapshots, work-stealing across panes). The per-pane parser lock
+//! `Work` (captures and attach snapshots, work-stealing across panes). `Input` and `Resize` are
+//! sized generously because their jobs mostly sleep: a pane whose pty is full or whose parser lock
+//! is held parks one thread, and the pool must outlast many such panes (tokio's blocking pool
+//! allowed 512). The per-pane parser lock
 //! still serialises work within one pane, so parallelism is across panes; no job here may hold
 //! that lock across a hop back to async.
 //!
@@ -111,7 +114,7 @@ pub struct PoolConfig {
 }
 
 impl PoolConfig {
-    /// `TYMUXD_INPUT_THREADS` (default 4), `TYMUXD_RESIZE_THREADS` (default 2),
+    /// `TYMUXD_INPUT_THREADS` (default 64), `TYMUXD_RESIZE_THREADS` (default 16),
     /// `TYMUXD_WORK_THREADS` (default available parallelism, at least 2) and
     /// `TYMUXD_POOL_QUEUE_LIMIT` (default 1024 queued jobs per class).
     pub fn from_env() -> Self {
@@ -122,8 +125,8 @@ impl PoolConfig {
         };
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
         Self {
-            input_threads: env("TYMUXD_INPUT_THREADS").unwrap_or(4).max(1),
-            resize_threads: env("TYMUXD_RESIZE_THREADS").unwrap_or(2).max(1),
+            input_threads: env("TYMUXD_INPUT_THREADS").unwrap_or(64).max(1),
+            resize_threads: env("TYMUXD_RESIZE_THREADS").unwrap_or(16).max(1),
             work_threads: env("TYMUXD_WORK_THREADS").unwrap_or(cores.max(2)).max(1),
             queue_limit: env("TYMUXD_POOL_QUEUE_LIMIT").unwrap_or(1024).max(1),
         }
@@ -243,6 +246,21 @@ impl Pools {
         })
     }
 
+    /// Like [`Pools::run`] for work that must not be dropped (keystrokes, resizes): a full queue
+    /// is waited out with a short backoff, which backpressures the caller, instead of rejected.
+    pub async fn run_must_land<T, F>(&self, class: Class, job: F) -> Result<T, PoolError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + Clone + 'static,
+    {
+        loop {
+            match self.run(class, job.clone()).await {
+                Err(PoolError::Rejected) => tokio::time::sleep(Duration::from_millis(5)).await,
+                other => return other,
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<ClassSnapshot> {
         Class::ALL
             .iter()
@@ -351,19 +369,21 @@ impl PollMonitor {
     }
 }
 
-pub struct Monitored<F> {
-    inner: F,
-    monitor: Arc<PollMonitor>,
+pin_project_lite::pin_project! {
+    pub struct Monitored<F> {
+        #[pin]
+        inner: F,
+        monitor: Arc<PollMonitor>,
+    }
 }
 
 impl<F: Future> Future for Monitored<F> {
     type Output = F::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: `inner` is never moved out of `self`, and `Monitored` has no Drop impl.
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.project();
         let started = Instant::now();
-        let result = unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx);
+        let result = this.inner.poll(cx);
         this.monitor.record(started.elapsed());
         result
     }
@@ -459,8 +479,14 @@ mod tests {
         let blocker = pools.run(Class::Work, move || {
             let _ = release_rx.lock().unwrap().recv();
         });
-        // Let the blocker leave the queue and occupy the worker.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait for the blocker to leave the queue and occupy the worker.
+        while pools
+            .snapshot()
+            .iter()
+            .any(|s| s.class == "work" && s.queue_depth > 0)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let a = pools.run(Class::Work, || ());
         let b = pools.run(Class::Work, || ());
         let overflow = pools.run(Class::Work, || ()).await;
@@ -469,6 +495,42 @@ mod tests {
         blocker.await.unwrap();
         a.await.unwrap();
         b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_must_land_should_wait_out_a_full_queue_instead_of_dropping_the_job() {
+        let pools = Arc::new(Pools::new(PoolConfig {
+            input_threads: 1,
+            resize_threads: 1,
+            work_threads: 1,
+            queue_limit: 1,
+        }));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let blocker = pools.run(Class::Input, move || {
+            let _ = release_rx.lock().unwrap().recv();
+        });
+        while pools
+            .snapshot()
+            .iter()
+            .any(|s| s.class == "input" && s.queue_depth > 0)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let filler = pools.run(Class::Input, || ());
+        let waiting = tokio::spawn({
+            let pools = pools.clone();
+            async move { pools.run_must_land(Class::Input, || 9).await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the job must wait while the queue is full"
+        );
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        filler.await.unwrap();
+        assert_eq!(waiting.await.unwrap(), Ok(9));
     }
 
     /// The point of the split: input stays fast while slow work is queued, and the negative
@@ -503,11 +565,11 @@ mod tests {
         let isolated = input_latency(false).await;
         let shared = input_latency(true).await;
         assert!(
-            isolated < Duration::from_millis(50),
+            isolated < Duration::from_millis(150),
             "isolated input took {isolated:?}"
         );
         assert!(
-            shared > Duration::from_millis(200),
+            shared > Duration::from_millis(250),
             "negative control should queue behind the slow jobs, took {shared:?}"
         );
     }

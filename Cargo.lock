@@ -1929,6 +1929,7 @@ dependencies = [
  "futures",
  "hyper-util",
  "libc",
+ "pin-project-lite",
  "prost",
  "rayon",
  "serde",
