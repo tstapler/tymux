@@ -550,6 +550,7 @@ impl From<&tokio::net::unix::UCred> for PeerIdentity {
 /// stub is provided here — an `unreachable!()` variant would be genuine
 /// dead code (architecture-review.md nitpick fix).
 #[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // a procfs read is served from memory and does not block
 fn peer_is_group_member_linux(pid: i32, gid: u32) -> bool {
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
         return false;
@@ -716,6 +717,7 @@ impl tonic::service::Interceptor for UdsPeerCredInterceptor {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests read /proc and spawn helpers
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicI64;
