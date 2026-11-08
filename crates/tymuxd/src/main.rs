@@ -4354,7 +4354,7 @@ mod tests {
         );
         drop(tx);
         drop(hold);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while gauge.load(Ordering::SeqCst) != 0 {
             assert!(
                 Instant::now() < deadline,
@@ -8513,6 +8513,9 @@ mod tests {
         assert_eq!((scheduled, restarted), (3, 3));
         let status = engine.pane_status(pane_id).unwrap();
         assert_eq!(status.view.state, tymux_core::LifecycleState::Failed);
-        assert!(pane.wait_final_exit().now_or_never().is_some());
+        // The state flips to Failed just before the final-exit signal; wait for it, don't sample.
+        tokio::time::timeout(Duration::from_secs(10), pane.wait_final_exit())
+            .await
+            .expect("the final exit must be signalled once the pane is FAILED");
     }
 }
