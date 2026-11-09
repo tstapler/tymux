@@ -2054,7 +2054,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
 
-    tracing::info!(%addr, uds_path = %socket_path.display(), "tymuxd listening");
+    tracing::info!(
+        %addr,
+        uds_path = %socket_path.display(),
+        version = env!("CARGO_PKG_VERSION"),
+        git_sha = option_env!("TYMUXD_GIT_SHA").unwrap_or("unknown"),
+        "tymuxd listening"
+    );
 
     // Epic 4.3 / Story 4.3.1: the TCP-deprecation warning vs. the
     // TCP-disabled info notice are mutually exclusive — never both.
@@ -2133,8 +2139,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // while every external dial gets refused. A periodic self-dial is the
     // only way to observe what an external caller actually sees.
     let tcp_health_future = async {
-        if !tcp_disabled {
-            tcp_health_probe(tcp_probe_target(socket_addr)).await;
+        if !tcp_disabled
+            && tcp_health_probe(tcp_probe_target(socket_addr)).await
+                == TcpHealthProbeExit::Unhealthy
+        {
+            std::process::exit(EXIT_TCP_LISTENER_UNHEALTHY);
         }
     };
 
@@ -2178,6 +2187,21 @@ fn tcp_probe_target(addr: std::net::SocketAddr) -> std::net::SocketAddr {
 /// transient noise into an error-level log line.
 const TCP_HEALTH_PROBE_WARN_THRESHOLD: u32 = 3;
 
+/// Consecutive failed probes (~5 min at the 30s interval) after which the
+/// listener is deemed unrecoverable in-process and the daemon exits non-zero
+/// so an external supervisor restarts it (#75: a 345-failure outage with the
+/// daemon alive needed operator intervention).
+const TCP_HEALTH_PROBE_FATAL_THRESHOLD: u32 = 10;
+
+/// Exit status for a sustained TCP listener outage (sysexits `EX_SOFTWARE`).
+const EXIT_TCP_LISTENER_UNHEALTHY: i32 = 70;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpHealthProbeExit {
+    Shutdown,
+    Unhealthy,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpProbeOutcome {
     Connected,
@@ -2188,6 +2212,7 @@ enum TcpProbeOutcome {
 enum TcpHealthProbeLog {
     None,
     Failing(u32),
+    Fatal(u32),
     Recovered,
 }
 
@@ -2214,7 +2239,9 @@ fn tcp_health_probe_transition(
             let next = consecutive_failures + 1;
             (
                 next,
-                if next >= TCP_HEALTH_PROBE_WARN_THRESHOLD {
+                if next >= TCP_HEALTH_PROBE_FATAL_THRESHOLD {
+                    TcpHealthProbeLog::Fatal(next)
+                } else if next >= TCP_HEALTH_PROBE_WARN_THRESHOLD {
                     TcpHealthProbeLog::Failing(next)
                 } else {
                     TcpHealthProbeLog::None
@@ -2229,7 +2256,7 @@ fn tcp_health_probe_transition(
 /// alive, TCP listener specifically unreachable" from "daemon fully
 /// healthy" without having to infer it from a pattern of external
 /// connection failures first.
-async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
+async fn tcp_health_probe(probe_addr: std::net::SocketAddr) -> TcpHealthProbeExit {
     // Frequent enough to catch a wedged listener well before an operator
     // would notice from external symptoms alone, without adding meaningful
     // load.
@@ -2255,7 +2282,7 @@ async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
     loop {
         tokio::select! {
             _ = interval.tick() => {}
-            _ = &mut shutdown => return,
+            _ = &mut shutdown => return TcpHealthProbeExit::Shutdown,
         }
         let outcome =
             match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(probe_addr))
@@ -2273,6 +2300,14 @@ async fn tcp_health_probe(probe_addr: std::net::SocketAddr) {
                 consecutive_failures = count,
                 "tcp listener health probe failed repeatedly — tymuxd is alive but its TCP endpoint may not be accepting connections"
             ),
+            TcpHealthProbeLog::Fatal(count) => {
+                tracing::error!(
+                    %probe_addr,
+                    consecutive_failures = count,
+                    "tcp listener unreachable past the fatal threshold — exiting so a supervisor can restart tymuxd"
+                );
+                return TcpHealthProbeExit::Unhealthy;
+            }
             TcpHealthProbeLog::Recovered => tracing::info!(
                 %probe_addr,
                 "tcp listener health probe recovered — accepting connections again"
@@ -6319,6 +6354,42 @@ mod tests {
         }
 
         assert!(logs_contain("tcp listener health probe failed repeatedly"));
+    }
+
+    #[test]
+    fn tcp_health_probe_transition_goes_fatal_at_threshold() {
+        let (_, action) = tcp_health_probe_transition(
+            TCP_HEALTH_PROBE_FATAL_THRESHOLD - 2,
+            TcpProbeOutcome::Failed,
+        );
+        assert_eq!(
+            action,
+            TcpHealthProbeLog::Failing(TCP_HEALTH_PROBE_FATAL_THRESHOLD - 1)
+        );
+        let (_, action) = tcp_health_probe_transition(
+            TCP_HEALTH_PROBE_FATAL_THRESHOLD - 1,
+            TcpProbeOutcome::Failed,
+        );
+        assert_eq!(
+            action,
+            TcpHealthProbeLog::Fatal(TCP_HEALTH_PROBE_FATAL_THRESHOLD)
+        );
+    }
+
+    /// Fault injection for #75: the listener is gone while the process stays
+    /// alive; the probe must give up with `Unhealthy`, not warn forever.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_health_probe_returns_unhealthy_after_sustained_outage() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let handle = tokio::spawn(tcp_health_probe(addr));
+        for _ in 0..(TCP_HEALTH_PROBE_FATAL_THRESHOLD + 3) {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(handle.await.unwrap(), TcpHealthProbeExit::Unhealthy);
     }
 
     // --- Epic 5.1: accept/reject over a real UDS connection ---
