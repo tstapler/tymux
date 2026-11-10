@@ -56,7 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, pinned 2026-08-26 -- rust-toolchain.toml's channel="stable" still controls the actual Rust version installed
-      - uses: tstapler/gha-actions/setup-protoc@e00baba497526a510763823adde39b37f54bb074 # gha-actions PR #1 head; re-pin to the merge commit once merged
+      - uses: tstapler/gha-actions/setup-protoc@9730d74171a0480cc091db7c34f6e18ccbdf273d # gha-actions main, includes setup-buf/setup-protoc (#1)
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: bench/go.mod
