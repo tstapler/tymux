@@ -79,10 +79,16 @@ type Options struct {
 
 	// ProbeTimeout bounds each GetServerInfo probe (default 3s), in addition to the caller's ctx.
 	ProbeTimeout time.Duration
+	// ReprobeTimeout bounds the Unix re-probe that runs on a caller's own RPC while sticky on
+	// TCP (default: ProbeTimeout). Keep it short: a socket that accepts but never answers
+	// delays one RPC by up to this much every ReprobeInterval.
+	ReprobeTimeout time.Duration
 	// ReprobeInterval is how long a TCP fallback sticks before the next call re-probes
 	// the Unix socket (default 30s). The re-probe runs on a caller's RPC, never a timer.
 	ReprobeInterval time.Duration
 	// Quiet is for one-shot probes: OnTransition is not called and Logger gets Debug only.
+	// Logger also gets one Warn per ReprobeInterval at most when a re-probe fails for a reason
+	// other than a refusal or denial (e.g. ETIMEDOUT, ECONNRESET).
 	Quiet bool
 	// OnTransition is called after the active transport changes (not in Quiet mode).
 	OnTransition func(from, to Kind, why string)
@@ -152,6 +158,9 @@ func NewFromTransports(unix, tcp Transport, opts Options) *Client {
 	if opts.ProbeTimeout <= 0 {
 		opts.ProbeTimeout = defaultProbeTimeout
 	}
+	if opts.ReprobeTimeout <= 0 {
+		opts.ReprobeTimeout = opts.ProbeTimeout
+	}
 	if opts.ReprobeInterval <= 0 {
 		opts.ReprobeInterval = defaultReprobeInterval
 	}
@@ -201,7 +210,7 @@ func (c *Client) pick(ctx context.Context) (Transport, Kind) {
 		claimed := c.opts.Now().Add(c.opts.ReprobeInterval)
 		c.nextUnixProbe = claimed
 		c.mu.Unlock()
-		err := c.probe(ctx, c.unix)
+		err := c.probe(ctx, c.unix, c.opts.ReprobeTimeout)
 		switch {
 		case err == nil:
 			c.switchTo(Unix, "control socket answers again")
@@ -214,6 +223,10 @@ func (c *Client) pick(ctx context.Context) (Transport, Kind) {
 				c.nextUnixProbe = prev
 			}
 			c.mu.Unlock()
+		case !isDialRefused(Unix, err):
+			// The socket exists but did not answer cleanly; staying on TCP would otherwise be silent.
+			// The claim above limits this to one warning per ReprobeInterval.
+			c.warnReprobe(err)
 		}
 		c.mu.Lock()
 	}
@@ -224,9 +237,9 @@ func (c *Client) pick(ctx context.Context) (Transport, Kind) {
 	return c.unix, Unix
 }
 
-// probe is bound by the caller's ctx as well as ProbeTimeout, so a cancelled RPC never waits on it.
-func (c *Client) probe(ctx context.Context, t Transport) error {
-	ctx, cancel := context.WithTimeout(ctx, c.opts.ProbeTimeout)
+// probe is bound by the caller's ctx as well as timeout, so a cancelled RPC never waits on it.
+func (c *Client) probe(ctx context.Context, t Transport, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	_, err := t.GetServerInfo(ctx, connect.NewRequest(&v1.GetServerInfoRequest{}))
 	return err
@@ -251,6 +264,17 @@ func (c *Client) switchTo(to Kind, why string) {
 	c.log(true, "tymuxd transport changed", from, to, why)
 	if c.opts.OnTransition != nil {
 		c.opts.OnTransition(from, to, why)
+	}
+}
+
+func (c *Client) warnReprobe(err error) {
+	const msg = "tymuxd control socket re-probe failed; staying on tcp"
+	switch l := c.opts.Logger; {
+	case l == nil:
+	case c.opts.Quiet:
+		l.Debug(msg, "error", err)
+	default:
+		l.Warn(msg, "error", err)
 	}
 }
 
@@ -301,7 +325,7 @@ func (c *Client) failover(ctx context.Context, from Kind, err error) bool {
 	}
 	switch from {
 	case Unix:
-		if c.tcp == nil || c.probe(ctx, c.tcp) != nil {
+		if c.tcp == nil || c.probe(ctx, c.tcp, c.opts.ProbeTimeout) != nil {
 			return false
 		}
 		c.switchTo(TCP, "control socket refused connections while the tcp listener answers")
@@ -309,7 +333,12 @@ func (c *Client) failover(ctx context.Context, from Kind, err error) bool {
 		if c.unix == nil {
 			return false
 		}
-		c.switchTo(Unix, "tcp listener refused connections")
+		// A dead socket is no better than a dead TCP listener: switch only if it answers, or
+		// denies us (which the next call then surfaces as a hard error).
+		if err := c.probe(ctx, c.unix, c.opts.ProbeTimeout); err != nil && !deniedAccess(err) {
+			return false
+		}
+		c.switchTo(Unix, "tcp listener refused connections while the control socket answers")
 	}
 	return true
 }
