@@ -335,7 +335,8 @@ func (c *Client) failover(ctx context.Context, from Kind, err error) bool {
 		}
 		// A dead socket is no better than a dead TCP listener: switch only if it answers, or
 		// denies us (which the next call then surfaces as a hard error).
-		if err := c.probe(ctx, c.unix, c.opts.ProbeTimeout); err != nil && !deniedAccess(err) {
+		// Bounded by the short ReprobeTimeout: a half-open socket must not stall every failing RPC.
+		if err := c.probe(ctx, c.unix, c.opts.ReprobeTimeout); err != nil && !deniedAccess(err) {
 			return false
 		}
 		c.switchTo(Unix, "tcp listener refused connections while the control socket answers")

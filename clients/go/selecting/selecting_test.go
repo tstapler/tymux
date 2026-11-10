@@ -480,11 +480,15 @@ func TestFailoverFromTCPWhenSocketAnswersOrDenies(t *testing.T) {
 	} {
 		r := newRig(Options{})
 		r.c.useTCP = true
+		r.c.nextUnixProbe = r.clock.Now().Add(time.Hour) // keep pick's re-probe out of the way: exercise failover
 		r.unix.set(probeErr, nil)
 		r.tcp.set(nil, dialErr(syscall.ECONNREFUSED))
 		_ = list(t, r.c)
 		if r.c.Active() != Unix {
 			t.Fatalf("%s: active = %s, want unix", name, r.c.Active())
+		}
+		if i, _ := r.unix.calls(); i != 1 {
+			t.Fatalf("%s: failover probes = %d, want 1", name, i)
 		}
 	}
 }
