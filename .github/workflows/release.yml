@@ -69,9 +69,7 @@ jobs:
           export V="${GITHUB_REF_NAME#v}"
           perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{V}"/m' Cargo.toml
           [ "$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')" = "$V" ]
-      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: tstapler/gha-actions/setup-protoc@e00baba497526a510763823adde39b37f54bb074 # gha-actions PR #1 head; re-pin to the merge commit once merged
       # aarch64-unknown-linux-musl needs a cross linker the ubuntu-latest
       # runner doesn't ship by default (unlike x86_64-unknown-linux-musl,
       # which only needs musl-tools) — this action wires up the right
