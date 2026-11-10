@@ -453,3 +453,88 @@ func TestSetPaneActivityGoesThroughTheSelectedTransport(t *testing.T) {
 		t.Fatalf("unix transport saw %v", r.unix.activity)
 	}
 }
+
+func TestNoFailoverFromTCPToDeadSocket(t *testing.T) {
+	t.Parallel()
+	lg := &recordingLogger{}
+	r := newRig(Options{Logger: lg})
+	r.c.useTCP = true
+	r.unix.set(dialErr(syscall.ENOENT), dialErr(syscall.ENOENT))
+	r.tcp.set(nil, dialErr(syscall.ECONNREFUSED))
+	if err := list(t, r.c); !refusedForTest(err) {
+		t.Fatalf("want the original refusal, got %v", err)
+	}
+	if r.c.Active() != TCP {
+		t.Fatalf("active = %s, want tcp (socket is dead too)", r.c.Active())
+	}
+	if n := len(r.transitions.all()); n != 0 || lg.warns != 0 {
+		t.Fatalf("spurious transition: callbacks=%d warns=%d", n, lg.warns)
+	}
+}
+
+func TestFailoverFromTCPWhenSocketAnswersOrDenies(t *testing.T) {
+	t.Parallel()
+	for name, probeErr := range map[string]error{
+		"answers": nil,
+		"denies":  connect.NewError(connect.CodePermissionDenied, errors.New("rejected")),
+	} {
+		r := newRig(Options{})
+		r.c.useTCP = true
+		r.c.nextUnixProbe = r.clock.Now().Add(time.Hour) // keep pick's re-probe out of the way: exercise failover
+		r.unix.set(probeErr, nil)
+		r.tcp.set(nil, dialErr(syscall.ECONNREFUSED))
+		_ = list(t, r.c)
+		if r.c.Active() != Unix {
+			t.Fatalf("%s: active = %s, want unix", name, r.c.Active())
+		}
+		if i, _ := r.unix.calls(); i != 1 {
+			t.Fatalf("%s: failover probes = %d, want 1", name, i)
+		}
+	}
+}
+
+func TestReprobeTimeoutBoundsTheReprobeNotTheFailoverProbe(t *testing.T) {
+	t.Parallel()
+	r := newRig(Options{ReprobeInterval: time.Second, ReprobeTimeout: 20 * time.Millisecond, ProbeTimeout: time.Hour})
+	fallBackToTCP(t, r)
+	r.unix.mu.Lock()
+	r.unix.infoHook = func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
+	r.unix.mu.Unlock()
+	r.clock.Advance(2 * time.Second)
+	done := make(chan error, 1)
+	go func() { done <- list(t, r.c) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("re-probe was not bounded by ReprobeTimeout")
+	}
+	if r.c.Active() != TCP {
+		t.Fatalf("active = %s", r.c.Active())
+	}
+}
+
+func TestReprobeWarnsOnSwallowedErrorOncePerInterval(t *testing.T) {
+	t.Parallel()
+	lg := &recordingLogger{}
+	r := newRig(Options{ReprobeInterval: 30 * time.Second, Logger: lg})
+	fallBackToTCP(t, r)
+	base := lg.warns // the transition warning
+	r.unix.set(dialErr(syscall.ETIMEDOUT), nil)
+
+	r.clock.Advance(31 * time.Second)
+	_ = list(t, r.c)
+	_ = list(t, r.c) // inside the backoff window: no new probe, no new warn
+	if lg.warns != base+1 {
+		t.Fatalf("warns = %d, want %d", lg.warns-base, 1)
+	}
+
+	r.unix.set(dialErr(syscall.ECONNREFUSED), nil) // a plain refusal stays silent
+	r.clock.Advance(31 * time.Second)
+	_ = list(t, r.c)
+	if lg.warns != base+1 {
+		t.Fatalf("refusal warned: %d", lg.warns-base)
+	}
+}
