@@ -109,12 +109,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # Publishes the formula to tstapler/homebrew-tap as the "tstapler-homebrew-tap-writer" GitHub App
-  # (https://github.com/settings/apps/tstapler-homebrew-tap-writer), which must be installed on
-  # the tap repo with Contents: read and write. A short-lived installation token is minted per
-  # run, so no personal access token is stored. Needs, on this repo:
+  # via the shared publish-homebrew-formula action (short-lived token, push-race retry). Needs, on
+  # this repo:
   #   variable HOMEBREW_TAP_APP_CLIENT_ID    the app's Client ID (not secret)
   #   secret   HOMEBREW_TAP_APP_PRIVATE_KEY  a private key generated for the app
-  # Without them the job skips with a notice, so a release never fails over the tap.
+  # (set both with `set-homebrew-tap-app-credentials`). Without them the job skips with a notice,
+  # so a release never fails over the tap.
   update-homebrew:
     needs: upload-assets
     runs-on: ubuntu-latest
@@ -130,19 +130,11 @@ jobs:
           if [ -n "$APP_CLIENT_ID" ] && [ -n "$APP_PRIVATE_KEY" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"
           else echo "::notice::HOMEBREW_TAP_APP_CLIENT_ID / HOMEBREW_TAP_APP_PRIVATE_KEY are not set; skipping the Homebrew tap update"; fi
       - if: steps.gate.outputs.enabled == 'true'
-        id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}
-          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
-          owner: tstapler
-          repositories: homebrew-tap
-          permission-contents: write
-      - if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - if: steps.gate.outputs.enabled == 'true'
+        id: render
         name: Render the formula from the published archives
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -151,20 +143,11 @@ jobs:
           gh release download "$GITHUB_REF_NAME" --pattern 'tymux-*.tar.gz' --dir "$RUNNER_TEMP/assets"
           scripts/render-homebrew-formula.sh "${GITHUB_REF_NAME#v}" "$RUNNER_TEMP/assets" > "$RUNNER_TEMP/tymux.rb"
           cat "$RUNNER_TEMP/tymux.rb"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - if: steps.gate.outputs.enabled == 'true'
-        name: Commit the formula to the tap
-        env:
-          TAP_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/tstapler/homebrew-tap.git" "$RUNNER_TEMP/tap"
-          cd "$RUNNER_TEMP/tap"
-          mkdir -p Formula
-          cp "$RUNNER_TEMP/tymux.rb" Formula/tymux.rb
-          if git diff --quiet -- Formula/tymux.rb && [ -z "$(git ls-files --others --exclude-standard Formula/tymux.rb)" ]; then
-            echo "formula already up to date"; exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/tymux.rb
-          git commit -m "tymux ${GITHUB_REF_NAME#v}"
-          git push origin HEAD
+        uses: tstapler/gha-actions/publish-homebrew-formula@dcc4013f1e0c983a6926d22b1cb9acf3aba9a489 # gha-actions main, includes publish-homebrew-formula (#2)
+        with:
+          client-id: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          files: ${{ runner.temp }}/tymux.rb:Formula/tymux.rb
+          commit-message: tymux ${{ steps.render.outputs.version }}
